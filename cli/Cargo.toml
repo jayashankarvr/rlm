@@ -1,0 +1,22 @@
+[package]
+name = "rlm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Resource Limit Manager - control process resource usage via cgroups v2"
+
+[[bin]]
+name = "rlm"
+path = "src/main.rs"
+
+[dependencies]
+common.workspace = true
+rlm-core.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+ctrlc.workspace = true
+dirs.workspace = true
+libc = "0.2.178"
+serde_yaml_ng = "0.10"

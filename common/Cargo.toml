@@ -1,0 +1,12 @@
+[package]
+name = "common"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Shared types for rlm"
+
+[dependencies]
+thiserror.workspace = true
+serde.workspace = true
+serde_yaml_ng.workspace = true
+dirs.workspace = true

@@ -1,0 +1,10 @@
+/target/
+*.swp
+*.swo
+.idea/
+.vscode/
+*.log
+*.deb
+*.rpm
+*.tar.gz
+*.tmp

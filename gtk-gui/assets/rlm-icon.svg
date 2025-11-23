@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="128" height="128" viewBox="0 0 128 128" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#5E81AC"/>
+      <stop offset="100%" style="stop-color:#81A1C1"/>
+    </linearGradient>
+  </defs>
+  <!-- Background circle -->
+  <circle cx="64" cy="64" r="60" fill="url(#bg)"/>
+  <!-- Gauge/meter arc representing limits -->
+  <path d="M 32 80 A 40 40 0 1 1 96 80"
+        fill="none"
+        stroke="#ECEFF4"
+        stroke-width="8"
+        stroke-linecap="round"/>
+  <!-- Gauge needle -->
+  <path d="M 64 64 L 48 48"
+        fill="none"
+        stroke="#BF616A"
+        stroke-width="6"
+        stroke-linecap="round"/>
+  <!-- Center dot -->
+  <circle cx="64" cy="64" r="6" fill="#ECEFF4"/>
+  <!-- Limit line marker -->
+  <path d="M 80 40 L 88 32"
+        fill="none"
+        stroke="#A3BE8C"
+        stroke-width="4"
+        stroke-linecap="round"/>
+</svg>
