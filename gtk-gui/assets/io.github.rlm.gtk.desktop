@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=Resource Limit Manager
+Comment=Manage process resource limits using cgroups v2
+Exec=rlm-gtk
+Icon=io.github.rlm.gtk
+Terminal=false
+Type=Application
+Categories=System;Utility;
+Keywords=cgroups;memory;cpu;limit;process;
+StartupNotify=true
