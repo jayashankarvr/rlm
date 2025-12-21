@@ -1,0 +1,70 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-4-dev libadwaita-1-dev
+
+      - name: Install packaging tools
+        run: cargo install cargo-deb cargo-generate-rpm
+
+      - name: Build release binaries
+        run: cargo build --release
+
+      - name: Build .deb packages
+        run: |
+          cargo deb -p rlm --no-build
+          cargo deb -p rlm-gtk --no-build
+
+      - name: Build .rpm packages
+        run: |
+          cargo generate-rpm -p cli
+          cargo generate-rpm -p gtk-gui
+
+      - name: Create tarball
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          mkdir -p release
+          cp target/release/rlm release/
+          cp target/release/rlm-gtk release/
+          cp README.md LICENSE release/
+          tar -czvf "rlm-${REF_NAME}-x86_64-linux.tar.gz" -C release .
+
+      - name: Get version
+        id: version
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: echo "version=${REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: false
+          generate_release_notes: true
+          files: |
+            target/debian/rlm_${{ steps.version.outputs.version }}-1_amd64.deb
+            target/debian/rlm-gtk_${{ steps.version.outputs.version }}-1_amd64.deb
+            target/generate-rpm/rlm-${{ steps.version.outputs.version }}-1.x86_64.rpm
+            target/generate-rpm/rlm-gtk-${{ steps.version.outputs.version }}-1.x86_64.rpm
+            rlm-${{ github.ref_name }}-x86_64-linux.tar.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
