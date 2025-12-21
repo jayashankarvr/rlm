@@ -1,0 +1,10 @@
+#!/bin/sh
+set -e
+
+# Only reload if systemd is running
+if [ -d /run/systemd/system ]; then
+    systemctl daemon-reload || true
+    echo "rlm: cgroup delegation configured. Log out and back in to apply."
+else
+    echo "rlm: systemd not detected. Manual cgroup setup may be required."
+fi

@@ -5,6 +5,29 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Resource Limit Manager - control process resource usage via cgroups v2"
+readme = "../README.md"
+keywords = ["cgroups", "resource-limit", "memory", "cpu", "linux"]
+categories = ["command-line-utilities", "os::linux-apis"]
+
+[package.metadata.deb]
+maintainer = "Jayashankar <me.jayashankar@gmail.com>"
+section = "admin"
+priority = "optional"
+depends = "$auto, systemd"
+assets = [
+    ["target/release/rlm", "usr/bin/", "755"],
+    ["../README.md", "usr/share/doc/rlm/", "644"],
+    ["../dist/delegate.conf", "etc/systemd/system/user@.service.d/", "644"],
+]
+maintainer-scripts = "../dist"
+
+[package.metadata.generate-rpm]
+assets = [
+    { source = "target/release/rlm", dest = "/usr/bin/rlm", mode = "755" },
+    { source = "../README.md", dest = "/usr/share/doc/rlm/README.md", mode = "644" },
+    { source = "../dist/delegate.conf", dest = "/etc/systemd/system/user@.service.d/rlm-delegate.conf", mode = "644" },
+]
+post_install_script = "../dist/postinst"
 
 [[bin]]
 name = "rlm"

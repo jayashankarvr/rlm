@@ -5,6 +5,34 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "GTK4/Libadwaita GUI for Resource Limit Manager"
+readme = "../README.md"
+keywords = ["cgroups", "resource-limit", "gtk", "gui", "linux"]
+categories = ["gui", "os::linux-apis"]
+
+[package.metadata.deb]
+maintainer = "Jayashankar <me.jayashankar@gmail.com>"
+section = "admin"
+priority = "optional"
+depends = "$auto, libgtk-4-1 (>= 4.6), libadwaita-1-0 (>= 1.2)"
+assets = [
+    ["target/release/rlm-gtk", "usr/bin/", "755"],
+    ["assets/io.github.rlm.gtk.desktop", "usr/share/applications/", "644"],
+    ["assets/rlm-icon.svg", "usr/share/icons/hicolor/scalable/apps/io.github.rlm.gtk.svg", "644"],
+    ["assets/rlm-symbolic.svg", "usr/share/icons/hicolor/symbolic/apps/io.github.rlm.gtk-symbolic.svg", "644"],
+    ["../README.md", "usr/share/doc/rlm-gtk/", "644"],
+]
+
+[package.metadata.generate-rpm]
+assets = [
+    { source = "target/release/rlm-gtk", dest = "/usr/bin/rlm-gtk", mode = "755" },
+    { source = "assets/io.github.rlm.gtk.desktop", dest = "/usr/share/applications/io.github.rlm.gtk.desktop", mode = "644" },
+    { source = "assets/rlm-icon.svg", dest = "/usr/share/icons/hicolor/scalable/apps/io.github.rlm.gtk.svg", mode = "644" },
+    { source = "assets/rlm-symbolic.svg", dest = "/usr/share/icons/hicolor/symbolic/apps/io.github.rlm.gtk-symbolic.svg", mode = "644" },
+    { source = "../README.md", dest = "/usr/share/doc/rlm-gtk/README.md", mode = "644" },
+]
+[package.metadata.generate-rpm.requires]
+gtk4 = ">= 4.6"
+libadwaita = ">= 1.2"
 
 [[bin]]
 name = "rlm-gtk"
