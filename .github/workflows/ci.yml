@@ -55,12 +55,9 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            libwayland-dev \
-            libxkbcommon-dev \
-            libvulkan-dev \
-            libssl-dev \
-            pkg-config \
-            cmake
+            libgtk-4-dev \
+            libadwaita-1-dev \
+            pkg-config
 
       - name: Cache cargo
         uses: actions/cache@v4
