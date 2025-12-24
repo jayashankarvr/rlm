@@ -93,22 +93,27 @@ impl CgroupManager {
         let safe_name = sanitize_cgroup_name(name)?;
         let cgroup_path = self.base_path.join(safe_name);
         self.create_cgroup(&cgroup_path)?;
+        self.set_limits(&cgroup_path, limit)?;
+        Ok(cgroup_path)
+    }
 
+    /// Set limits on an existing cgroup
+    fn set_limits(&self, cgroup_path: &Path, limit: &Limit) -> Result<()> {
         if let Some(mem) = &limit.memory {
-            self.set_memory_limit(&cgroup_path, *mem)?;
+            self.set_memory_limit(cgroup_path, *mem)?;
         }
 
         if let Some(cpu) = &limit.cpu {
-            self.set_cpu_limit(&cgroup_path, *cpu)?;
+            self.set_cpu_limit(cgroup_path, *cpu)?;
         }
 
         if let Some(io) = &limit.io {
             if !io.is_empty() {
-                self.set_io_limit(&cgroup_path, *io)?;
+                self.set_io_limit(cgroup_path, *io)?;
             }
         }
 
-        Ok(cgroup_path)
+        Ok(())
     }
 
     /// Add a process to an existing cgroup
@@ -118,8 +123,46 @@ impl CgroupManager {
         Ok(())
     }
 
+    /// Find if a PID is already in an rlm-managed cgroup
+    pub fn find_cgroup_for_pid(&self, pid: u32) -> Option<String> {
+        let entries = fs::read_dir(&self.base_path).ok()?;
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+
+            let procs_file = path.join("cgroup.procs");
+            if let Ok(content) = fs::read_to_string(&procs_file) {
+                for line in content.lines() {
+                    if line.trim().parse::<u32>().ok() == Some(pid) {
+                        return path.file_name()?.to_str().map(String::from);
+                    }
+                }
+            }
+        }
+        None
+    }
+
     /// Apply resource limits to a process (creates cgroup and adds process)
     pub fn apply_limit(&self, pid: u32, limit: &Limit) -> Result<()> {
+        // Check if process is already managed
+        if let Some(existing_cgroup) = self.find_cgroup_for_pid(pid) {
+            // If it's in a pid-{pid} cgroup, update the limits
+            if existing_cgroup == format!("pid-{pid}") {
+                let cgroup_path = self.base_path.join(&existing_cgroup);
+                self.set_limits(&cgroup_path, limit)?;
+                tracing::info!(pid, "updated existing limits");
+                return Ok(());
+            }
+            // Process is in a different cgroup (run-* or gtk-*)
+            return Err(Error::InvalidArgs(format!(
+                "process {} is already managed in cgroup '{}'",
+                pid, existing_cgroup
+            )));
+        }
+
         let cgroup_path = self.prepare_cgroup(&format!("pid-{pid}"), limit)?;
 
         // Try to add process - if it fails because process doesn't exist,
@@ -143,49 +186,52 @@ impl CgroupManager {
         self.cleanup_cgroup(&format!("pid-{pid}"))
     }
 
-    /// Clean up a cgroup by name
+    /// Clean up a cgroup by name (moves processes out and deletes cgroup)
     pub fn cleanup_cgroup(&self, name: &str) -> Result<()> {
         // Sanitize name to prevent path traversal
         let safe_name = sanitize_cgroup_name(name)?;
         let cgroup_path = self.base_path.join(safe_name);
 
-        // First try cgroup.kill (cgroups v2 feature) - kills all processes atomically
-        let kill_file = cgroup_path.join("cgroup.kill");
-        if kill_file.exists() {
-            let _ = fs::write(&kill_file, "1");
-        } else {
-            // Fallback: move processes to parent cgroup
-            if let Ok(content) = fs::read_to_string(cgroup_path.join("cgroup.procs")) {
-                let parent_procs = self.base_path.join("cgroup.procs");
-                for line in content.lines() {
-                    if let Ok(pid) = line.trim().parse::<u32>() {
-                        let _ = fs::write(&parent_procs, pid.to_string());
+        if !cgroup_path.exists() {
+            return Ok(());
+        }
+
+        // Try to move processes out
+        if let Ok(content) = fs::read_to_string(cgroup_path.join("cgroup.procs")) {
+            let pids: Vec<u32> = content
+                .lines()
+                .filter_map(|l| l.trim().parse().ok())
+                .collect();
+
+            if !pids.is_empty() {
+                // Create/use an "unlimit" leaf cgroup (no controllers = no limits)
+                let unlimit_path = self.base_path.join("unlimit");
+                let _ = fs::create_dir(&unlimit_path);
+                let unlimit_procs = unlimit_path.join("cgroup.procs");
+
+                for pid in pids {
+                    if fs::write(&unlimit_procs, pid.to_string()).is_ok() {
+                        tracing::debug!(pid, "moved process to unlimit cgroup");
+                    } else {
+                        // Fallback - reset limits in place
+                        tracing::debug!(pid, "couldn't move process, resetting limits");
+                        let _ = fs::write(cgroup_path.join("memory.max"), "max");
+                        let _ = fs::write(cgroup_path.join("cpu.max"), "max");
+                        let _ = fs::write(cgroup_path.join("io.max"), "");
                     }
                 }
             }
         }
 
-        // Retry rmdir with exponential backoff (processes may take time to exit)
-        let mut delay_ms = 5;
-        for attempt in 0..5 {
+        // Try to remove the cgroup
+        for _ in 0..3 {
             match fs::remove_dir(&cgroup_path) {
                 Ok(()) => {
                     tracing::info!(?cgroup_path, "removed cgroup");
                     return Ok(());
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    // Already removed or never existed
-                    return Ok(());
-                }
-                Err(e) if attempt < 4 => {
-                    // EBUSY (processes still present) - wait and retry
-                    tracing::trace!(?cgroup_path, attempt, "retrying cgroup removal: {e}");
-                    std::thread::sleep(std::time::Duration::from_millis(delay_ms));
-                    delay_ms *= 2; // exponential backoff: 5, 10, 20, 40ms
-                }
-                Err(e) => {
-                    tracing::debug!(?cgroup_path, "failed to remove cgroup after retries: {e}");
-                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(50)),
             }
         }
 

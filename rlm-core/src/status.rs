@@ -7,6 +7,7 @@ use std::path::Path;
 pub struct ProcessStatus {
     pub pid: u32,
     pub name: String,
+    pub cgroup_name: String,
     pub memory_max: Option<u64>,
     pub cpu_quota: Option<u32>,
     pub io_read_bps: Option<u64>,
@@ -34,6 +35,11 @@ pub fn get_managed_processes(manager: &CgroupManager) -> Result<Vec<ProcessStatu
         let Some(cgroup_name) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
+
+        // Skip the "unlimit" cgroup (holds released processes)
+        if cgroup_name == "unlimit" {
+            continue;
+        }
 
         // Extract PID from cgroup directory name patterns:
         // - "pid-XXXX" (CLI limit command)
@@ -69,9 +75,20 @@ pub fn get_managed_processes(manager: &CgroupManager) -> Result<Vec<ProcessStatu
         let cpu_quota = parse_cpu_quota(&path);
         let (io_read_bps, io_write_bps) = parse_io_limits(&path);
 
+        // Skip processes with no active limits (all set to max/unlimited)
+        if memory_max.is_none()
+            && cpu_quota.is_none()
+            && io_read_bps.is_none()
+            && io_write_bps.is_none()
+        {
+            dead_cgroups.push(cgroup_name.to_string());
+            continue;
+        }
+
         results.push(ProcessStatus {
             pid,
             name: proc_name,
+            cgroup_name: cgroup_name.to_string(),
             memory_max,
             cpu_quota,
             io_read_bps,

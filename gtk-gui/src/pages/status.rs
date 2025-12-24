@@ -1,5 +1,6 @@
 use adw::prelude::*;
 use common::format_bytes;
+use gtk::glib;
 use rlm_core::CgroupManager;
 use std::sync::Arc;
 
@@ -22,6 +23,7 @@ pub fn create(manager: Option<Arc<CgroupManager>>) -> gtk::Widget {
     let list_box = gtk::ListBox::new();
     list_box.set_selection_mode(gtk::SelectionMode::None);
     list_box.add_css_class("boxed-list");
+    list_box.set_widget_name("status-list-box");
 
     // Empty state
     let empty_row = adw::ActionRow::new();
@@ -48,25 +50,26 @@ pub fn create(manager: Option<Arc<CgroupManager>>) -> gtk::Widget {
 }
 
 pub fn refresh(widget: &gtk::Widget, manager: Arc<CgroupManager>) {
-    // Find the list box in the widget hierarchy
-    if let Some(page) = widget.downcast_ref::<adw::PreferencesPage>() {
-        // Get first child which should be the group
-        let mut child = page.first_child();
-        while let Some(c) = child {
-            if let Some(group) = c.downcast_ref::<adw::PreferencesGroup>() {
-                // Find list box in group
-                let mut group_child = group.first_child();
-                while let Some(gc) = group_child {
-                    if let Some(list_box) = gc.downcast_ref::<gtk::ListBox>() {
-                        do_refresh(list_box, manager);
-                        return;
-                    }
-                    group_child = gc.next_sibling();
-                }
-            }
-            child = c.next_sibling();
+    // Find the list box by name (recursive search)
+    if let Some(list_box) = find_widget_by_name(widget, "status-list-box") {
+        if let Some(list_box) = list_box.downcast_ref::<gtk::ListBox>() {
+            do_refresh(list_box, manager);
         }
     }
+}
+
+fn find_widget_by_name(widget: &gtk::Widget, name: &str) -> Option<gtk::Widget> {
+    if widget.widget_name() == name {
+        return Some(widget.clone());
+    }
+    let mut child = widget.first_child();
+    while let Some(c) = child {
+        if let Some(found) = find_widget_by_name(&c, name) {
+            return Some(found);
+        }
+        child = c.next_sibling();
+    }
+    None
 }
 
 fn do_refresh(list_box: &gtk::ListBox, manager: Arc<CgroupManager>) {
@@ -106,7 +109,11 @@ fn create_process_row(
     list_box: &gtk::ListBox,
 ) -> adw::ActionRow {
     let row = adw::ActionRow::new();
-    row.set_title(&format!("{} (PID {})", proc.name, proc.pid));
+    row.set_title(&format!(
+        "{} (PID {})",
+        glib::markup_escape_text(&proc.name),
+        proc.pid
+    ));
 
     // Build subtitle with limits
     let mut limits = Vec::new();
@@ -135,11 +142,11 @@ fn create_process_row(
     remove_btn.add_css_class("flat");
     remove_btn.set_tooltip_text(Some("Remove limits"));
 
-    let pid = proc.pid;
+    let cgroup_name = proc.cgroup_name.clone();
     let list_box_clone = list_box.clone();
     let manager_clone = manager.clone();
     remove_btn.connect_clicked(move |_| {
-        if let Err(e) = manager_clone.remove_limit(pid) {
+        if let Err(e) = manager_clone.cleanup_cgroup(&cgroup_name) {
             tracing::error!("Failed to remove limit: {e}");
         } else {
             do_refresh(&list_box_clone, manager_clone.clone());

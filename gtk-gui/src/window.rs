@@ -135,10 +135,28 @@ impl Window {
 
         // Connect sidebar selection to stack
         let content_stack_clone = content_stack.clone();
+        let status_page_clone = status_page.clone();
+        let limit_page_clone = limit_page.clone();
+        let run_page_clone = run_page.clone();
+        let manager_clone = self.manager();
         sidebar_list.connect_row_selected(move |_, row| {
             if let Some(row) = row {
                 if let Some(id) = row.widget_name().as_str().strip_prefix("nav-") {
                     content_stack_clone.set_visible_child_name(id);
+                    match id {
+                        "status" => {
+                            if let Some(ref mgr) = manager_clone {
+                                pages::status::refresh(&status_page_clone, mgr.clone());
+                            }
+                        }
+                        "limit" => {
+                            pages::limit::refresh_profiles(&limit_page_clone);
+                        }
+                        "run" => {
+                            pages::run::refresh_profiles(&run_page_clone);
+                        }
+                        _ => {}
+                    }
                 }
             }
         });
