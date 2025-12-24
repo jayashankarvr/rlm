@@ -266,12 +266,12 @@ fn filter_apps(state: &Rc<RefCell<RunState>>, query: &str) {
 
     // Get desktop apps
     let mut filtered: Vec<_> = if query.is_empty() {
-        apps.iter().cloned().take(50).collect()
+        apps.iter().take(50).cloned().collect()
     } else {
         apps.iter()
             .filter(|app| app.name.to_lowercase().contains(&query_lower))
-            .cloned()
             .take(50)
+            .cloned()
             .collect()
     };
 
