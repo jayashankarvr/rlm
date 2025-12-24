@@ -38,3 +38,38 @@ pub fn get_unit_suffix(dropdown: &gtk::DropDown) -> &'static str {
     let idx = dropdown.selected() as usize;
     UNIT_SUFFIXES.get(idx).copied().unwrap_or("M")
 }
+
+/// Parse a value like "4G" or "100M" and set entry + dropdown
+pub fn set_value_with_unit(entry: &adw::EntryRow, dropdown: &gtk::DropDown, value: &str) {
+    let value = value.trim();
+    if value.is_empty() {
+        entry.set_text("");
+        return;
+    }
+
+    // Find where digits end
+    let digit_end = value
+        .chars()
+        .position(|c| !c.is_ascii_digit())
+        .unwrap_or(value.len());
+
+    let (num_part, unit_part) = value.split_at(digit_end);
+
+    // Set numeric part
+    entry.set_text(num_part);
+
+    // Set unit dropdown based on suffix
+    let unit_idx = match unit_part.trim().to_uppercase().as_str() {
+        "K" | "KB" => 0,
+        "M" | "MB" => 1,
+        "G" | "GB" => 2,
+        "T" | "TB" => 3,
+        _ => 1, // Default to MB
+    };
+    dropdown.set_selected(unit_idx);
+}
+
+/// Parse a CPU value like "75%" and return just the number
+pub fn parse_cpu_value(value: &str) -> String {
+    value.trim().trim_end_matches('%').to_string()
+}

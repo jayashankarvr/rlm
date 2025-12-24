@@ -1,4 +1,7 @@
-use crate::widgets::{create_unit_dropdown, get_unit_suffix, setup_number_validation};
+use crate::widgets::{
+    create_unit_dropdown, get_unit_suffix, parse_cpu_value, set_value_with_unit,
+    setup_number_validation,
+};
 use adw::prelude::*;
 use gtk::glib;
 use rlm_core::CgroupManager;
@@ -39,6 +42,12 @@ pub fn create(manager: Option<Arc<CgroupManager>>) -> gtk::Widget {
     page.set_title("Run");
     page.set_icon_name(Some("media-playback-start-symbolic"));
 
+    // Main heading group
+    let header_group = adw::PreferencesGroup::new();
+    header_group.set_title("Launch New Process");
+    header_group.set_description(Some("Start an application with resource limits"));
+    page.add(&header_group);
+
     // Status label
     let status_label = gtk::Label::new(None);
     status_label.set_margin_top(12);
@@ -48,7 +57,6 @@ pub fn create(manager: Option<Arc<CgroupManager>>) -> gtk::Widget {
     // Command group
     let command_group = adw::PreferencesGroup::new();
     command_group.set_title("Command");
-    command_group.set_description(Some("Enter a command or select an application"));
 
     let command_entry = adw::EntryRow::new();
     command_entry.set_title("Command");
@@ -97,6 +105,7 @@ pub fn create(manager: Option<Arc<CgroupManager>>) -> gtk::Widget {
     let profile_dropdown = gtk::DropDown::new(Some(profile_list), gtk::Expression::NONE);
     profile_dropdown.set_selected(0);
     profile_dropdown.set_valign(gtk::Align::Center);
+    profile_dropdown.set_widget_name("run-profile-dropdown");
 
     let profile_row = adw::ActionRow::new();
     profile_row.set_title("Profile");
@@ -255,14 +264,26 @@ fn filter_apps(state: &Rc<RefCell<RunState>>, query: &str) {
     let apps = state_ref.all_apps.borrow();
     let query_lower = query.to_lowercase();
 
-    let filtered: Vec<_> = if query.is_empty() {
-        apps.iter().take(50).collect()
+    // Get desktop apps
+    let mut filtered: Vec<_> = if query.is_empty() {
+        apps.iter().cloned().take(50).collect()
     } else {
         apps.iter()
             .filter(|app| app.name.to_lowercase().contains(&query_lower))
+            .cloned()
             .take(50)
             .collect()
     };
+
+    // Add CLI apps from PATH when searching
+    if !query.is_empty() {
+        let cli_apps = rlm_core::desktop::search_cli_apps(query);
+        for cli_app in cli_apps {
+            if !filtered.iter().any(|a| a.exec == cli_app.exec) {
+                filtered.push(cli_app);
+            }
+        }
+    }
 
     if filtered.is_empty() {
         let row = adw::ActionRow::new();
@@ -275,8 +296,8 @@ fn filter_apps(state: &Rc<RefCell<RunState>>, query: &str) {
     } else {
         for app in filtered {
             let row = adw::ActionRow::new();
-            row.set_title(&app.name);
-            row.set_subtitle(&app.exec);
+            row.set_title(&glib::markup_escape_text(&app.name));
+            row.set_subtitle(&glib::markup_escape_text(&app.exec));
             row.set_activatable(true);
 
             let exec = app.exec.clone();
@@ -302,16 +323,16 @@ fn apply_profile(state: &Rc<RefCell<RunState>>, index: usize) {
     if let Ok(config) = common::Config::load() {
         if let Some(profile) = config.get_profile(profile_name) {
             if let Some(ref mem) = profile.memory {
-                state.memory_entry.set_text(mem);
+                set_value_with_unit(&state.memory_entry, &state.memory_unit, mem);
             }
             if let Some(ref cpu) = profile.cpu {
-                state.cpu_entry.set_text(cpu);
+                state.cpu_entry.set_text(&parse_cpu_value(cpu));
             }
             if let Some(ref ior) = profile.io_read {
-                state.io_read_entry.set_text(ior);
+                set_value_with_unit(&state.io_read_entry, &state.io_read_unit, ior);
             }
             if let Some(ref iow) = profile.io_write {
-                state.io_write_entry.set_text(iow);
+                set_value_with_unit(&state.io_write_entry, &state.io_write_unit, iow);
             }
         }
     }
@@ -494,4 +515,31 @@ fn setup_command_validation(entry: &adw::EntryRow) {
             e.remove_css_class("error");
         }
     });
+}
+
+/// Refresh the profile dropdown
+pub fn refresh_profiles(widget: &gtk::Widget) {
+    if let Some(dropdown) = find_widget_by_name(widget, "run-profile-dropdown") {
+        if let Some(dropdown) = dropdown.downcast_ref::<gtk::DropDown>() {
+            let profiles = load_profile_names();
+            let profile_list =
+                gtk::StringList::new(&profiles.iter().map(|s| s.as_str()).collect::<Vec<_>>());
+            dropdown.set_model(Some(&profile_list));
+            dropdown.set_selected(0);
+        }
+    }
+}
+
+fn find_widget_by_name(widget: &gtk::Widget, name: &str) -> Option<gtk::Widget> {
+    if widget.widget_name() == name {
+        return Some(widget.clone());
+    }
+    let mut child = widget.first_child();
+    while let Some(c) = child {
+        if let Some(found) = find_widget_by_name(&c, name) {
+            return Some(found);
+        }
+        child = c.next_sibling();
+    }
+    None
 }

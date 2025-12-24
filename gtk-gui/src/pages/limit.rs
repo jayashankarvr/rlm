@@ -1,5 +1,9 @@
-use crate::widgets::{create_unit_dropdown, get_unit_suffix, setup_number_validation};
+use crate::widgets::{
+    create_unit_dropdown, get_unit_suffix, parse_cpu_value, set_value_with_unit,
+    setup_number_validation,
+};
 use adw::prelude::*;
+use gtk::glib;
 use rlm_core::CgroupManager;
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -32,6 +36,12 @@ pub fn create(manager: Option<Arc<CgroupManager>>) -> gtk::Widget {
     page.set_title("Limit");
     page.set_icon_name(Some("speedometer-symbolic"));
 
+    // Main heading group
+    let header_group = adw::PreferencesGroup::new();
+    header_group.set_title("Limit Running Process");
+    header_group.set_description(Some("Apply resource limits to a running process"));
+    page.add(&header_group);
+
     // Status label for feedback
     let status_label = gtk::Label::new(None);
     status_label.set_margin_top(12);
@@ -41,7 +51,6 @@ pub fn create(manager: Option<Arc<CgroupManager>>) -> gtk::Widget {
     // Target process group
     let target_group = adw::PreferencesGroup::new();
     target_group.set_title("Target Process");
-    target_group.set_description(Some("Enter PID or search below"));
 
     let pid_entry = adw::EntryRow::new();
     pid_entry.set_title("Process ID");
@@ -89,6 +98,7 @@ pub fn create(manager: Option<Arc<CgroupManager>>) -> gtk::Widget {
     let profile_dropdown = gtk::DropDown::new(Some(profile_list), gtk::Expression::NONE);
     profile_dropdown.set_selected(0);
     profile_dropdown.set_valign(gtk::Align::Center);
+    profile_dropdown.set_widget_name("limit-profile-dropdown");
 
     let profile_row = adw::ActionRow::new();
     profile_row.set_title("Profile");
@@ -261,16 +271,16 @@ fn apply_profile(state: &Rc<RefCell<LimitState>>, index: usize) {
     if let Ok(config) = common::Config::load() {
         if let Some(profile) = config.get_profile(profile_name) {
             if let Some(ref mem) = profile.memory {
-                state.memory_entry.set_text(mem);
+                set_value_with_unit(&state.memory_entry, &state.memory_unit, mem);
             }
             if let Some(ref cpu) = profile.cpu {
-                state.cpu_entry.set_text(cpu);
+                state.cpu_entry.set_text(&parse_cpu_value(cpu));
             }
             if let Some(ref ior) = profile.io_read {
-                state.io_read_entry.set_text(ior);
+                set_value_with_unit(&state.io_read_entry, &state.io_read_unit, ior);
             }
             if let Some(ref iow) = profile.io_write {
-                state.io_write_entry.set_text(iow);
+                set_value_with_unit(&state.io_write_entry, &state.io_write_unit, iow);
             }
         }
     }
@@ -316,7 +326,7 @@ fn filter_processes(state: &Rc<RefCell<LimitState>>, query: &str) {
     } else {
         for proc in filtered {
             let row = adw::ActionRow::new();
-            row.set_title(&proc.name);
+            row.set_title(&glib::markup_escape_text(&proc.name));
             row.set_subtitle(&format!("PID: {}", proc.pid));
             row.set_activatable(true);
 
@@ -440,4 +450,31 @@ fn show_status(label: &gtk::Label, message: &str, is_error: bool) {
     } else {
         label.add_css_class("success");
     }
+}
+
+/// Refresh the profile dropdown
+pub fn refresh_profiles(widget: &gtk::Widget) {
+    if let Some(dropdown) = find_widget_by_name(widget, "limit-profile-dropdown") {
+        if let Some(dropdown) = dropdown.downcast_ref::<gtk::DropDown>() {
+            let profiles = load_profile_names();
+            let profile_list =
+                gtk::StringList::new(&profiles.iter().map(|s| s.as_str()).collect::<Vec<_>>());
+            dropdown.set_model(Some(&profile_list));
+            dropdown.set_selected(0);
+        }
+    }
+}
+
+fn find_widget_by_name(widget: &gtk::Widget, name: &str) -> Option<gtk::Widget> {
+    if widget.widget_name() == name {
+        return Some(widget.clone());
+    }
+    let mut child = widget.first_child();
+    while let Some(c) = child {
+        if let Some(found) = find_widget_by_name(&c, name) {
+            return Some(found);
+        }
+        child = c.next_sibling();
+    }
+    None
 }
