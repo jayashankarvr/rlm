@@ -6,7 +6,6 @@ use adw::prelude::*;
 use gtk::glib;
 use rlm_core::CgroupManager;
 use std::cell::RefCell;
-use std::process::Command;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -445,7 +444,12 @@ fn run_command(state: &Rc<RefCell<RunState>>) {
         }
     };
 
-    let child = match Command::new(program).args(args).spawn() {
+    // Place the child into the cgroup before it execs, so limits apply from its
+    // first instruction (see CgroupManager::placement_command). add_to_cgroup
+    // below remains as a fallback.
+    let mut cmd = manager.placement_command(&cgroup_path, program);
+    cmd.args(args);
+    let child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
             let _ = manager.cleanup_cgroup(&cgroup_name);

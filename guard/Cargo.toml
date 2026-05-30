@@ -1,0 +1,19 @@
+[package]
+name = "rlm-guard"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "rlm freeze-guard daemon - proactively prevents system freezes"
+
+[[bin]]
+name = "rlm-guard"
+path = "src/main.rs"
+
+[dependencies]
+common.workspace = true
+rlm-core.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+ctrlc.workspace = true
+libc = "0.2.178"

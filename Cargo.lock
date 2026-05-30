@@ -908,6 +908,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "rlm-guard"
+version = "0.1.0"
+dependencies = [
+ "common",
+ "ctrlc",
+ "libc",
+ "rlm-core",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "rustc_version"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

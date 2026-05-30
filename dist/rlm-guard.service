@@ -1,0 +1,17 @@
+[Unit]
+Description=rlm freeze guard - proactively prevents system freezes
+Documentation=https://github.com/jayashankarvr/rlm
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/rlm-guard
+Restart=on-failure
+RestartSec=2
+# Stop with SIGTERM and give the daemon a bounded window to thaw/undo all
+# interventions on shutdown (undo_all is fast; this just caps the worst case).
+KillSignal=SIGTERM
+TimeoutStopSec=10
+
+[Install]
+WantedBy=default.target

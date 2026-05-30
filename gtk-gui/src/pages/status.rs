@@ -109,11 +109,31 @@ fn create_process_row(
     list_box: &gtk::ListBox,
 ) -> adw::ActionRow {
     let row = adw::ActionRow::new();
-    row.set_title(&format!(
-        "{} (PID {})",
-        glib::markup_escape_text(&proc.name),
-        proc.pid
-    ));
+    
+    // Build title with process count for shared cgroups
+    let title = if proc.is_shared {
+        if let Some(count) = proc.process_count {
+            format!(
+                "{} (PID {}, {} processes)",
+                glib::markup_escape_text(&proc.name),
+                proc.pid,
+                count
+            )
+        } else {
+            format!(
+                "{} (PID {}, shared)",
+                glib::markup_escape_text(&proc.name),
+                proc.pid
+            )
+        }
+    } else {
+        format!(
+            "{} (PID {})",
+            glib::markup_escape_text(&proc.name),
+            proc.pid
+        )
+    };
+    row.set_title(&title);
 
     // Build subtitle with limits
     let mut limits = Vec::new();
@@ -130,11 +150,18 @@ fn create_process_row(
         limits.push(format!("I/O Write: {}/s", format_bytes(w)));
     }
 
-    if limits.is_empty() {
-        row.set_subtitle("No limits set");
+    let mut subtitle = if limits.is_empty() {
+        "No limits set".to_string()
     } else {
-        row.set_subtitle(&limits.join(" | "));
+        limits.join(" | ")
+    };
+    
+    // Add note about shared limits
+    if proc.is_shared {
+        subtitle.push_str(" (shared among all processes)");
     }
+    
+    row.set_subtitle(&subtitle);
 
     // Remove button
     let remove_btn = gtk::Button::from_icon_name("user-trash-symbolic");

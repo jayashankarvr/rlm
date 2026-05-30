@@ -12,6 +12,8 @@ pub struct ProcessStatus {
     pub cpu_quota: Option<u32>,
     pub io_read_bps: Option<u64>,
     pub io_write_bps: Option<u64>,
+    pub is_shared: bool,
+    pub process_count: Option<usize>,
 }
 
 /// Get status of all processes managed by rlm
@@ -42,11 +44,16 @@ pub fn get_managed_processes(manager: &CgroupManager) -> Result<Vec<ProcessStatu
         }
 
         // Extract PID from cgroup directory name patterns:
-        // - "pid-XXXX" (CLI limit command)
-        // - "run-XXXX" (CLI run command)
+        // - "pid-XXXX" (CLI limit command - individual)
+        // - "app-XXXX" (CLI limit --application - shared)
+        // - "multi-XXXX" (CLI limit --all-pids - shared)
+        // - "run-XXXX-XXXX" (CLI run command: pid + timestamp)
         // - "gtk-XXXX-N" (GUI run command)
         let pid = if let Some(pid_str) = cgroup_name.strip_prefix("pid-") {
             pid_str.parse::<u32>().ok()
+        } else if cgroup_name.starts_with("app-") || cgroup_name.starts_with("multi-") {
+            // For shared cgroups, read first PID from cgroup.procs
+            read_first_pid(&path)
         } else if cgroup_name.starts_with("run-") || cgroup_name.starts_with("gtk-") {
             // For run-* and gtk-* cgroups, read PID from cgroup.procs
             read_first_pid(&path)
@@ -55,8 +62,15 @@ pub fn get_managed_processes(manager: &CgroupManager) -> Result<Vec<ProcessStatu
         };
 
         let Some(pid) = pid else {
-            // No PID found - cgroup is empty/dead, mark for cleanup
-            dead_cgroups.push(cgroup_name.to_string());
+            // No PID found - cgroup is empty. Only reap it if it isn't freshly
+            // created: another `limit`/`run` invocation may have created the
+            // cgroup and not yet written its PID into cgroup.procs. Reaping it
+            // mid-setup would race-delete a cgroup that's about to be used.
+            // Reaping is merely DEFERRED here, not skipped: a genuinely-dead
+            // fresh cgroup is collected on the next status pass once 2s elapse.
+            if !recently_modified(&path, 2) {
+                dead_cgroups.push(cgroup_name.to_string());
+            }
             continue;
         };
 
@@ -85,6 +99,23 @@ pub fn get_managed_processes(manager: &CgroupManager) -> Result<Vec<ProcessStatu
             continue;
         }
 
+        // Check if this is a shared cgroup
+        let is_shared = cgroup_name.starts_with("app-")
+            || cgroup_name.starts_with("multi-")
+            || cgroup_name.starts_with("run-")
+            || cgroup_name.starts_with("gtk-");
+
+        // Count processes in shared cgroups
+        let process_count = if is_shared {
+            if let Ok(content) = fs::read_to_string(path.join("cgroup.procs")) {
+                Some(content.lines().filter(|l| !l.trim().is_empty()).count())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         results.push(ProcessStatus {
             pid,
             name: proc_name,
@@ -93,6 +124,8 @@ pub fn get_managed_processes(manager: &CgroupManager) -> Result<Vec<ProcessStatu
             cpu_quota,
             io_read_bps,
             io_write_bps,
+            is_shared,
+            process_count,
         });
     }
 
@@ -104,6 +137,16 @@ pub fn get_managed_processes(manager: &CgroupManager) -> Result<Vec<ProcessStatu
     }
 
     Ok(results)
+}
+
+/// Whether `path` was modified within the last `secs` seconds.
+fn recently_modified(path: &Path, secs: u64) -> bool {
+    fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .map(|age| age.as_secs() < secs)
+        .unwrap_or(false)
 }
 
 fn read_first_pid(cgroup_path: &Path) -> Option<u32> {

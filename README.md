@@ -51,15 +51,24 @@ cargo install --path gtk-gui
 ### Limit a running process
 
 ```bash
-# By PID
+# By PID (individual limit)
 rlm limit --pid 1234 --memory 512M --cpu 50%
 
-# By name (limits all matching processes)
+# By name (limits all matching processes individually)
 rlm limit --name firefox --memory 2G
+
+# By application (all processes share the same limit pool)
+rlm limit --application firefox --memory 4G --cpu 75%
+# Note: All Firefox processes share 4GB total, not 4GB each
+
+# Multiple specific PIDs (share limits)
+rlm limit --all-pids 1234,5678,9012 --memory 2G --cpu 50%
 
 # With I/O limits
 rlm limit --pid 1234 --memory 1G --io-read 50M --io-write 20M
 ```
+
+**Important:** When using `--application` or `--all-pids`, all processes **share** the limits (combined pool). For example, 10 processes with 4GB limit = 4GB total shared among all, not 4GB each. See [APPLICATION_LIMITING.md](APPLICATION_LIMITING.md) for details.
 
 ### Run a command with limits
 
@@ -75,6 +84,8 @@ rlm run --profile browser -- firefox
 ```bash
 rlm unlimit --pid 1234
 rlm unlimit --name firefox
+rlm unlimit --application firefox  # Remove shared application limits
+rlm unlimit --cgroup app-firefox   # Remove by cgroup name
 ```
 
 ### View managed processes

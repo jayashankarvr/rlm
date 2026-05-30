@@ -2,7 +2,7 @@ use clap::{Parser, Subcommand};
 use common::{build_limit, format_bytes, Config, Error, Result};
 use rlm_core::CgroupManager;
 use std::io::{self, Write};
-use std::process::{Command, ExitCode};
+use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -13,6 +13,22 @@ fn resolve_pids(pid: Option<u32>, name: Option<&str>) -> Result<Vec<u32>> {
         (None, None) => Err(Error::InvalidArgs("specify either --pid or --name".into())),
         (Some(_), Some(_)) => unreachable!("clap prevents this"),
     }
+}
+
+fn resolve_application_pids(application: &str) -> Result<Vec<u32>> {
+    let processes = rlm_core::process::find_all_by_executable(application)?;
+    Ok(processes.iter().map(|p| p.pid).collect())
+}
+
+fn parse_pid_list(pids_str: &str) -> Result<Vec<u32>> {
+    pids_str
+        .split(',')
+        .map(|s| {
+            s.trim()
+                .parse::<u32>()
+                .map_err(|_| Error::InvalidArgs(format!("invalid PID: {}", s.trim())))
+        })
+        .collect()
 }
 
 /// Prompt user for confirmation when affecting multiple processes
@@ -56,26 +72,40 @@ enum Commands {
     /// Apply resource limits to a running process
     Limit {
         /// Process ID to limit
-        #[arg(long, conflicts_with = "name")]
+        #[arg(long, conflicts_with_all = ["name", "application", "all_pids"])]
         pid: Option<u32>,
 
-        /// Process name to limit (limits all matching processes)
-        #[arg(long, conflicts_with = "pid")]
+        /// Process name to limit (limits all matching processes individually)
+        #[arg(long, conflicts_with_all = ["pid", "application", "all_pids"])]
         name: Option<String>,
 
+        /// Application name to limit (all processes share the same limit pool)
+        /// Use this for applications with multiple processes (e.g., firefox, chrome)
+        /// All processes will share the specified limits (combined, not per-process)
+        #[arg(long, conflicts_with_all = ["pid", "name", "all_pids"])]
+        application: Option<String>,
+
+        /// Comma-separated list of PIDs to limit together (share the same limit pool)
+        #[arg(long, conflicts_with_all = ["pid", "name", "application"])]
+        all_pids: Option<String>,
+
         /// Memory limit (K=1024, M=1024K, G=1024M, T=1024G)
+        /// Note: For multiple processes, this is shared among all processes
         #[arg(long, value_name = "SIZE")]
         memory: Option<String>,
 
         /// CPU limit as percentage (50%=half core, 100%=1 core, 200%=2 cores)
+        /// Note: For multiple processes, this is shared among all processes
         #[arg(long, value_name = "PERCENT")]
         cpu: Option<String>,
 
         /// I/O read bandwidth limit per second (K/M/G/T units)
+        /// Note: For multiple processes, this is shared among all processes
         #[arg(long, value_name = "SIZE")]
         io_read: Option<String>,
 
         /// I/O write bandwidth limit per second (K/M/G/T units)
+        /// Note: For multiple processes, this is shared among all processes
         #[arg(long, value_name = "SIZE")]
         io_write: Option<String>,
 
@@ -87,12 +117,20 @@ enum Commands {
     /// Remove resource limits from a process
     Unlimit {
         /// Process ID to unlimit
-        #[arg(long, conflicts_with = "name")]
+        #[arg(long, conflicts_with_all = ["name", "application", "cgroup"])]
         pid: Option<u32>,
 
-        /// Process name to unlimit
-        #[arg(long, conflicts_with = "pid")]
+        /// Process name to unlimit (all matching processes)
+        #[arg(long, conflicts_with_all = ["pid", "application", "cgroup"])]
         name: Option<String>,
+
+        /// Application name to unlimit (removes shared cgroup)
+        #[arg(long, conflicts_with_all = ["pid", "name", "cgroup"])]
+        application: Option<String>,
+
+        /// Cgroup name to remove (for shared application cgroups)
+        #[arg(long, conflicts_with_all = ["pid", "name", "application"])]
+        cgroup: Option<String>,
     },
 
     /// Run a command with resource limits
@@ -148,6 +186,24 @@ enum Commands {
 
     /// Check system requirements and diagnose issues
     Doctor,
+
+    /// Manage the freeze-guard daemon (rlm-guard)
+    Guard {
+        #[command(subcommand)]
+        action: GuardAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum GuardAction {
+    /// Show current memory pressure and active guard interventions
+    Status,
+    /// Enable and start the guard user service
+    Enable,
+    /// Disable and stop the guard user service
+    Disable,
+    /// Dry-run: print what the guard would do right now, without acting
+    Test,
 }
 
 fn main() -> ExitCode {
@@ -175,6 +231,8 @@ fn run() -> Result<ExitCode> {
         Commands::Limit {
             pid,
             name,
+            application,
+            all_pids,
             memory,
             cpu,
             io_read,
@@ -194,7 +252,33 @@ fn run() -> Result<ExitCode> {
                 ));
             }
 
-            let pids = resolve_pids(pid, name.as_deref())?;
+            // Determine which mode we're in
+            let (pids, cgroup_name, is_shared) = if let Some(app_name) = application {
+                // Application mode: all processes share limits
+                let pids = resolve_application_pids(&app_name)?;
+                if pids.is_empty() {
+                    return Err(Error::ProcessNameNotFound(app_name));
+                }
+                let cgroup_name = format!("app-{}", app_name.replace(['/', ' '], "_"));
+                println!(
+                    "Found {} process(es) for application '{}'",
+                    pids.len(),
+                    app_name
+                );
+                (pids, cgroup_name, true)
+            } else if let Some(pids_str) = all_pids {
+                // Multiple PIDs mode: all share limits
+                let pids = parse_pid_list(&pids_str)?;
+                if pids.is_empty() {
+                    return Err(Error::InvalidArgs("no valid PIDs specified".into()));
+                }
+                let cgroup_name = format!("multi-{}", pids[0]);
+                (pids, cgroup_name, true)
+            } else {
+                // Individual mode: each process gets its own limits
+                let pids = resolve_pids(pid, name.as_deref())?;
+                (pids, String::new(), false)
+            };
 
             if dry_run {
                 println!(
@@ -207,19 +291,23 @@ fn run() -> Result<ExitCode> {
                         .unwrap_or_else(|_| "?".to_string());
                     println!("  {pid}: {name}");
                 }
-                println!("\nLimits:");
+                if is_shared {
+                    println!("\n⚠️  All processes will SHARE these limits (combined pool):");
+                } else {
+                    println!("\nLimits (per process):");
+                }
                 if let Some(ref mem) = limit.memory {
-                    println!("  Memory: {} bytes", mem.bytes());
+                    println!("  Memory: {}", format_bytes(mem.bytes()));
                 }
                 if let Some(ref cpu) = limit.cpu {
                     println!("  CPU: {}%", cpu.percent());
                 }
                 if let Some(ref io) = limit.io {
                     if let Some(r) = io.read_bps {
-                        println!("  I/O Read: {} bytes/sec", r);
+                        println!("  I/O Read: {}/s", format_bytes(r));
                     }
                     if let Some(w) = io.write_bps {
-                        println!("  I/O Write: {} bytes/sec", w);
+                        println!("  I/O Write: {}/s", format_bytes(w));
                     }
                 }
                 return Ok(ExitCode::SUCCESS);
@@ -230,23 +318,52 @@ fn run() -> Result<ExitCode> {
                 return Ok(ExitCode::SUCCESS);
             }
 
-            for pid in &pids {
-                manager.apply_limit(*pid, &limit)?;
-                println!("applied limits to pid {pid}");
+            if is_shared {
+                // Apply shared limits to all processes
+                manager.apply_limit_to_multiple(&pids, &limit, &cgroup_name)?;
+                println!(
+                    "Applied shared limits to {} process(es) in cgroup '{}'",
+                    pids.len(),
+                    cgroup_name
+                );
+                println!("⚠️  Note: All processes share these limits (combined pool)");
+            } else {
+                // Apply individual limits to each process
+                for pid in &pids {
+                    manager.apply_limit(*pid, &limit)?;
+                    println!("applied limits to pid {pid}");
+                }
             }
         }
 
-        Commands::Unlimit { pid, name } => {
-            let pids = resolve_pids(pid, name.as_deref())?;
+        Commands::Unlimit {
+            pid,
+            name,
+            application,
+            cgroup,
+        } => {
+            if let Some(cgroup_name) = cgroup {
+                // Remove by cgroup name
+                manager.remove_application_limit(&cgroup_name)?;
+                println!("removed limits from cgroup '{}'", cgroup_name);
+            } else if let Some(app_name) = application {
+                // Remove application cgroup
+                let cgroup_name = format!("app-{}", app_name.replace(['/', ' '], "_"));
+                manager.remove_application_limit(&cgroup_name)?;
+                println!("removed limits from application '{}'", app_name);
+            } else {
+                // Remove individual processes
+                let pids = resolve_pids(pid, name.as_deref())?;
 
-            if !confirm_batch(&pids, "Unlimit") {
-                println!("cancelled");
-                return Ok(ExitCode::SUCCESS);
-            }
+                if !confirm_batch(&pids, "Unlimit") {
+                    println!("cancelled");
+                    return Ok(ExitCode::SUCCESS);
+                }
 
-            for pid in &pids {
-                manager.remove_limit(*pid)?;
-                println!("removed limits from pid {pid}");
+                for pid in &pids {
+                    manager.remove_limit(*pid)?;
+                    println!("removed limits from pid {pid}");
+                }
             }
         }
 
@@ -315,10 +432,13 @@ fn run() -> Result<ExitCode> {
 
         Commands::Export { file } => {
             let config = Config::load()?;
-            let profiles = config.all_profiles();
+            // Export only user-defined profiles. Built-in presets are always
+            // available, so including them would re-import as user profiles and
+            // permanently pollute the user's config on a round-trip.
+            let profiles = config.profiles.clone();
 
             if profiles.is_empty() {
-                println!("no profiles to export");
+                println!("no user-defined profiles to export (built-in presets are always available)");
             } else {
                 // Create export structure
                 let export = serde_yaml_ng::to_string(&profiles)
@@ -370,10 +490,10 @@ fn run() -> Result<ExitCode> {
                 println!("no processes currently managed");
             } else {
                 println!(
-                    "{:<8} {:<20} {:>12} {:>15} {:>10}",
-                    "PID", "NAME", "MEMORY", "CPU", "I/O"
+                    "{:<8} {:<25} {:>12} {:>15} {:>10} {:>15}",
+                    "PID", "NAME", "MEMORY", "CPU", "I/O", "TYPE"
                 );
-                println!("{}", "-".repeat(70));
+                println!("{}", "-".repeat(85));
 
                 for p in processes {
                     let mem = p.memory_max.map(format_bytes).unwrap_or_else(|| "-".into());
@@ -386,20 +506,145 @@ fn run() -> Result<ExitCode> {
                     } else {
                         "-".to_string()
                     };
+                    let type_info = if p.is_shared {
+                        if let Some(count) = p.process_count {
+                            format!("shared ({} procs)", count)
+                        } else {
+                            "shared".to_string()
+                        }
+                    } else {
+                        "individual".to_string()
+                    };
                     println!(
-                        "{:<8} {:<20} {:>12} {:>15} {:>10}",
-                        p.pid, p.name, mem, cpu, io
+                        "{:<8} {:<25} {:>12} {:>15} {:>10} {:>15}",
+                        p.pid, p.name, mem, cpu, io, type_info
                     );
                 }
+                println!("\nNote: 'shared' means multiple processes share the same limit pool");
             }
         }
 
         Commands::Doctor => {
             run_doctor();
         }
+
+        Commands::Guard { action } => {
+            return run_guard(&manager, action);
+        }
     }
 
     Ok(ExitCode::SUCCESS)
+}
+
+fn run_guard(manager: &CgroupManager, action: GuardAction) -> Result<ExitCode> {
+    match action {
+        GuardAction::Enable => systemctl(&["enable", "--now", "rlm-guard"]),
+        GuardAction::Disable => systemctl(&["disable", "--now", "rlm-guard"]),
+        GuardAction::Status => {
+            guard_status(manager);
+            Ok(ExitCode::SUCCESS)
+        }
+        GuardAction::Test => {
+            guard_test();
+            Ok(ExitCode::SUCCESS)
+        }
+    }
+}
+
+fn systemctl(args: &[&str]) -> Result<ExitCode> {
+    let status = std::process::Command::new("systemctl")
+        .arg("--user")
+        .args(args)
+        .status()
+        .map_err(|e| Error::InvalidArgs(format!("failed to run systemctl: {e}")))?;
+    Ok(if status.success() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    })
+}
+
+/// Current real UID from the kernel.
+fn current_uid() -> u32 {
+    // SAFETY: getuid() is always safe; it only reads our real UID.
+    unsafe { libc::getuid() }
+}
+
+fn guard_status(manager: &CgroupManager) {
+    let cfg = Config::load().unwrap_or_default();
+    let sampler = rlm_core::guard::Sampler::new(cfg.guard, std::process::id(), current_uid());
+
+    match sampler.sample() {
+        Some(s) => println!(
+            "Memory pressure: some(avg10)={:.1}%  full(avg10)={:.1}%  available={} MB",
+            s.some_avg10, s.full_avg10, s.mem_available_mb
+        ),
+        None => println!("Memory pressure: PSI unavailable (/proc/pressure/memory)"),
+    }
+
+    let base = manager.base_path();
+    let pids = manager.list_guard_pids();
+    if pids.is_empty() {
+        println!("\nNo active guard interventions.");
+        return;
+    }
+
+    println!("\n{:<8} {:<20} {:<8} {:<14}", "PID", "NAME", "STATE", "MEM.HIGH");
+    println!("{}", "-".repeat(52));
+    for pid in pids {
+        let gpath = base.join(format!("guard-{pid}"));
+        let frozen = std::fs::read_to_string(gpath.join("cgroup.freeze"))
+            .map(|s| s.trim() == "1")
+            .unwrap_or(false);
+        let high = std::fs::read_to_string(gpath.join("memory.high"))
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+        let name = std::fs::read_to_string(format!("/proc/{pid}/comm"))
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|_| "?".to_string());
+        let state = if frozen {
+            "frozen"
+        } else if !high.is_empty() && high != "max" {
+            "capped"
+        } else {
+            "active"
+        };
+        println!("{:<8} {:<20} {:<8} {:<14}", pid, name, state, high);
+    }
+}
+
+fn guard_test() {
+    // Single-shot preview: ticks a FRESH engine once at now_ms=0, so it shows
+    // what the guard's *first* action would be right now (the escalation gate is
+    // open and no prior interventions exist). It does not simulate recovery or
+    // cooldown behavior, and applies nothing.
+    let cfg = Config::load().unwrap_or_default();
+    let sampler =
+        rlm_core::guard::Sampler::new(cfg.guard.clone(), std::process::id(), current_uid());
+    let mut engine = rlm_core::guard::PolicyEngine::new(cfg.guard);
+
+    let Some(sample) = sampler.sample() else {
+        println!("PSI unavailable; cannot evaluate guard actions.");
+        return;
+    };
+    let procs = sampler.eligible();
+    println!(
+        "Pressure: some={:.1}%  full={:.1}%  available={} MB  |  {} eligible process(es)",
+        sample.some_avg10,
+        sample.full_avg10,
+        sample.mem_available_mb,
+        procs.len()
+    );
+
+    let actions = engine.tick(0, sample, &procs);
+    if actions.is_empty() {
+        println!("No action would be taken right now.");
+    } else {
+        println!("Would take {} action(s):", actions.len());
+        for a in &actions {
+            println!("  {a:?}");
+        }
+    }
 }
 
 fn run_doctor() {
@@ -497,8 +742,14 @@ fn run_with_limits(
         .split_first()
         .ok_or_else(|| common::Error::InvalidArgs("command is required".into()))?;
 
-    // Generate unique cgroup name
-    let cgroup_name = format!("run-{}", std::process::id());
+    // Generate a collision-resistant cgroup name. Using only the PID risks
+    // reusing a stale leaked `run-<pid>` cgroup after PID reuse; the timestamp
+    // suffix makes that effectively impossible.
+    let uniq = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let cgroup_name = format!("run-{}-{}", std::process::id(), uniq);
 
     // Create cgroup and set limits BEFORE spawning the process
     let cgroup_path = manager.prepare_cgroup(&cgroup_name, limit)?;
@@ -512,12 +763,16 @@ fn run_with_limits(
     })
     .ok();
 
-    // Spawn process
-    let mut child = Command::new(program).args(args).spawn()?;
+    // Place the child into the cgroup BEFORE it execs, so it is constrained from
+    // its first instruction (see CgroupManager::placement_command).
+    let mut cmd = manager.placement_command(&cgroup_path, program);
+    cmd.args(args);
+    let mut child = cmd.spawn()?;
 
     let pid = child.id();
 
-    // Add process to cgroup immediately after spawn
+    // Fallback: ensure the process is in the cgroup even if pre-exec placement
+    // failed. Idempotent if it's already there.
     if let Err(e) = manager.add_to_cgroup(&cgroup_path, pid) {
         eprintln!("warning: failed to apply limits: {e}");
     }
@@ -544,11 +799,42 @@ fn run_with_limits(
         }
     };
 
-    // Clean up cgroup
-    manager.cleanup_cgroup(&cgroup_name)?;
+    // Clean up our ephemeral cgroup. Don't propagate a cleanup error here: cgroup
+    // v2 can briefly return EBUSY on rmdir right after the last process exits, and
+    // we must not let that mask the child program's real exit code.
+    if let Err(e) = manager.cleanup_cgroup(&cgroup_name) {
+        eprintln!("warning: failed to remove cgroup: {e}");
+    }
 
     Ok(status
         .code()
         .map(|c| ExitCode::from(c as u8))
         .unwrap_or(ExitCode::FAILURE))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_pid_list_basic() {
+        assert_eq!(parse_pid_list("1,2,3").unwrap(), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn parse_pid_list_trims_whitespace() {
+        assert_eq!(parse_pid_list(" 10 , 20 ,30 ").unwrap(), vec![10, 20, 30]);
+    }
+
+    #[test]
+    fn parse_pid_list_single() {
+        assert_eq!(parse_pid_list("42").unwrap(), vec![42]);
+    }
+
+    #[test]
+    fn parse_pid_list_rejects_invalid() {
+        assert!(parse_pid_list("1,abc,3").is_err());
+        assert!(parse_pid_list("1,,3").is_err()); // empty element
+        assert!(parse_pid_list("-1").is_err()); // negative
+    }
 }

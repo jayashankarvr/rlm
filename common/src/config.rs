@@ -11,7 +11,133 @@ const MAX_CONFIG_SIZE: u64 = 1_048_576;
 pub struct Config {
     #[serde(default)]
     pub profiles: HashMap<String, Profile>,
+
+    /// Freeze-guard daemon configuration. Skipped on serialize when at defaults
+    /// so saving profiles doesn't pollute config.yaml with a guard block.
+    #[serde(default, skip_serializing_if = "GuardConfig::is_default")]
+    pub guard: GuardConfig,
 }
+
+/// Configuration for the `rlm-guard` freeze-guard daemon. Every field defaults,
+/// so a missing `guard:` section (or any missing key) yields a working setup.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GuardConfig {
+    pub enabled: bool,
+    pub trigger: GuardTrigger,
+    pub timing: GuardTiming,
+    pub selection: GuardSelection,
+    pub notify: bool,
+}
+
+impl Default for GuardConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            trigger: GuardTrigger::default(),
+            timing: GuardTiming::default(),
+            selection: GuardSelection::default(),
+            notify: true,
+        }
+    }
+}
+
+impl GuardConfig {
+    pub fn is_default(&self) -> bool {
+        *self == GuardConfig::default()
+    }
+}
+
+/// Pressure thresholds (PSI percentages and a MemAvailable backstop).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GuardTrigger {
+    /// PSI `some` avg10 (%) at which to start warning.
+    pub psi_some_warn: f64,
+    /// PSI `some` avg10 (%) at which to start acting (High).
+    pub psi_some_high: f64,
+    /// PSI `full` avg10 (%) considered Critical.
+    pub psi_full_critical: f64,
+    /// Hard floor: act if MemAvailable drops below this many MB.
+    pub mem_available_floor_mb: u64,
+}
+
+impl Default for GuardTrigger {
+    fn default() -> Self {
+        Self {
+            psi_some_warn: 10.0,
+            psi_some_high: 30.0,
+            psi_full_critical: 10.0,
+            mem_available_floor_mb: 400,
+        }
+    }
+}
+
+/// Timing/hysteresis knobs.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GuardTiming {
+    /// How long a freeze is held before auto-thaw.
+    pub freeze_hold_secs: u64,
+    /// How long pressure must stay Calm before caps are lifted.
+    pub calm_hold_secs: u64,
+    /// Minimum gap before the same PID may be frozen again (else it's capped).
+    pub freeze_cooldown_secs: u64,
+    /// Sampling interval.
+    pub sample_interval_ms: u64,
+}
+
+impl Default for GuardTiming {
+    fn default() -> Self {
+        Self {
+            freeze_hold_secs: 5,
+            calm_hold_secs: 30,
+            freeze_cooldown_secs: 60,
+            sample_interval_ms: 1000,
+        }
+    }
+}
+
+/// Victim-selection knobs.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GuardSelection {
+    /// Ignore processes smaller than this (MB of RSS+swap).
+    pub min_rss_mb: u64,
+    /// Process names to NEVER act on. These ADD to the built-in protect-list.
+    pub protect: Vec<String>,
+}
+
+impl Default for GuardSelection {
+    fn default() -> Self {
+        Self {
+            min_rss_mb: 200,
+            protect: Vec::new(),
+        }
+    }
+}
+
+/// Process names always protected from the guard, regardless of config.
+pub const BUILTIN_PROTECT: &[&str] = &[
+    "gnome-shell",
+    "kwin_wayland",
+    "kwin_x11",
+    "plasmashell",
+    "sway",
+    "Hyprland",
+    "Xwayland",
+    "Xorg",
+    "sshd",
+    "systemd",
+    "dbus-daemon",
+    "pipewire",
+    "wireplumber",
+    "pulseaudio",
+    "rlm-guard",
+    "bash",
+    "zsh",
+    "fish",
+];
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Profile {
@@ -210,13 +336,6 @@ impl Config {
             all.insert(name.clone(), profile.clone());
         }
         all
-    }
-
-    /// Find a profile that matches an executable name
-    pub fn find_profile_for_exe(&self, exe: &str) -> Option<&Profile> {
-        self.profiles
-            .values()
-            .find(|p| p.match_exe.iter().any(|m| m == exe))
     }
 
     /// Save config to user config path (atomic write)

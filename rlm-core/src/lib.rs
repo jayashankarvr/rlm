@@ -1,5 +1,6 @@
 mod cgroup;
 pub mod desktop;
+pub mod guard;
 pub mod process;
 pub mod status;
 
