@@ -12,6 +12,13 @@ RestartSec=2
 # interventions on shutdown (undo_all is fast; this just caps the worst case).
 KillSignal=SIGTERM
 TimeoutStopSec=10
+# Keep the guard responsive during the very pressure spike it exists to handle:
+# protect its working set from reclaim, give it CPU priority under contention,
+# and make it a poor OOM victim so it stays alive to act. (Requires cpu+memory
+# delegation to the user manager, which rlm already configures.)
+MemoryMin=48M
+CPUWeight=300
+OOMScoreAdjust=-500
 
 [Install]
 WantedBy=default.target
