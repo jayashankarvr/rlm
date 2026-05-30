@@ -135,7 +135,11 @@ fn cap_target_bytes_from_status(status: &str) -> u64 {
 /// the binary is missing or the spawn fails — notifications must never break the
 /// guard.
 fn notify(message: &str) {
-    match Command::new("notify-send").arg("rlm-guard").arg(message).spawn() {
+    match Command::new("notify-send")
+        .arg("rlm-guard")
+        .arg(message)
+        .spawn()
+    {
         Ok(mut child) => {
             // Reap asynchronously so we don't block; ignore any wait error.
             std::thread::spawn(move || {
@@ -158,7 +162,10 @@ mod tests {
         let status = "Name:\tfirefox\nVmHWM:\t  2000000 kB\nVmRSS:\t  1000000 kB\nThreads:\t10\n";
         let got = cap_target_bytes_from_status(status);
         assert_eq!(got, 1_000_000 * 1024 / 10 * 9);
-        assert!(got > MIN_CAP_BYTES, "a 1GB process should cap above the floor");
+        assert!(
+            got > MIN_CAP_BYTES,
+            "a 1GB process should cap above the floor"
+        );
     }
 
     #[test]
@@ -202,7 +209,10 @@ mod tests {
         let manager = CgroupManager::new().expect("create CgroupManager");
         let effector = Effector::new(&manager);
 
-        let mut child = Command::new("sleep").arg("30").spawn().expect("spawn sleep");
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
         let pid = child.id();
 
         effector
@@ -218,7 +228,9 @@ mod tests {
         assert_eq!(frozen.trim(), "1", "process should be frozen");
 
         effector.apply(&Action::Thaw { pid }).expect("thaw");
-        effector.apply(&Action::LiftCap { pid }).expect("lift+cleanup");
+        effector
+            .apply(&Action::LiftCap { pid })
+            .expect("lift+cleanup");
 
         let _ = child.kill();
         let _ = child.wait();

@@ -7,6 +7,7 @@ A Linux tool for managing process resource limits using cgroups v2. Available as
 - Limit memory, CPU, and I/O bandwidth for running processes
 - Run commands with resource limits applied
 - Named profiles for reusable limit configurations
+- **Freeze guard**: a background daemon that proactively prevents system freezes
 - Works with systemd cgroup delegation (no root required for user processes)
 
 ## Supported Distros
@@ -138,6 +139,39 @@ Pages:
 - **Run** - launch commands with limits
 - **Profiles** - saved limit configurations
 - **About** - version and license info
+
+## Freeze Guard (automatic protection)
+
+`rlm-guard` is an optional per-user daemon that watches system memory pressure
+(via the kernel's PSI) and, before the machine locks up, proactively **freezes**
+or soft-**caps** your biggest memory hog — healing itself once pressure clears.
+It is recovery-only and **never kills** processes.
+
+How it escalates as pressure rises: notify → briefly freeze the hog (≈5s circuit
+breaker, then auto-thaw) → soft-cap it (`memory.high`, never an OOM-kill) → lift
+everything automatically once memory is calm again. It only ever acts on *your*
+processes and protects your desktop session, shells, and audio (configurable).
+
+```bash
+rlm guard enable    # enable + start the user service (systemctl --user)
+rlm guard status    # current pressure + active interventions
+rlm guard test      # dry-run: print what it would do right now (no action)
+rlm guard disable   # stop and disable
+```
+
+Tunable under a `guard:` section in `~/.config/rlm/config.yaml` (all optional —
+it works with zero configuration):
+
+```yaml
+guard:
+  enabled: true
+  trigger:   { psi_some_warn: 10, psi_some_high: 30, psi_full_critical: 10, mem_available_floor_mb: 400 }
+  timing:    { freeze_hold_secs: 5, calm_hold_secs: 30, freeze_cooldown_secs: 60, sample_interval_ms: 1000 }
+  selection: { min_rss_mb: 200, protect: [] }   # names here ADD to the built-in protect-list
+  notify: true
+```
+
+Requires PSI (`/proc/pressure/memory`); run `rlm doctor` to verify.
 
 ## Configuration
 

@@ -311,7 +311,9 @@ mod tests {
     }
 
     fn has_thaw(actions: &[Action], pid: u32) -> bool {
-        actions.iter().any(|a| matches!(a, Action::Thaw { pid: p } if *p == pid))
+        actions
+            .iter()
+            .any(|a| matches!(a, Action::Thaw { pid: p } if *p == pid))
     }
 
     fn has_liftcap(actions: &[Action], pid: u32) -> bool {
@@ -348,7 +350,11 @@ mod tests {
 
         // full drops below the fall threshold (1.0 < 1.5): now it may step down.
         e.tick(3_000, sample(0.0, 1.0, 8000), &procs);
-        assert_eq!(e.level, Level::Calm, "full below fall threshold drops to Calm");
+        assert_eq!(
+            e.level,
+            Level::Calm,
+            "full below fall threshold drops to Calm"
+        );
     }
 
     #[test]
@@ -439,7 +445,10 @@ mod tests {
         assert_eq!(e.level, Level::High, "dropped out of High prematurely");
         // A thaw here is expected (the freeze hold elapsed), but the cap must not
         // be lifted while we're still High.
-        assert!(!has_liftcap(&a, 2), "should not lift while still High: {a:?}");
+        assert!(
+            !has_liftcap(&a, 2),
+            "should not lift while still High: {a:?}"
+        );
 
         // Drop below the fall threshold (some < 15 and full < 3): fall to Warn.
         e.tick(21_000, sample(12.0, 0.0, 8000), &procs);
@@ -479,7 +488,7 @@ mod tests {
 
         e.tick(15_000, calm(), &procs); // calm clock starts
         e.tick(20_000, high(), &procs); // pressure returns -> calm clock cleared
-        // New calm window starts at 25s; at 50s only 25s have passed -> no lift.
+                                        // New calm window starts at 25s; at 50s only 25s have passed -> no lift.
         e.tick(25_000, calm(), &procs);
         let a = e.tick(50_000, calm(), &procs);
         assert!(!has_liftcap(&a, 2), "calm clock should have reset: {a:?}");

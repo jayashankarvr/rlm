@@ -27,7 +27,7 @@ struct LimitState {
     manager: Option<Arc<CgroupManager>>,
     all_processes: RefCell<Vec<rlm_core::process::ProcessInfo>>,
     profiles: RefCell<Vec<String>>,
-    limit_mode: RefCell<LimitMode>, // Individual or Application
+    limit_mode: RefCell<LimitMode>,   // Individual or Application
     selected_pids: RefCell<Vec<u32>>, // For multi-select in application mode
 }
 
@@ -62,8 +62,10 @@ pub fn create(manager: Option<Arc<CgroupManager>>) -> gtk::Widget {
 
     let mode_row = adw::ComboRow::new();
     mode_row.set_title("Mode");
-    mode_row.set_subtitle("Individual: each process gets its own limit. Application: all processes share limits");
-    
+    mode_row.set_subtitle(
+        "Individual: each process gets its own limit. Application: all processes share limits",
+    );
+
     let mode_list = gtk::StringList::new(&["Individual", "Application (Shared)"]);
     mode_row.set_model(Some(&mode_list));
     mode_row.set_selected(0);
@@ -291,12 +293,16 @@ pub fn create(manager: Option<Arc<CgroupManager>>) -> gtk::Widget {
                     }
                 }
             }
-            
+
             state.selected_pids.replace(selected_pids.clone());
-            
+
             // Update PID entry with comma-separated list
             if !selected_pids.is_empty() {
-                let pids_str = selected_pids.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(",");
+                let pids_str = selected_pids
+                    .iter()
+                    .map(|p| p.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
                 pid_entry_clone.set_text(&pids_str);
             } else {
                 pid_entry_clone.set_text("");
@@ -409,7 +415,7 @@ fn filter_processes(state: &Rc<RefCell<LimitState>>, query: &str) {
     if mode == LimitMode::Application {
         // Group processes by executable
         let groups = rlm_core::process::group_by_executable(&processes);
-        
+
         let filtered_groups: Vec<_> = if query.is_empty() {
             groups.iter().take(20).collect()
         } else {
@@ -439,17 +445,24 @@ fn filter_processes(state: &Rc<RefCell<LimitState>>, query: &str) {
                 let select_all_btn = gtk::Button::with_label("Select All");
                 select_all_btn.add_css_class("flat");
                 select_all_btn.add_css_class("suggested-action");
-                
+
                 let group_pids: Vec<u32> = group.processes.iter().map(|p| p.pid).collect();
                 let state_clone = state.clone();
                 let list_clone = list.clone();
                 let pid_entry_clone = state_ref.pid_entry.clone();
                 select_all_btn.connect_clicked(move |_| {
                     // Select all processes in this group
-                    state_clone.borrow().selected_pids.replace(group_pids.clone());
-                    let pids_str = group_pids.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(",");
+                    state_clone
+                        .borrow()
+                        .selected_pids
+                        .replace(group_pids.clone());
+                    let pids_str = group_pids
+                        .iter()
+                        .map(|p| p.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",");
                     pid_entry_clone.set_text(&pids_str);
-                    
+
                     // Update list selection (visual feedback)
                     let mut child = list_clone.first_child();
                     while let Some(c) = child {
@@ -488,7 +501,9 @@ fn filter_processes(state: &Rc<RefCell<LimitState>>, query: &str) {
             let query_pid: Option<u32> = query.parse().ok();
             processes
                 .iter()
-                .filter(|p| p.name.to_lowercase().contains(&query_lower) || query_pid == Some(p.pid))
+                .filter(|p| {
+                    p.name.to_lowercase().contains(&query_lower) || query_pid == Some(p.pid)
+                })
                 .take(50)
                 .collect()
         };

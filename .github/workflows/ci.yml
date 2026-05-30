@@ -31,13 +31,13 @@ jobs:
           key: ${{ runner.os }}-cargo-cli-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Build CLI
-        run: cargo build --release -p rlm -p rlm-core -p common
+        run: cargo build --release -p rlm -p rlm-guard -p rlm-core -p common
 
       - name: Run tests
-        run: cargo test -p rlm -p rlm-core -p common
+        run: cargo test -p rlm -p rlm-guard -p rlm-core -p common
 
       - name: Run clippy
-        run: cargo clippy -p rlm -p rlm-core -p common -- -D warnings
+        run: cargo clippy -p rlm -p rlm-guard -p rlm-core -p common -- -D warnings
 
       - name: Check formatting
         run: cargo fmt --check

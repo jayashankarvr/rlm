@@ -45,7 +45,9 @@ jobs:
         run: |
           mkdir -p release
           cp target/release/rlm release/
+          cp target/release/rlm-guard release/
           cp target/release/rlm-gtk release/
+          cp dist/rlm-guard.service release/
           cp README.md LICENSE release/
           tar -czvf "rlm-${REF_NAME}-x86_64-linux.tar.gz" -C release .
 

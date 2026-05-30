@@ -438,7 +438,9 @@ fn run() -> Result<ExitCode> {
             let profiles = config.profiles.clone();
 
             if profiles.is_empty() {
-                println!("no user-defined profiles to export (built-in presets are always available)");
+                println!(
+                    "no user-defined profiles to export (built-in presets are always available)"
+                );
             } else {
                 // Create export structure
                 let export = serde_yaml_ng::to_string(&profiles)
@@ -589,7 +591,10 @@ fn guard_status(manager: &CgroupManager) {
         return;
     }
 
-    println!("\n{:<8} {:<20} {:<8} {:<14}", "PID", "NAME", "STATE", "MEM.HIGH");
+    println!(
+        "\n{:<8} {:<20} {:<8} {:<14}",
+        "PID", "NAME", "STATE", "MEM.HIGH"
+    );
     println!("{}", "-".repeat(52));
     for pid in pids {
         let gpath = base.join(format!("guard-{pid}"));
@@ -718,6 +723,13 @@ fn run_doctor() {
     );
     if !config_exists {
         println!("  -> optional: create config for profiles");
+    }
+
+    // Check PSI availability (required by the freeze guard, rlm-guard)
+    let psi_ok = std::path::Path::new("/proc/pressure/memory").exists();
+    print_check("memory pressure info (PSI, for rlm-guard)", psi_ok);
+    if !psi_ok {
+        println!("  -> the freeze guard needs PSI; boot with `psi=1` if your kernel disables it");
     }
 
     println!();

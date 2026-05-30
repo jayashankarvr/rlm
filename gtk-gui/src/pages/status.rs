@@ -109,7 +109,7 @@ fn create_process_row(
     list_box: &gtk::ListBox,
 ) -> adw::ActionRow {
     let row = adw::ActionRow::new();
-    
+
     // Build title with process count for shared cgroups
     let title = if proc.is_shared {
         if let Some(count) = proc.process_count {
@@ -155,12 +155,12 @@ fn create_process_row(
     } else {
         limits.join(" | ")
     };
-    
+
     // Add note about shared limits
     if proc.is_shared {
         subtitle.push_str(" (shared among all processes)");
     }
-    
+
     row.set_subtitle(&subtitle);
 
     // Remove button

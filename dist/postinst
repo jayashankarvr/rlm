@@ -5,6 +5,7 @@ set -e
 if [ -d /run/systemd/system ]; then
     systemctl daemon-reload || true
     echo "rlm: cgroup delegation configured. Log out and back in to apply."
+    echo "rlm: to enable the freeze guard, run: rlm guard enable"
 else
     echo "rlm: systemd not detected. Manual cgroup setup may be required."
 fi
