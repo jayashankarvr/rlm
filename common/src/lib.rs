@@ -4,8 +4,8 @@ mod limit;
 mod util;
 
 pub use config::{
-    builtin_presets, Config, GuardConfig, GuardSelection, GuardTiming, GuardTrigger, Profile,
-    BUILTIN_PROTECT,
+    builtin_presets, AppRule, Config, GuardConfig, GuardSelection, GuardTiming, GuardTrigger,
+    Profile, BUILTIN_PROTECT,
 };
 pub use error::{Error, Result};
 pub use limit::{CpuLimit, IoLimit, Limit, MemoryLimit};

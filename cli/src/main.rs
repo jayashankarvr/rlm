@@ -112,6 +112,11 @@ enum Commands {
         /// Show what would be done without applying limits
         #[arg(long)]
         dry_run: bool,
+
+        /// Save as a persistent rule (only valid with --application). The limit
+        /// is re-applied across reboots and to future instances by rlm-guard.
+        #[arg(long, requires = "application")]
+        save: bool,
     },
 
     /// Remove resource limits from a process
@@ -131,6 +136,17 @@ enum Commands {
         /// Cgroup name to remove (for shared application cgroups)
         #[arg(long, conflicts_with_all = ["pid", "name", "application"])]
         cgroup: Option<String>,
+
+        /// Also delete the persistent rule (with --application). Without this,
+        /// unlimit drops the live limit but keeps the saved rule.
+        #[arg(long)]
+        forget: bool,
+    },
+
+    /// Manage persistent application rules (enforced by rlm-guard)
+    Rule {
+        #[command(subcommand)]
+        action: RuleAction,
     },
 
     /// Run a command with resource limits
@@ -206,6 +222,17 @@ enum GuardAction {
     Test,
 }
 
+#[derive(Subcommand)]
+enum RuleAction {
+    /// List saved persistent application rules
+    List,
+    /// Remove a saved rule by name
+    Remove {
+        /// Rule name (the executable name used when saving)
+        name: String,
+    },
+}
+
 fn main() -> ExitCode {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -238,6 +265,7 @@ fn run() -> Result<ExitCode> {
             io_read,
             io_write,
             dry_run,
+            save,
         } => {
             let limit = build_limit(
                 memory.as_deref(),
@@ -251,6 +279,10 @@ fn run() -> Result<ExitCode> {
                     "specify at least one limit (--memory, --cpu, --io-read, --io-write)".into(),
                 ));
             }
+
+            // Remember the application name for persisting a rule after apply.
+            // clap's `requires` guarantees --save is only set with --application.
+            let save_app = if save { application.clone() } else { None };
 
             // Determine which mode we're in
             let (pids, cgroup_name, is_shared) = if let Some(app_name) = application {
@@ -327,6 +359,31 @@ fn run() -> Result<ExitCode> {
                     cgroup_name
                 );
                 println!("⚠️  Note: All processes share these limits (combined pool)");
+
+                // Persist as a rule so it survives reboot and applies to future
+                // instances (enforced by rlm-guard).
+                if let Some(app) = save_app {
+                    let mut config = Config::load()?;
+                    config.add_rule(
+                        &app,
+                        common::AppRule {
+                            match_exe: vec![app.clone()],
+                            memory: memory.clone(),
+                            cpu: cpu.clone(),
+                            io_read: io_read.clone(),
+                            io_write: io_write.clone(),
+                        },
+                    );
+                    config.save()?;
+                    println!(
+                        "Saved persistent rule '{app}' (rlm-guard will re-apply it to running and future instances)"
+                    );
+                    if !is_guard_active() {
+                        println!(
+                            "  hint: enable the daemon for it to take effect: rlm guard enable"
+                        );
+                    }
+                }
             } else {
                 // Apply individual limits to each process
                 for pid in &pids {
@@ -341,6 +398,7 @@ fn run() -> Result<ExitCode> {
             name,
             application,
             cgroup,
+            forget,
         } => {
             if let Some(cgroup_name) = cgroup {
                 // Remove by cgroup name
@@ -351,6 +409,24 @@ fn run() -> Result<ExitCode> {
                 let cgroup_name = format!("app-{}", app_name.replace(['/', ' '], "_"));
                 manager.remove_application_limit(&cgroup_name)?;
                 println!("removed limits from application '{}'", app_name);
+
+                // The saved rule persists unless --forget is given. Otherwise the
+                // daemon would simply re-apply it on the next reconcile.
+                if forget {
+                    let mut config = Config::load()?;
+                    if config.remove_rule(&app_name) {
+                        config.save()?;
+                        println!("forgot persistent rule '{}'", app_name);
+                    }
+                } else {
+                    let config = Config::load()?;
+                    if config.rules.contains_key(&app_name) {
+                        println!(
+                            "  note: persistent rule '{}' still saved (rlm-guard will re-apply it); use --forget to delete it",
+                            app_name
+                        );
+                    }
+                }
             } else {
                 // Remove individual processes
                 let pids = resolve_pids(pid, name.as_deref())?;
@@ -533,9 +609,65 @@ fn run() -> Result<ExitCode> {
         Commands::Guard { action } => {
             return run_guard(&manager, action);
         }
+
+        Commands::Rule { action } => {
+            return run_rule(action);
+        }
     }
 
     Ok(ExitCode::SUCCESS)
+}
+
+/// Whether the rlm-guard user service is active (best-effort, for hints).
+fn is_guard_active() -> bool {
+    std::process::Command::new("systemctl")
+        .args(["--user", "is-active", "--quiet", "rlm-guard"])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+fn run_rule(action: RuleAction) -> Result<ExitCode> {
+    match action {
+        RuleAction::List => {
+            let config = Config::load()?;
+            if config.rules.is_empty() {
+                println!("no persistent rules configured");
+                println!("  create one with: rlm limit --application <exe> --memory <size> --save");
+                return Ok(ExitCode::SUCCESS);
+            }
+            println!(
+                "{:<20} {:>10} {:>8} {:>10} {:>10}",
+                "RULE", "MEMORY", "CPU", "IO_READ", "IO_WRITE"
+            );
+            println!("{}", "-".repeat(62));
+            let mut names: Vec<_> = config.rules.keys().collect();
+            names.sort();
+            for name in names {
+                let r = &config.rules[name];
+                println!(
+                    "{:<20} {:>10} {:>8} {:>10} {:>10}",
+                    name,
+                    r.memory.as_deref().unwrap_or("-"),
+                    r.cpu.as_deref().unwrap_or("-"),
+                    r.io_read.as_deref().unwrap_or("-"),
+                    r.io_write.as_deref().unwrap_or("-"),
+                );
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        RuleAction::Remove { name } => {
+            let mut config = Config::load()?;
+            if config.remove_rule(&name) {
+                config.save()?;
+                println!("removed rule '{name}'");
+                println!("  note: this does not drop a currently-applied limit; use `rlm unlimit --application {name}` for that");
+                Ok(ExitCode::SUCCESS)
+            } else {
+                Err(Error::InvalidArgs(format!("no rule named '{name}'")))
+            }
+        }
+    }
 }
 
 fn run_guard(manager: &CgroupManager, action: GuardAction) -> Result<ExitCode> {

@@ -16,6 +16,73 @@ pub struct Config {
     /// so saving profiles doesn't pollute config.yaml with a guard block.
     #[serde(default, skip_serializing_if = "GuardConfig::is_default")]
     pub guard: GuardConfig,
+
+    /// Persistent application limit rules, enforced continuously by rlm-guard.
+    /// Keyed by rule name (defaults to the executable basename). Omitted from
+    /// serialized output when empty.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub rules: HashMap<String, AppRule>,
+}
+
+/// A persistent application limit rule. Instances whose executable basename is
+/// in `match_exe` are placed into a shared `app-<name>` cgroup with these limits.
+/// Limits are stored inline (a snapshot), not as a reference to a profile.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AppRule {
+    /// Executable basenames this rule matches.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub match_exe: Vec<String>,
+
+    /// Memory limit (e.g., "4G").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory: Option<String>,
+
+    /// CPU limit (e.g., "75%").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu: Option<String>,
+
+    /// I/O read bandwidth limit (e.g., "100M").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub io_read: Option<String>,
+
+    /// I/O write bandwidth limit (e.g., "50M").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub io_write: Option<String>,
+}
+
+impl AppRule {
+    pub fn to_limit(&self) -> Result<Limit> {
+        use crate::{CpuLimit, IoLimit, MemoryLimit};
+
+        let read_bps = self
+            .io_read
+            .as_ref()
+            .map(|s| IoLimit::parse_bps(s))
+            .transpose()?;
+        let write_bps = self
+            .io_write
+            .as_ref()
+            .map(|s| IoLimit::parse_bps(s))
+            .transpose()?;
+        let io = if read_bps.is_some() || write_bps.is_some() {
+            Some(IoLimit {
+                read_bps,
+                write_bps,
+            })
+        } else {
+            None
+        };
+
+        Ok(Limit {
+            memory: self
+                .memory
+                .as_ref()
+                .map(|s| MemoryLimit::parse(s))
+                .transpose()?,
+            cpu: self.cpu.as_ref().map(|s| CpuLimit::parse(s)).transpose()?,
+            io,
+        })
+    }
 }
 
 /// Configuration for the `rlm-guard` freeze-guard daemon. Every field defaults,
@@ -301,6 +368,11 @@ impl Config {
     fn merge_from(&mut self, path: &Path) -> Result<()> {
         let other = Self::load_from(path)?;
         self.profiles.extend(other.profiles);
+        self.rules.extend(other.rules);
+        // A non-default guard block in a loaded file takes effect.
+        if !other.guard.is_default() {
+            self.guard = other.guard;
+        }
         Ok(())
     }
 
@@ -338,6 +410,16 @@ impl Config {
         all
     }
 
+    /// Add or replace a persistent application rule.
+    pub fn add_rule(&mut self, name: impl Into<String>, rule: AppRule) {
+        self.rules.insert(name.into(), rule);
+    }
+
+    /// Remove a persistent rule by name. Returns true if a rule was removed.
+    pub fn remove_rule(&mut self, name: &str) -> bool {
+        self.rules.remove(name).is_some()
+    }
+
     /// Save config to user config path (atomic write)
     pub fn save(&self) -> Result<()> {
         let path = Self::user_config_path()
@@ -355,5 +437,76 @@ impl Config {
         fs::write(&tmp_path, &yaml)?;
         fs::rename(&tmp_path, &path)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn app_rule_to_limit_parses_fields() {
+        let rule = AppRule {
+            match_exe: vec!["firefox".into()],
+            memory: Some("4G".into()),
+            cpu: Some("75%".into()),
+            io_read: None,
+            io_write: None,
+        };
+        let limit = rule.to_limit().unwrap();
+        assert_eq!(limit.memory.unwrap().bytes(), 4 * 1024 * 1024 * 1024);
+        assert_eq!(limit.cpu.unwrap().percent(), 75);
+        assert!(limit.io.is_none());
+    }
+
+    #[test]
+    fn app_rule_invalid_limit_errors() {
+        let rule = AppRule {
+            match_exe: vec!["x".into()],
+            memory: Some("notasize".into()),
+            ..Default::default()
+        };
+        assert!(rule.to_limit().is_err());
+    }
+
+    #[test]
+    fn empty_rules_omitted_from_yaml() {
+        let cfg = Config::default();
+        let yaml = serde_yaml_ng::to_string(&cfg).unwrap();
+        assert!(
+            !yaml.contains("rules:"),
+            "empty rules must be omitted: {yaml}"
+        );
+    }
+
+    #[test]
+    fn rules_round_trip_through_yaml() {
+        let mut cfg = Config::default();
+        cfg.add_rule(
+            "firefox",
+            AppRule {
+                match_exe: vec!["firefox".into()],
+                memory: Some("4G".into()),
+                cpu: Some("75%".into()),
+                io_read: None,
+                io_write: None,
+            },
+        );
+        let yaml = serde_yaml_ng::to_string(&cfg).unwrap();
+        assert!(yaml.contains("rules:"));
+        let back: Config = serde_yaml_ng::from_str(&yaml).unwrap();
+        let r = back.rules.get("firefox").expect("rule present");
+        assert_eq!(r.match_exe, vec!["firefox".to_string()]);
+        assert_eq!(r.memory.as_deref(), Some("4G"));
+    }
+
+    #[test]
+    fn add_and_remove_rule() {
+        let mut cfg = Config::default();
+        cfg.add_rule("code", AppRule::default());
+        assert!(cfg.rules.contains_key("code"));
+        assert!(cfg.remove_rule("code"));
+        assert!(!cfg.remove_rule("code"));
+        assert!(cfg.rules.is_empty());
     }
 }

@@ -7,6 +7,7 @@
 
 use common::Config;
 use rlm_core::guard::{Effector, PolicyEngine, Sampler};
+use rlm_core::rules::RulesEnforcer;
 use rlm_core::CgroupManager;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -30,8 +31,11 @@ fn run() -> common::Result<()> {
     let config = Config::load().unwrap_or_default();
     let gcfg = config.guard.clone();
 
-    if !gcfg.enabled {
-        tracing::info!("guard disabled in config (guard.enabled = false); exiting");
+    // The daemon does two jobs: freeze protection (when enabled) and enforcing
+    // persistent application rules. Only exit if BOTH are off.
+    let enforcer = RulesEnforcer::new(&config);
+    if !gcfg.enabled && enforcer.rule_count() == 0 {
+        tracing::info!("guard disabled and no rules configured; exiting");
         return Ok(());
     }
 
@@ -64,6 +68,8 @@ fn run() -> common::Result<()> {
     tracing::info!(
         uid,
         interval_ms = interval.as_millis() as u64,
+        freeze_guard = gcfg.enabled,
+        rules = enforcer.rule_count(),
         "rlm-guard started"
     );
 
@@ -71,17 +77,24 @@ fn run() -> common::Result<()> {
         // Monotonic, injected into the pure engine for deterministic behavior.
         let now_ms = start.elapsed().as_millis() as u64;
 
-        if let Some(sample) = sampler.sample() {
-            let procs = sampler.eligible();
-            for action in engine.tick(now_ms, sample, &procs) {
-                if let Err(e) = effector.apply(&action) {
-                    tracing::warn!(?action, "action failed: {e}");
+        // Freeze protection (PSI-driven), only when enabled.
+        if gcfg.enabled {
+            if let Some(sample) = sampler.sample() {
+                let procs = sampler.eligible();
+                for action in engine.tick(now_ms, sample, &procs) {
+                    if let Err(e) = effector.apply(&action) {
+                        tracing::warn!(?action, "action failed: {e}");
+                    }
                 }
+            } else if !warned_no_psi {
+                tracing::warn!("/proc/pressure/memory unavailable; guard cannot act on PSI");
+                warned_no_psi = true;
             }
-        } else if !warned_no_psi {
-            tracing::warn!("/proc/pressure/memory unavailable; guard cannot act on PSI");
-            warned_no_psi = true;
         }
+
+        // Persistent application rules: reconcile every tick (best-effort,
+        // logs internally). Absorbs newly-launched matching instances.
+        enforcer.reconcile(&manager);
 
         sleep_responsive(interval, &shutdown);
     }

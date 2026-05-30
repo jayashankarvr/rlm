@@ -536,6 +536,26 @@ fn filter_processes(state: &Rc<RefCell<LimitState>>, query: &str) {
     }
 }
 
+/// Persist an application limit as a rule in the user config, keyed by exe name.
+/// Stores the raw input strings (a snapshot), matching the CLI `--save` behavior.
+fn save_app_rule(app_name: &str, inputs: &LimitInputs) -> common::Result<()> {
+    let (mem, cpu, ior, iow) = inputs.values();
+    let opt = |s: String| if s.trim().is_empty() { None } else { Some(s) };
+
+    let mut config = common::Config::load()?;
+    config.add_rule(
+        app_name,
+        common::AppRule {
+            match_exe: vec![app_name.to_string()],
+            memory: opt(mem),
+            cpu: opt(cpu),
+            io_read: opt(ior),
+            io_write: opt(iow),
+        },
+    );
+    config.save()
+}
+
 fn apply_limits(state: &Rc<RefCell<LimitState>>) {
     let state = state.borrow();
     let mode = *state.limit_mode.borrow();

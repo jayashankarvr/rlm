@@ -466,6 +466,23 @@ impl CgroupManager {
         pids
     }
 
+    /// Whether a child cgroup with this name currently exists.
+    pub fn cgroup_exists(&self, name: &str) -> bool {
+        self.base_path.join(name).is_dir()
+    }
+
+    /// PIDs currently in the named child cgroup (empty if it doesn't exist).
+    pub fn pids_in_cgroup(&self, name: &str) -> Vec<u32> {
+        let procs = self.base_path.join(name).join("cgroup.procs");
+        match fs::read_to_string(procs) {
+            Ok(content) => content
+                .lines()
+                .filter_map(|l| l.trim().parse::<u32>().ok())
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
     /// Startup recovery: thaw and clean up every leftover guard cgroup so no
     /// process is left frozen after a prior crash.
     pub fn sweep_guard_leftovers(&self) -> Result<()> {
