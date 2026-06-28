@@ -27,8 +27,9 @@ struct LimitState {
     manager: Option<Arc<CgroupManager>>,
     all_processes: RefCell<Vec<rlm_core::process::ProcessInfo>>,
     profiles: RefCell<Vec<String>>,
-    limit_mode: RefCell<LimitMode>,   // Individual or Application
-    selected_pids: RefCell<Vec<u32>>, // For multi-select in application mode
+    limit_mode: RefCell<LimitMode>,    // Individual or Application
+    selected_pids: RefCell<Vec<u32>>,  // For multi-select in application mode
+    save_rule_check: gtk::CheckButton, // Persist as a rule (application mode only)
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -187,6 +188,12 @@ pub fn create(manager: Option<Arc<CgroupManager>>) -> gtk::Widget {
 
     page.add(&limits_group);
 
+    // Persist-as-rule toggle (only meaningful in application mode; hidden otherwise)
+    let save_rule_check =
+        gtk::CheckButton::with_label("Save as persistent rule (re-apply across reboots)");
+    save_rule_check.set_halign(gtk::Align::Center);
+    save_rule_check.set_visible(false);
+
     // Apply button
     let apply_btn = gtk::Button::with_label("Apply Limits");
     apply_btn.add_css_class("suggested-action");
@@ -197,6 +204,7 @@ pub fn create(manager: Option<Arc<CgroupManager>>) -> gtk::Widget {
 
     let button_box = gtk::Box::new(gtk::Orientation::Vertical, 12);
     button_box.append(&status_label);
+    button_box.append(&save_rule_check);
     button_box.append(&apply_btn);
 
     let button_group = adw::PreferencesGroup::new();
@@ -221,6 +229,7 @@ pub fn create(manager: Option<Arc<CgroupManager>>) -> gtk::Widget {
         profiles: RefCell::new(profiles),
         limit_mode: RefCell::new(LimitMode::Individual),
         selected_pids: RefCell::new(Vec::new()),
+        save_rule_check: save_rule_check.clone(),
     }));
 
     // Load initial processes
@@ -239,6 +248,11 @@ pub fn create(manager: Option<Arc<CgroupManager>>) -> gtk::Widget {
         };
         state_clone.borrow().limit_mode.replace(mode);
         update_mode_info(&mode_info_label_clone, mode);
+        // The "save as rule" toggle only applies to application (shared) mode.
+        state_clone
+            .borrow()
+            .save_rule_check
+            .set_visible(mode == LimitMode::Application);
         filter_processes(&state_clone, search_entry_clone.text().as_str());
     });
     update_mode_info(&mode_info_label, LimitMode::Individual);
@@ -537,20 +551,24 @@ fn filter_processes(state: &Rc<RefCell<LimitState>>, query: &str) {
 }
 
 /// Persist an application limit as a rule in the user config, keyed by exe name.
-/// Stores the raw input strings (a snapshot), matching the CLI `--save` behavior.
-fn save_app_rule(app_name: &str, inputs: &LimitInputs) -> common::Result<()> {
-    let (mem, cpu, ior, iow) = inputs.values();
-    let opt = |s: String| if s.trim().is_empty() { None } else { Some(s) };
-
+/// Stores the unit-qualified limit strings (a snapshot), matching the CLI
+/// `--save` behavior.
+fn save_app_rule(
+    app_name: &str,
+    memory: Option<String>,
+    cpu: Option<String>,
+    io_read: Option<String>,
+    io_write: Option<String>,
+) -> common::Result<()> {
     let mut config = common::Config::load()?;
     config.add_rule(
         app_name,
         common::AppRule {
             match_exe: vec![app_name.to_string()],
-            memory: opt(mem),
-            cpu: opt(cpu),
-            io_read: opt(ior),
-            io_write: opt(iow),
+            memory,
+            cpu,
+            io_read,
+            io_write,
         },
     );
     config.save()
@@ -681,11 +699,33 @@ fn apply_limits(state: &Rc<RefCell<LimitState>>) {
             match manager.apply_limit_to_multiple(&pids, &limit, &cgroup_name) {
                 Ok(()) => {
                     state.status_label.set_text("");
-                    let msg = if pids.len() == 1 {
+                    let mut msg = if pids.len() == 1 {
                         format!("Limits applied to PID {}", pids[0])
                     } else {
                         format!("Shared limits applied to {} process(es)", pids.len())
                     };
+
+                    // Persist as a rule if requested. Only meaningful for a real
+                    // application group (cgroup named "app-<exe>").
+                    if state.save_rule_check.is_active() {
+                        if let Some(app_name) = cgroup_name.strip_prefix("app-") {
+                            match save_app_rule(
+                                app_name,
+                                memory.clone(),
+                                cpu.clone(),
+                                io_read.clone(),
+                                io_write.clone(),
+                            ) {
+                                Ok(()) => {
+                                    msg.push_str(&format!("; saved persistent rule '{app_name}'"))
+                                }
+                                Err(e) => msg.push_str(&format!("; could not save rule: {e}")),
+                            }
+                        } else {
+                            msg.push_str("; (rule not saved: select 2+ instances of one app)");
+                        }
+                    }
+
                     let toast = adw::Toast::new(&msg);
                     toast.set_timeout(3);
                     state.toast_overlay.add_toast(toast);

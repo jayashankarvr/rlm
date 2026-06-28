@@ -121,7 +121,7 @@ impl Sampler {
         }
 
         // Biggest memory hog first — that's the victim the engine prefers.
-        out.sort_by(|a, b| b.rss_kb.cmp(&a.rss_kb));
+        out.sort_by_key(|p| std::cmp::Reverse(p.rss_kb));
         out
     }
 }
