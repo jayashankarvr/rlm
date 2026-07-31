@@ -550,6 +550,29 @@ fn filter_processes(state: &Rc<RefCell<LimitState>>, query: &str) {
     }
 }
 
+/// The shared executable basename of all `pids`, or `None` if they don't all
+/// resolve to the same executable. Used to gate saving a persistent rule so its
+/// `match_exe` is meaningful.
+fn common_exe_basename(procs: &[rlm_core::process::ProcessInfo], pids: &[u32]) -> Option<String> {
+    let mut found: Option<String> = None;
+    for pid in pids {
+        let p = procs.iter().find(|p| p.pid == *pid)?;
+        let base = p
+            .executable
+            .as_ref()
+            .and_then(|e| e.file_name())
+            .and_then(|n| n.to_str())
+            .map(String::from)
+            .unwrap_or_else(|| p.name.clone());
+        match &found {
+            None => found = Some(base),
+            Some(prev) if *prev != base => return None,
+            _ => {}
+        }
+    }
+    found
+}
+
 /// Persist an application limit as a rule in the user config, keyed by exe name.
 /// Stores the unit-qualified limit strings (a snapshot), matching the CLI
 /// `--save` behavior.
@@ -705,24 +728,24 @@ fn apply_limits(state: &Rc<RefCell<LimitState>>) {
                         format!("Shared limits applied to {} process(es)", pids.len())
                     };
 
-                    // Persist as a rule if requested. Only meaningful for a real
-                    // application group (cgroup named "app-<exe>").
+                    // Persist as a rule if requested. A rule matches by executable
+                    // basename, so only save when every selected PID is the same
+                    // app — otherwise the saved match_exe would be misleading.
                     if state.save_rule_check.is_active() {
-                        if let Some(app_name) = cgroup_name.strip_prefix("app-") {
-                            match save_app_rule(
-                                app_name,
+                        match common_exe_basename(&state.all_processes.borrow(), &pids) {
+                            Some(exe) => match save_app_rule(
+                                &exe,
                                 memory.clone(),
                                 cpu.clone(),
                                 io_read.clone(),
                                 io_write.clone(),
                             ) {
-                                Ok(()) => {
-                                    msg.push_str(&format!("; saved persistent rule '{app_name}'"))
-                                }
+                                Ok(()) => msg.push_str(&format!("; saved persistent rule '{exe}'")),
                                 Err(e) => msg.push_str(&format!("; could not save rule: {e}")),
-                            }
-                        } else {
-                            msg.push_str("; (rule not saved: select 2+ instances of one app)");
+                            },
+                            None => msg.push_str(
+                                "; (rule not saved: select instances of a single application)",
+                            ),
                         }
                     }
 

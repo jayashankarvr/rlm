@@ -67,22 +67,37 @@ impl CompiledRule {
 }
 
 /// Pure planner: decide the actions for one rule given the current process
-/// snapshot and the set of PIDs already in this rule's cgroup.
+/// snapshot, the PIDs already in this rule's cgroup, the PIDs the freeze guard
+/// is currently holding (frozen/capped in a `guard-*` cgroup), and whether this
+/// rule's cgroup currently has any process in it.
 ///
-/// - matches present, some not yet placed -> EnsureCgroup + AddPid(each new)
-/// - matches present, all already placed  -> EnsureCgroup only (idempotent)
-/// - no matches, cgroup currently exists  -> TeardownEmpty
-/// - no matches, no cgroup                -> nothing
+/// - matches present (excluding guard-held), some not placed -> EnsureCgroup + AddPid(each new)
+/// - matches present, all already placed                     -> EnsureCgroup only (idempotent)
+/// - no placeable matches, cgroup occupied                   -> nothing (don't evict)
+/// - no placeable matches, cgroup empty-but-present          -> TeardownEmpty
+/// - no placeable matches, no cgroup                         -> nothing
+///
+/// `guard_held` PIDs are skipped entirely: re-adding a soft-capped/frozen
+/// process would migrate it out of its `guard-<pid>` cgroup and discard the
+/// guard's intervention. The freeze guard wins while pressure is high; the rule
+/// re-absorbs the process on a later tick once the guard releases it.
 pub fn plan(
     rule: &CompiledRule,
     procs: &[ProcessInfo],
     already_placed: &[u32],
+    guard_held: &[u32],
     cgroup_exists: bool,
 ) -> Vec<RuleAction> {
-    let matches: Vec<&ProcessInfo> = procs.iter().filter(|p| rule.matches(p)).collect();
+    let matches: Vec<&ProcessInfo> = procs
+        .iter()
+        .filter(|p| rule.matches(p) && !guard_held.contains(&p.pid))
+        .collect();
 
     if matches.is_empty() {
-        return if cgroup_exists {
+        // Only tear down a cgroup that exists AND is empty. A populated
+        // `app-<exe>` (e.g. created by a manual one-off `--application` limit
+        // that shares the name) must never be evicted from under its owner.
+        return if cgroup_exists && already_placed.is_empty() {
             vec![RuleAction::TeardownEmpty {
                 rule: rule.name.clone(),
             }]
@@ -139,13 +154,18 @@ impl RulesEnforcer {
             }
         };
 
+        // PIDs the freeze guard currently holds (frozen/capped). Re-adding one
+        // to a rule cgroup would migrate it out of guard-<pid> and discard the
+        // guard's intervention, so the planner skips these.
+        let guard_held = mgr.list_guard_pids();
+
         let mut applied = Vec::new();
         for rule in &self.rules {
             // Which matching PIDs are already in this rule's cgroup?
             let placed = mgr.pids_in_cgroup(&rule.cgroup);
             let exists = !placed.is_empty() || mgr.cgroup_exists(&rule.cgroup);
 
-            for action in plan(rule, &procs, &placed, exists) {
+            for action in plan(rule, &procs, &placed, &guard_held, exists) {
                 if let Err(e) = self.apply(mgr, rule, &action) {
                     tracing::warn!(?action, error = %e, "rules: action failed");
                 } else {
@@ -219,7 +239,7 @@ mod tests {
     fn plan_ensures_and_adds_unplaced_matches() {
         let r = rule("firefox", &["firefox"]);
         let procs = vec![proc(10, "firefox", None), proc(11, "firefox", None)];
-        let actions = plan(&r, &procs, &[], false);
+        let actions = plan(&r, &procs, &[], &[], false);
         assert_eq!(
             actions[0],
             RuleAction::EnsureCgroup {
@@ -240,7 +260,7 @@ mod tests {
     fn plan_is_idempotent_when_all_placed() {
         let r = rule("firefox", &["firefox"]);
         let procs = vec![proc(10, "firefox", None)];
-        let actions = plan(&r, &procs, &[10], true);
+        let actions = plan(&r, &procs, &[10], &[], true);
         // Ensure only; no AddPid for the already-placed pid.
         assert_eq!(
             actions,
@@ -254,7 +274,7 @@ mod tests {
     fn plan_adds_only_new_pid() {
         let r = rule("firefox", &["firefox"]);
         let procs = vec![proc(10, "firefox", None), proc(12, "firefox", None)];
-        let actions = plan(&r, &procs, &[10], true);
+        let actions = plan(&r, &procs, &[10], &[], true);
         assert_eq!(
             actions,
             vec![
@@ -270,9 +290,10 @@ mod tests {
     }
 
     #[test]
-    fn plan_teardown_when_no_matches_but_cgroup_exists() {
+    fn plan_teardown_only_when_empty_and_present() {
         let r = rule("firefox", &["firefox"]);
-        let actions = plan(&r, &[proc(1, "code", None)], &[], true);
+        // Present + empty (no placed pids) + no matches -> teardown.
+        let actions = plan(&r, &[proc(1, "code", None)], &[], &[], true);
         assert_eq!(
             actions,
             vec![RuleAction::TeardownEmpty {
@@ -282,9 +303,42 @@ mod tests {
     }
 
     #[test]
+    fn plan_does_not_evict_occupied_cgroup_with_no_matches() {
+        // No rule-matching process, but the cgroup still holds something (e.g. a
+        // manual one-off `--application firefox` sharing the name). Must NOT tear
+        // it down out from under its owner.
+        let r = rule("firefox", &["firefox"]);
+        let actions = plan(&r, &[proc(1, "code", None)], &[999], &[], true);
+        assert!(
+            actions.is_empty(),
+            "must not evict an occupied cgroup: {actions:?}"
+        );
+    }
+
+    #[test]
+    fn plan_skips_guard_held_pids() {
+        // A matching process the freeze guard is currently holding must not be
+        // re-added (that would migrate it out of guard-<pid> and discard the cap).
+        let r = rule("firefox", &["firefox"]);
+        let procs = vec![proc(10, "firefox", None), proc(11, "firefox", None)];
+        let actions = plan(&r, &procs, &[], &[10], false);
+        assert!(
+            !actions.contains(&RuleAction::AddPid {
+                rule: "firefox".into(),
+                pid: 10
+            }),
+            "guard-held pid 10 must be skipped: {actions:?}"
+        );
+        assert!(actions.contains(&RuleAction::AddPid {
+            rule: "firefox".into(),
+            pid: 11
+        }));
+    }
+
+    #[test]
     fn plan_noop_when_no_matches_and_no_cgroup() {
         let r = rule("firefox", &["firefox"]);
-        let actions = plan(&r, &[proc(1, "code", None)], &[], false);
+        let actions = plan(&r, &[proc(1, "code", None)], &[], &[], false);
         assert!(actions.is_empty());
     }
 }

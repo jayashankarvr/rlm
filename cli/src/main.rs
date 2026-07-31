@@ -375,13 +375,15 @@ fn run() -> Result<ExitCode> {
                         },
                     );
                     config.save()?;
-                    println!(
-                        "Saved persistent rule '{app}' (rlm-guard will re-apply it to running and future instances)"
-                    );
-                    if !is_guard_active() {
+                    println!("Saved persistent rule '{app}'");
+                    // The daemon reads rules at startup, so a running daemon must
+                    // be restarted to pick up the new rule.
+                    if is_guard_active() {
                         println!(
-                            "  hint: enable the daemon for it to take effect: rlm guard enable"
+                            "  note: restart the daemon to load it: systemctl --user restart rlm-guard"
                         );
+                    } else {
+                        println!("  note: enable the daemon to enforce it: rlm guard enable");
                     }
                 }
             } else {
