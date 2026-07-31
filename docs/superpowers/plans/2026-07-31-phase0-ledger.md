@@ -3,3 +3,5 @@ Task 1: complete (commits 91762c9..62ff14e, review clean)
 Task 2: review round 1 — Critical: abs() Path::join drops /sys/fs/cgroup prefix on absolute cg paths (cgfs.rs:171). Fix dispatched to impl-task2.
 Task 2: minor (deferred): parse_anon lacks anon_thp-collision regression test (cgfs.rs:258)
 Task 2: minor (deferred): implementer skipped TDD red step (process note)
+Task 2: fix round 1/5 (1 addressed, 0 open — abs() prefix drop fixed + regression test; commits 17003b8..211cb9b)
+Task 2: complete (commits 62ff14e..211cb9b, review clean after 1 fix round)

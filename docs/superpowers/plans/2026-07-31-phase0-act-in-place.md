@@ -248,7 +248,7 @@ pub fn parse_frozen(events: &str) -> Option<bool>;
 pub fn parse_anon(stat: &str) -> Option<u64>;
 ```
 
-- [ ] **Step 1: Write failing tests for the pure parsers:**
+- [x] **Step 1: Write failing tests for the pure parsers:**
 
 ```rust
 #[test]
@@ -266,8 +266,8 @@ fn parse_anon_reads_memory_stat() {
 }
 ```
 
-- [ ] **Step 2: Run — compile failure.**
-- [ ] **Step 3: Implement.** IO functions are thin wrappers (`fs::read_to_string(abs(cg).join("cgroup.events"))` etc.); `anon_swap_bytes` = `parse_anon(memory.stat)? + memory.swap.current.trim().parse().unwrap_or(0)`; `write_*` map io errors through the crate's existing error type (see `cgroup.rs` for the pattern — `RlmError::CgroupWrite` or nearest equivalent); `dir_inode` uses `fs::metadata(abs(cg)).ok()?.ino()` (`use std::os::unix::fs::MetadataExt`).
+- [x] **Step 2: Run — compile failure.**
+- [x] **Step 3: Implement.** IO functions are thin wrappers (`fs::read_to_string(abs(cg).join("cgroup.events"))` etc.); `anon_swap_bytes` = `parse_anon(memory.stat)? + memory.swap.current.trim().parse().unwrap_or(0)`; `write_*` map io errors through the crate's existing error type (see `cgroup.rs` for the pattern — `RlmError::CgroupWrite` or nearest equivalent); `dir_inode` uses `fs::metadata(abs(cg)).ok()?.ino()` (`use std::os::unix::fs::MetadataExt`).
 
 ```rust
 pub fn parse_frozen(events: &str) -> Option<bool> {
@@ -282,8 +282,8 @@ pub fn parse_anon(stat: &str) -> Option<u64> {
 }
 ```
 
-- [ ] **Step 4: `cargo test -p rlm-core cgfs` — pass. fmt+clippy.**
-- [ ] **Step 5: Commit** `feat(guard): cgroupfs helpers — frozen state, memory.high, anon+swap, inode, boot id`
+- [x] **Step 4: `cargo test -p rlm-core cgfs` — pass. fmt+clippy.**
+- [x] **Step 5: Commit** `feat(guard): cgroupfs helpers — frozen state, memory.high, anon+swap, inode, boot id`
 
 ---
 
