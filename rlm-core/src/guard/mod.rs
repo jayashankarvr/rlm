@@ -3,6 +3,7 @@
 //! itself once pressure clears. Pure engine + sampler live here; the daemon loop
 //! lives in the `rlm-guard` binary.
 
+pub mod cgfs;
 pub mod effector;
 pub mod policy;
 pub mod resolve;

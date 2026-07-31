@@ -81,7 +81,7 @@ Semantics (from the spec, verbatim):
 - Under rlm_base: the target is `rlm_base/<first child component>`; `unit = None`, `Mechanism::Raw`.
 - `finalize`: any member exe in `protect` → `Verdict::CapOnly` + `Coverage::Partial` (safety over coverage; never freeze a protected process's cgroup). Otherwise `Freeze` + `Full`.
 
-- [ ] **Step 1: Write failing tests** in `resolve.rs` `#[cfg(test)]`:
+- [x] **Step 1: Write failing tests** in `resolve.rs` `#[cfg(test)]`:
 
 ```rust
 const RLM: &str = "/user.slice/user-1000.slice/user@1000.service/rlm";
@@ -180,8 +180,8 @@ fn finalize_protected_member_degrades_to_caponly_partial() {
 }
 ```
 
-- [ ] **Step 2: Run `cargo test -p rlm-core resolve` — expect compile failure (module missing).**
-- [ ] **Step 3: Implement:**
+- [x] **Step 2: Run `cargo test -p rlm-core resolve` — expect compile failure (module missing).**
+- [x] **Step 3: Implement:**
 
 ```rust
 pub fn candidate_target(victim_cgroup: &str, uid: u32, rlm_base: &str) -> Option<Candidate> {
@@ -217,8 +217,8 @@ pub fn finalize(c: Candidate, member_exes: &[String], protect: &HashSet<String>)
 }
 ```
 
-- [ ] **Step 4: `cargo test -p rlm-core resolve` — all pass. `cargo fmt && cargo clippy`.**
-- [ ] **Step 5: Commit** `feat(guard): pure resolve_target — permitted roots, verdict, coverage, mechanism`
+- [x] **Step 4: `cargo test -p rlm-core resolve` — all pass. `cargo fmt && cargo clippy`.**
+- [x] **Step 5: Commit** `feat(guard): pure resolve_target — permitted roots, verdict, coverage, mechanism`
 
 ---
 
