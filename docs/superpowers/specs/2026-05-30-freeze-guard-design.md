@@ -1,7 +1,7 @@
 # Design: System-wide Freeze Guard (`rlm-guard`)
 
 **Date:** 2026-05-30
-**Status:** Approved (brainstorming) — ready for implementation
+**Status:** Approved (brainstorming); ready for implementation
 **Component:** new `rlm-guard` daemon + `rlm-core` guard engine
 
 ## 1. Goal
@@ -9,14 +9,14 @@
 rlm's tagline is "proactively prevent system freezes," but today the tool is
 entirely manual. The freeze guard delivers the actual promise: a per-user
 background daemon that watches memory pressure and **automatically pauses or
-throttles the user's biggest memory hog before the system locks up** — and
+throttles the user's biggest memory hog before the system locks up**: and
 heals itself once pressure clears. It never kills processes.
 
 ## 2. Decisions (locked during brainstorming)
 
 | Decision | Choice |
 |----------|--------|
-| Scope / privilege | **Per-user daemon** — runs as the user via existing cgroup delegation, no root. Acts only on the user's own processes. |
+| Scope / privilege | **Per-user daemon**: runs as the user via existing cgroup delegation, no root. Acts only on the user's own processes. |
 | Action policy | **Recovery-only, never kill.** Escalation: notify → freeze → soft-cap (`memory.high`). rlm never issues a kill signal. |
 | Victim selection | **Highest `RSS+swap`** among eligible processes, with a protect-list. |
 | Recovery model | **Self-healing circuit breaker.** Freeze is a short (~5s) auto-thawed pause; if pressure persists, soft-cap; everything auto-lifts once memory is calm. Hysteresis + cooldowns prevent flapping. |
@@ -178,17 +178,17 @@ guard:
   thaw + clean before starting. Even a SIGKILL self-heals on restart.
 - **Residual risk (documented):** SIGKILL while a process is frozen leaves it
   paused until restart (which sweeps). Bounded by 5s freezes + `Restart=on-failure`.
-- **Loop robustness:** every effector action is best-effort + logged; a failure
+- **Loop resilience:** every effector action is best-effort + logged; a failure
   never crashes the loop. Guard excludes its own PID so it can never target itself.
 
 ## 10. Testing
 
-- **PolicyEngine (bulk):** pure unit tests — synthetic `(now_ms, Sample, ProcList)`
+- **PolicyEngine (bulk):** pure unit tests, synthetic `(now_ms, Sample, ProcList)`
   sequences asserting emitted `Action`s: escalation ladder, hysteresis (no flap
   across rise/fall), freeze→cap cooldown, self-healing recovery, never-pick-protected,
   min-RSS gate. No root needed.
 - **Sampler:** table-driven parsing of PSI + `/proc/<pid>` fixtures.
-- **Effector:** one optional integration test under delegation — freeze a throwaway
+- **Effector:** one optional integration test under delegation, freeze a throwaway
   `sleep`, assert paused via `cgroup.freeze`/proc state, then thaw.
 
 ## 11. Out of scope (future)

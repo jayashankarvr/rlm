@@ -1,7 +1,7 @@
 # Design: Process Grouping & Persistent Application Rules
 
 **Date:** 2026-05-31
-**Status:** Approved (brainstorming) — implementing
+**Status:** Approved (brainstorming); implementing
 **Components:** `common::config`, new `rlm-core::rules`, `rlm-guard`, `cli`, `gtk-gui`
 
 ## 1. Goal
@@ -13,11 +13,11 @@ Two related capabilities sharing one data model:
    limit individual PIDs. Largely surfaces logic that already exists
    (`group_by_executable`, `--application`, `apply_limit_to_multiple`).
 2. **Persistent application rules (new):** an application limit can be saved as a
-   standing rule. `rlm-guard` enforces saved rules continuously — applying them
+   standing rule. `rlm-guard` enforces saved rules continuously, applying them
    to running instances on startup and absorbing newly-launched matching
    instances into the app's shared cgroup.
 
-**Per-process (`pid-*`) limits are never persisted** — PIDs do not survive a
+**Per-process (`pid-*`) limits are never persisted**: PIDs do not survive a
 reboot. Only application rules (matched by executable) persist.
 
 ## 2. Decisions (locked during brainstorming)
@@ -26,7 +26,7 @@ reboot. Only application rules (matched by executable) persist.
 |----------|--------|
 | Persist semantics | Standing policy: re-apply to running **and** future instances. |
 | Enforcer | Extend `rlm-guard` (no new daemon/autostart). |
-| Limit semantics | **Shared pool** — all instances share one `app-<exe>` cgroup. |
+| Limit semantics | **Shared pool**: all instances share one `app-<exe>` cgroup. |
 | Rule creation/match | Save from a limit action; explicit `rules:` config section keyed by exe; match by exe basename. |
 | Stored limits | **Inline snapshot** (not a live reference to a profile). |
 | Group UX | Grouped expandable rows: "Limit group" on header + per-PID when expanded. |
@@ -113,14 +113,14 @@ impl RulesEnforcer {
 3. If no matches: tear down `app-<exe>` if present; **keep the rule**.
 
 Properties:
-- **Idempotent & cheap** — steady state does almost nothing; reuses the daemon's
+- **Idempotent & cheap**: steady state does almost nothing; reuses the daemon's
   existing per-tick `/proc` scan (no extra polling).
-- **Startup = first reconcile** — no special boot path.
-- **Best-effort & isolated** — a failure on one rule logs and never aborts other
+- **Startup = first reconcile**: no special boot path.
+- **Best-effort & isolated**: a failure on one rule logs and never aborts other
   rules or the freeze loop (mirrors the Effector discipline).
-- **No fight with the freeze guard** — a PID already in an `app-<exe>` rule
+- **No fight with the freeze guard**: a PID already in an `app-<exe>` rule
   cgroup counts as already-managed, so the freeze engine won't re-cage it.
-- **Cadence** — every tick (~1s); new instances are absorbed within ~1s.
+- **Cadence**: every tick (~1s); new instances are absorbed within ~1s.
 
 Tick loop:
 ```
@@ -133,9 +133,9 @@ sample → freeze PolicyEngine.tick → apply freeze actions
 - `rlm limit --application <exe> --memory … [--cpu …] [--io-read …] [--io-write …] --save`
   applies the shared limit now **and** writes/updates the `rules:` entry (keyed
   by `<exe>`, `match_exe: [<exe>]`).
-- `rlm rule list` — table of saved rules.
-- `rlm rule remove <name>` — delete a rule (does not touch a live cgroup).
-- `rlm unlimit --application <exe>` — drop the live cgroup; **keep** the rule
+- `rlm rule list`: table of saved rules.
+- `rlm rule remove <name>`: delete a rule (does not touch a live cgroup).
+- `rlm unlimit --application <exe>`: drop the live cgroup; **keep** the rule
   unless `--forget` is passed (which also removes the rule).
 
 ## 7. GUI surface (`gtk-gui` Limit page)
@@ -158,14 +158,14 @@ sample → freeze PolicyEngine.tick → apply freeze actions
 
 ## 9. Testing
 
-- **`AppRule::to_limit`** — parse/validation, mirrors Profile tests.
-- **Config** — `rules` round-trips; empty `rules` is omitted on serialize;
+- **`AppRule::to_limit`**: parse/validation, mirrors Profile tests.
+- **Config**: `rules` round-trips; empty `rules` is omitted on serialize;
   add/remove helpers.
-- **RulesEnforcer** — pure decision tests with an injected process list:
+- **RulesEnforcer**: pure decision tests with an injected process list:
   matching by exe basename, "ensure then add new PID", "teardown when no
   matches", idempotency (no duplicate AddPid when PID already present). Process
   enumeration is injected so these need no root.
-- **Effector/integration** — one ignored test (under delegation): a rule absorbs
+- **Effector/integration**: one ignored test (under delegation): a rule absorbs
   a freshly-spawned matching process into `app-<exe>`.
 
 ## 10. Out of scope

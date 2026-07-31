@@ -75,16 +75,16 @@ rlm unlimit --pid 1234
 ## When to Use Shared vs Individual Limits
 
 ### Use Shared Limits (`--application` or `--all-pids`) When:
-- ✅ Application spawns many processes (browsers, IDEs, etc.)
-- ✅ You want to limit the application as a whole
-- ✅ Processes are related and should share resources
-- ✅ You want simpler management (one limit for all)
+- Application spawns many processes (browsers, IDEs, etc.)
+- You want to limit the application as a whole
+- Processes are related and should share resources
+- You want simpler management (one limit for all)
 
 ### Use Individual Limits (`--pid` or `--name`) When:
-- ✅ Each process should have its own limit
-- ✅ Processes are independent
-- ✅ You need fine-grained control per process
-- ✅ Processes have different resource needs
+- Each process should have its own limit
+- Processes are independent
+- You need fine-grained control per process
+- Processes have different resource needs
 
 ## Technical Details
 
@@ -173,7 +173,9 @@ rlm limit --application firefox --memory 4G
 
 ## GUI Support
 
-The GUI will be updated to show process groups and allow selecting all processes of an application with a single click. This feature is coming soon.
+The GUI groups processes by executable on the Limit page (Application mode). Each
+group is an expandable row, so you can limit a whole application at once or expand
+it to limit individual instances.
 
 ## FAQ
 
@@ -184,7 +186,7 @@ A: They share 4GB total (combined pool).
 A: Yes, but a process can only be in one cgroup at a time. Remove individual limits before applying shared limits.
 
 **Q: What happens if a new process starts after limiting?**  
-A: New processes are not automatically added. You need to re-run the limit command or use `--all-pids` with the new PID.
+A: A one-off `--application` limit only covers the processes that existed when you ran it. To catch future instances automatically, save it as a persistent rule (`rlm limit --application <exe> ... --save`); the rlm-guard daemon then adds new matching processes to the shared cgroup.
 
 **Q: How do I see how many processes are in a shared cgroup?**  
 A: Use `rlm status` - it shows the process count for shared cgroups.

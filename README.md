@@ -144,13 +144,13 @@ Pages:
 
 `rlm-guard` is an optional per-user daemon that watches system memory pressure
 (via the kernel's PSI) and, before the machine locks up, proactively **freezes**
-or soft-**caps** your biggest memory hog — healing itself once pressure clears.
+or soft-**caps** your biggest memory hog, then heals itself once pressure clears.
 It is recovery-only and **never kills** processes.
 
-How it escalates as pressure rises: notify → briefly freeze the hog (≈5s circuit
-breaker, then auto-thaw) → soft-cap it (`memory.high`, never an OOM-kill) → lift
-everything automatically once memory is calm again. It only ever acts on *your*
-processes and protects your desktop session, shells, and audio (configurable).
+As pressure rises it escalates: notify, then briefly freeze the hog (~5s, then
+auto-thaw), then soft-cap it (`memory.high`, never an OOM-kill), then lift
+everything once memory is calm again. It only ever acts on your own processes
+and protects your desktop session, shells, and audio (configurable).
 
 ```bash
 rlm guard enable    # enable + start the user service (systemctl --user)
@@ -159,7 +159,7 @@ rlm guard test      # dry-run: print what it would do right now (no action)
 rlm guard disable   # stop and disable
 ```
 
-Tunable under a `guard:` section in `~/.config/rlm/config.yaml` (all optional —
+Tunable under a `guard:` section in `~/.config/rlm/config.yaml` (all optional;
 it works with zero configuration):
 
 ```yaml
