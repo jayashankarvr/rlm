@@ -8,8 +8,10 @@ const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 
 /// Convert a cgroup path (relative to /sys/fs/cgroup) to an absolute path.
 /// All paths passed to this module are relative to /sys/fs/cgroup (same convention as Resolution.cgroup).
+/// Handles both absolute-style paths (starting with '/') and relative paths.
 pub fn abs(cg: &str) -> PathBuf {
-    PathBuf::from(CGROUP_ROOT).join(cg)
+    let clean = cg.strip_prefix('/').unwrap_or(cg);
+    PathBuf::from(CGROUP_ROOT).join(clean)
 }
 
 /// Read the frozen state from cgroup.events.
@@ -117,5 +119,20 @@ mod tests {
         let stat = "anon 1073741824\nfile 536870912\nkernel 1000\n";
         assert_eq!(parse_anon(stat), Some(1_073_741_824));
         assert_eq!(parse_anon("file 5\n"), None);
+    }
+
+    #[test]
+    fn abs_handles_absolute_style_paths() {
+        // Task 1's Resolution.cgroup produces absolute-style paths (starting with '/')
+        // abs() must correctly prefix /sys/fs/cgroup, not drop it via Path::join
+        assert_eq!(
+            abs("/user.slice/user-1000.slice/user@1000.service/app.slice"),
+            PathBuf::from("/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice")
+        );
+        // Also handles relative paths without leading '/'
+        assert_eq!(
+            abs("user.slice/foo"),
+            PathBuf::from("/sys/fs/cgroup/user.slice/foo")
+        );
     }
 }
