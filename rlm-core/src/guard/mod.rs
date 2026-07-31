@@ -5,6 +5,7 @@
 
 pub mod effector;
 pub mod policy;
+pub mod resolve;
 pub mod sampler;
 pub mod types;
 
