@@ -15,3 +15,6 @@ Task 3: complete (commits e05d7c2..9439119, review clean after 1 fix round)
 Task 4: complete (commits 35ad886..8f4788e, review clean first pass; live freeze/thaw roundtrip verified via journalctl)
 Task 4: minor (deferred): run_with_timeout maps Disconnected(panic) to "timed out" message (systemd.rs ~1304)
 Task 4: minor (deferred): D-Bus errors reuse Error::Cgroup variant; revisit if branches grow
+Task 5: complete (commits a97b196..8b59c41, review clean first pass; effector stopgap graded non-destructive+inert)
+Task 5: CARRY-FORWARD to Task 6 (Important): dead-prune LiftCap must also thaw (or emit Thaw+LiftCap for Frozen) — a still-frozen cgroup that transiently fails to resolve must never be dropped from tracking while frozen
+Task 5: note: plan test unresolvable_process_is_never_selected corrected in substance (Notify fires at High regardless); plan text had a bug

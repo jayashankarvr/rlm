@@ -514,7 +514,7 @@ Engine changes (policy.rs):
 - `Verdict::CapOnly` → emit `Cap`, never `Freeze`, regardless of cooldown state.
 - **Partial-coverage gate shortening (spec):** add field `last_action_partial: bool`. The escalation gate uses `gate_ms = if self.last_action_partial { 0 } else { freeze_hold_ms }` — after acting with `Coverage::Partial`, the gate is open again on the next tick.
 
-- [ ] **Step 1: Update existing policy tests to build `ProcInfo` with resolutions** (test helper below) and add the two new behaviors:
+- [x] **Step 1: Update existing policy tests to build `ProcInfo` with resolutions** (test helper below) and add the two new behaviors:
 
 ```rust
 fn res(cg: &str) -> Resolution {
@@ -573,9 +573,9 @@ fn two_pids_same_scope_yield_one_intervention() {
 
 (Helpers `freeze_targets`/`has_cap_target`/`has_freeze_target` mirror the old pid-based ones but match on `res.cgroup`.)
 
-- [ ] **Step 2: Run — compile failures across policy tests. Mechanically migrate every existing test** (each `proc(pid, name, rss)` becomes `proc_at(pid, name, rss, "/app.slice/app-<name>-<pid>.scope")` so distinct pids keep distinct targets and every existing behavioral assertion — hysteresis, cooldown-cap, calm-hold lift, gate, dead-prune, notify — is preserved against cgroup-keyed state).
-- [ ] **Step 3: Implement the engine changes. All policy tests pass.**
-- [ ] **Step 4: fmt+clippy. Commit** `feat(guard): policy engine acts on resolved cgroups — CapOnly verdicts, Partial gate shortening`
+- [x] **Step 2: Run — compile failures across policy tests. Mechanically migrate every existing test** (each `proc(pid, name, rss)` becomes `proc_at(pid, name, rss, "/app.slice/app-<name>-<pid>.scope")` so distinct pids keep distinct targets and every existing behavioral assertion — hysteresis, cooldown-cap, calm-hold lift, gate, dead-prune, notify — is preserved against cgroup-keyed state).
+- [x] **Step 3: Implement the engine changes. All policy tests pass.**
+- [x] **Step 4: fmt+clippy. Commit** `feat(guard): policy engine acts on resolved cgroups — CapOnly verdicts, Partial gate shortening`
 
 ---
 
