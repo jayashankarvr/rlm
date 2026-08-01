@@ -21,6 +21,20 @@
 //! stays eligible for eviction and refault under pressure. One process
 //! cannot measure both signals — see the crate-level doc in `lib.rs` for
 //! why — so the harness runs this pair and takes the difference.
+//!
+//! ## Symmetric control walk
+//!
+//! Both modes walk the entire working set every tick with the *same*
+//! function (`touch_pages_write`, same stride, same byte count, same
+//! order) — in `locked` mode the working set is mlocked, so the walk can
+//! never fault, but it costs the same CPU as `touch` mode's walk. That
+//! shared CPU cost cancels out in `touch − locked`, so it stops being
+//! misattributed to memory-induced stall. Only `touch` mode additionally
+//! re-reads the file-backed mapping every tick — that asymmetry is
+//! intentional, it's the whole point of the treatment arm. Consequently
+//! the residual `touch − locked` is the file-backed-reclaim component plus
+//! any anon-reclaim effect the two walks' identical CPU cost doesn't
+//! explain — not scheduling noise from unequal per-tick work.
 
 use clap::Parser;
 use harness::proc_parse::{parse_majflt, parse_schedstat_wait_ns};
@@ -28,6 +42,7 @@ use harness::{ProbeMode, Tick};
 use std::fs::File;
 use std::io::{BufWriter, Read, Write};
 use std::os::unix::io::AsRawFd;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 /// Working-set and file-mapping touches operate one byte per page: enough
@@ -62,13 +77,14 @@ impl Drop for FileMapping {
     }
 }
 
-/// Map up to 1 MiB of `path` read-only, `MAP_PRIVATE`. The file descriptor
-/// does not need to outlive the call: once `mmap` succeeds, the mapping is
-/// independent of the fd.
-fn map_file(path: &str) -> std::io::Result<FileMapping> {
+/// Map up to `max_mb` MiB of `path` read-only, `MAP_PRIVATE`. The file
+/// descriptor does not need to outlive the call: once `mmap` succeeds, the
+/// mapping is independent of the fd.
+fn map_file(path: &str, max_mb: u64) -> std::io::Result<FileMapping> {
     let file = File::open(path)?;
     let file_len = file.metadata()?.len();
-    let len = std::cmp::min(file_len, 1024 * 1024).max(1) as usize;
+    let max_len = max_mb.saturating_mul(1024 * 1024);
+    let len = std::cmp::min(file_len, max_len).max(1) as usize;
 
     let ptr = unsafe {
         libc::mmap(
@@ -84,6 +100,66 @@ fn map_file(path: &str) -> std::io::Result<FileMapping> {
         return Err(std::io::Error::last_os_error());
     }
     Ok(FileMapping { ptr, len })
+}
+
+/// Create a dedicated scratch file for `--mode touch`'s file-backed
+/// mapping: `size_mb` MiB of non-compressible bytes (a simple xorshift
+/// stream, so a filesystem/device with transparent compression can't
+/// collapse it to a handful of physical pages), written into `dir`,
+/// `fsync`'d so the content is actually durable, then best-effort dropped
+/// from the page cache with `posix_fadvise(POSIX_FADV_DONTNEED)` so the
+/// probe's own write doesn't leave the mapping pre-warmed. Returns the
+/// path and the still-open `File` (kept open only so the caller can mmap
+/// it; the file's directory entry is removed by the caller once the
+/// mapping is established). On any failure the partially-written file is
+/// removed before returning the error — this function never leaves a
+/// scratch file behind on an error path.
+fn create_scratch_file(dir: &Path, size_mb: u64) -> std::io::Result<(PathBuf, File)> {
+    let path = dir.join(format!("rlm-probe-scratch-{}.bin", std::process::id()));
+
+    let result = (|| -> std::io::Result<File> {
+        let mut file = File::create(&path)?;
+        let mut buf = vec![0u8; PAGE_SIZE];
+        let size_bytes = (size_mb as usize) * 1024 * 1024;
+        // xorshift32 requires a non-zero seed; OR in 1 so an unlucky PID
+        // can't zero it out and collapse the stream to all-zero bytes.
+        let mut state: u32 = (0x9E37_79B9 ^ std::process::id()) | 1;
+        let mut written = 0usize;
+        while written < size_bytes {
+            for word in buf.chunks_mut(4) {
+                // xorshift32: cheap, deterministic-per-run, and non-repeating
+                // over a single page — good enough to defeat compression
+                // without pulling in a `rand` dependency for a one-time
+                // setup step outside the measurement loop.
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                let bytes = state.to_le_bytes();
+                word.copy_from_slice(&bytes[..word.len()]);
+            }
+            file.write_all(&buf)?;
+            written += buf.len();
+        }
+        file.sync_all()?;
+
+        // Best-effort: not fatal if unsupported (e.g. tmpfs) or denied.
+        // Portable without root — unlike dropping another process's cached
+        // pages, fadvise on a file this process just created and owns
+        // needs no special privilege.
+        unsafe {
+            libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED);
+        }
+
+        Ok(file)
+    })();
+
+    match result {
+        Ok(file) => Ok((path, file)),
+        Err(e) => {
+            let _ = std::fs::remove_file(&path);
+            Err(e)
+        }
+    }
 }
 
 /// Touch (write) one byte per page of `bytes`. Uses `write_volatile`
@@ -155,11 +231,23 @@ struct Args {
     #[arg(long, default_value_t = 2)]
     working_set_mb: u64,
 
-    /// File to memory-map (up to 1 MiB) and re-touch every tick in
-    /// `--mode touch`, to keep file-backed pages in play alongside the
-    /// anonymous working set. Ignored in `--mode locked`.
-    #[arg(long, default_value = "/proc/self/exe")]
-    file: String,
+    /// File to memory-map (up to `--file-mb` MiB) and re-touch every tick
+    /// in `--mode touch`, to keep file-backed pages in play alongside the
+    /// anonymous working set. If omitted, the probe creates, owns, and
+    /// deletes its own dedicated scratch file (see `--file-mb`) — do NOT
+    /// point this at `/proc/self/exe` or any other binary the probe (or
+    /// anything else) is actively executing: the kernel's LRU is least
+    /// likely to reclaim actively-executing code pages, so re-reading them
+    /// silently understates file-backed reclaim sensitivity instead of
+    /// measuring it. Ignored in `--mode locked`.
+    #[arg(long)]
+    file: Option<String>,
+
+    /// Size, in mebibytes, of the dedicated scratch file `--mode touch`
+    /// creates when `--file` is not given, and the cap on how much of any
+    /// `--file` (dedicated or user-supplied) gets mapped and re-touched.
+    #[arg(long, default_value_t = 1)]
+    file_mb: u64,
 
     /// Free-text label for the cgroup slice this probe was placed under
     /// (set by the runner; not read from `/proc` by the probe itself).
@@ -209,10 +297,14 @@ fn main() {
                 eprintln!(
                     "error: mlockall(MCL_CURRENT | MCL_FUTURE) failed: {e}\n\
                      The locked-mode control probe requires every page to stay \
-                     resident so it can never major-fault; this almost always \
-                     means RLIMIT_MEMLOCK is too low for this user. Check it \
-                     with `ulimit -l` and raise it (e.g. `ulimit -l unlimited`, \
-                     or LimitMEMLOCK=infinity under systemd), then retry."
+                     resident so it can never major-fault. MCL_CURRENT locks the \
+                     process's *entire* current mapping set — binary text, \
+                     shared libraries, and stack, not just --working-set-mb — so \
+                     size RLIMIT_MEMLOCK well above --working-set-mb alone. This \
+                     almost always means RLIMIT_MEMLOCK is too low for this \
+                     user. Check it with `ulimit -l` and raise it (e.g. `ulimit \
+                     -l unlimited`, or LimitMEMLOCK=infinity under systemd), \
+                     then retry."
                 );
                 std::process::exit(1);
             }
@@ -221,24 +313,77 @@ fn main() {
         ProbeMode::Touch => false,
     };
 
-    let file_mapping = match args.mode {
-        ProbeMode::Touch => match map_file(&args.file) {
-            Ok(mapping) => {
-                // Warm up the mapping before the loop for the same reason
-                // the working set is pre-faulted: the first tick shouldn't
-                // pay for this probe's own setup.
-                touch_pages_read(mapping.as_slice());
-                Some(mapping)
-            }
-            Err(e) => {
-                eprintln!("error: failed to mmap --file {}: {e}", args.file);
-                std::process::exit(1);
+    // If `--mode touch` and no `--file` was given, create a dedicated
+    // scratch file rather than defaulting to something like
+    // `/proc/self/exe`: re-reading the probe's own executing code would
+    // measure pages the kernel's LRU is least likely to ever reclaim,
+    // understating file-backed reclaim sensitivity instead of measuring
+    // it. `scratch_path` is `Some` only when we own the file and must
+    // delete it ourselves; a user-supplied `--file` is never deleted.
+    let mut scratch_path: Option<PathBuf> = None;
+    let file_path: Option<String> = match args.mode {
+        ProbeMode::Touch => match &args.file {
+            Some(p) => Some(p.clone()),
+            None => {
+                let out_dir = Path::new(&args.out)
+                    .parent()
+                    .filter(|p| !p.as_os_str().is_empty())
+                    .unwrap_or_else(|| Path::new("."));
+                match create_scratch_file(out_dir, args.file_mb) {
+                    Ok((path, _file)) => {
+                        let p = path
+                            .to_str()
+                            .expect("scratch path is valid UTF-8")
+                            .to_string();
+                        scratch_path = Some(path);
+                        Some(p)
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "error: failed to create scratch file for --mode touch's \
+                             file-backed mapping: {e}"
+                        );
+                        std::process::exit(1);
+                    }
+                }
             }
         },
         ProbeMode::Locked => None,
     };
 
-    // Buffers reused every iteration; cleared, never reallocated.
+    let file_mapping = match &file_path {
+        Some(path) => match map_file(path, args.file_mb) {
+            Ok(mapping) => {
+                // Warm up the mapping before the loop for the same reason
+                // the working set is pre-faulted: the first tick shouldn't
+                // pay for this probe's own setup.
+                touch_pages_read(mapping.as_slice());
+                // The mapping now holds the inode open, so it's safe (and
+                // required, to satisfy "delete on exit including error
+                // paths") to unlink our own scratch file's directory entry
+                // right away rather than waiting for process exit — the
+                // kernel keeps the inode alive as long as it's mapped.
+                if let Some(p) = &scratch_path {
+                    let _ = std::fs::remove_file(p);
+                }
+                Some(mapping)
+            }
+            Err(e) => {
+                if let Some(p) = &scratch_path {
+                    let _ = std::fs::remove_file(p);
+                }
+                eprintln!("error: failed to mmap --file {path}: {e}");
+                std::process::exit(1);
+            }
+        },
+        None => None,
+    };
+
+    // Buffers reused every iteration; cleared, never reallocated. Both are
+    // allocated after `mlockall(MCL_FUTURE)` above (locked mode), so their
+    // backing pages count against the locked memory budget — harmless: a
+    // one-time, sub-page-rounded, pre-loop allocation, not part of the
+    // measured working set.
     let mut schedstat_buf = String::with_capacity(256);
     let mut stat_buf = String::with_capacity(512);
 
@@ -260,16 +405,25 @@ fn main() {
             std::thread::sleep(next_wake - now);
         }
 
-        // Touch mode's whole point: pages that are NOT locked can be
-        // reclaimed between ticks, so re-touching them here is what makes
-        // this mode's drift/majflt sensitive to memory pressure. This
-        // touches only pre-allocated memory — no allocation, no
-        // formatting, no logging.
-        if args.mode == ProbeMode::Touch {
-            touch_pages_write(&mut working_set);
-            if let Some(mapping) = &file_mapping {
-                touch_pages_read(mapping.as_slice());
-            }
+        // Symmetric control walk (see module doc): BOTH modes re-touch the
+        // whole working set every tick, with the same function, stride,
+        // byte count, and order, so this walk's CPU cost is identical in
+        // both modes and cancels in `touch − locked`. In `locked` mode the
+        // working set is mlocked, so the walk can never fault — only the
+        // CPU cost is symmetric, not the fault behaviour. This touches
+        // only pre-allocated memory — no allocation, no formatting, no
+        // logging.
+        touch_pages_write(&mut working_set);
+
+        // Only `touch` mode re-reads the file-backed mapping: pages that
+        // are NOT locked can be reclaimed between ticks, so re-touching
+        // them here is what makes this mode's drift/majflt sensitive to
+        // memory pressure. This asymmetry vs. `locked` (which has no file
+        // mapping at all) is intentional — it's the treatment's whole
+        // point — so it is the one component that legitimately survives
+        // into the `touch − locked` residual.
+        if let Some(mapping) = &file_mapping {
+            touch_pages_read(mapping.as_slice());
         }
 
         let actual_elapsed = start.elapsed();
@@ -352,6 +506,12 @@ fn main() {
         "slice": args.slice_label,
         "schedstat_failures": schedstat_failures,
         "majflt_failures": majflt_failures,
+        // True iff this build performs the symmetric control walk (both
+        // modes re-touch the working set every tick, so the walk's CPU
+        // cost cancels in `touch − locked`). Always true as of this field
+        // existing; downstream tooling should treat its *absence* as
+        // "unknown, possibly biased" rather than assuming symmetry.
+        "symmetric_walk": true,
     });
     serde_json::to_writer(&mut writer, &header).expect("serialize header");
     writer.write_all(b"\n").expect("write newline");

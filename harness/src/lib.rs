@@ -23,6 +23,17 @@
 //! working set and stays eligible for eviction. `touch − locked` isolates
 //! the memory-induced component of stall — that difference is the number
 //! later phases are judged on.
+//!
+//! Both modes perform an identical per-tick page walk over the anonymous
+//! working set (same function, stride, byte count, order), so that walk's
+//! CPU cost is symmetric and cancels in the subtraction — `locked`'s copy
+//! of the walk can never fault (its pages are mlocked), so only `touch`'s
+//! copy carries real fault behaviour. Only `touch` additionally re-reads a
+//! file-backed mapping each tick; that asymmetry is intentional (it's the
+//! treatment's actual point), so the residual `touch − locked` is the
+//! file-backed-reclaim component plus any anon-reclaim effect — not CPU
+//! noise from unequal per-tick work. See `rlm-probe.rs`'s module doc for
+//! detail.
 
 pub mod proc_parse;
 
