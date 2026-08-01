@@ -728,7 +728,7 @@ pub fn journal_path() -> std::path::PathBuf {
 - [ ] **Step 3:** Observe via `journalctl --user -u rlm-guard -f`: freeze targets the **scope**, not a `guard-<pid>`. `systemd-cgls --user-unit app.slice` confirms the hog never left `rlm-gate-hog.scope`.
 - [ ] **Step 4:** After thaw: `cat .../rlm-gate-hog.scope/memory.high` == original value (`max` unless capped and lifted). Journal file empty of live entries.
 - [ ] **Step 5:** Repeat, and mid-freeze `kill -9 $(pgrep rlm-guard)`; restart the daemon; confirm the sweep thaws the scope and restores `memory.high`. **This is the gate criterion — paste the journalctl excerpt into the commit message.**
-- [ ] **Step 6:** Docs edits; `cargo fmt && cargo clippy && cargo test --workspace` final. Commit `docs(guard): act-in-place notes; Phase 0 gate transcript`
+- [x] **Step 6:** Docs edits; `cargo fmt && cargo clippy && cargo test --workspace` final. Commit `docs(guard): act-in-place notes; Phase 0 gate transcript`
 
 ---
 
