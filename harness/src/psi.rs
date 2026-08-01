@@ -49,10 +49,13 @@ pub struct PsiSample {
 }
 
 /// Parse one `/proc/pressure/<res>` body into `(some_avg10, full_avg10,
-/// some_total, full_total)`. Pure — no I/O. A missing `full` line (e.g. some
-/// kernels omit it for `io` under certain configs) defaults both of its
-/// fields to zero rather than failing the whole parse; a missing `some`
-/// line (unexpected on any real kernel) is treated as unparseable.
+/// some_total, full_total)`. Pure — no I/O. A `full` line that is missing
+/// entirely (e.g. some kernels omit it for `io` under certain configs) *or*
+/// present but malformed (e.g. missing its `total=` field) defaults both of
+/// its fields to zero rather than failing the whole parse — a broken `full`
+/// line shouldn't discard an otherwise-good `some` reading. A missing *or*
+/// malformed `some` line (unexpected on any real kernel) is treated as
+/// unparseable, since `some` is the required signal.
 pub fn parse_psi(body: &str) -> Option<(f64, f64, u64, u64)> {
     let mut some_avg10 = None;
     let mut some_total = None;
@@ -62,20 +65,35 @@ pub fn parse_psi(body: &str) -> Option<(f64, f64, u64, u64)> {
     for line in body.lines() {
         // Fixed field order per line: "<kind> avg10=.. avg60=.. avg300=.. total=..".
         let mut fields = line.split_whitespace();
-        let kind = fields.next()?;
-        let avg10: f64 = fields.next()?.strip_prefix("avg10=")?.parse().ok()?;
-        fields.next()?; // avg60=..., unused
-        fields.next()?; // avg300=..., unused
-        let total: u64 = fields.next()?.strip_prefix("total=")?.parse().ok()?;
+        let Some(kind) = fields.next() else {
+            continue;
+        };
+
+        // Parse this line's avg10/total fields without letting a malformed
+        // `full` line abort the whole function via `?` — only a malformed
+        // `some` line should do that (handled below via `some_avg10?`).
+        let parsed: Option<(f64, u64)> = (|| {
+            let avg10: f64 = fields.next()?.strip_prefix("avg10=")?.parse().ok()?;
+            fields.next()?; // avg60=..., unused
+            fields.next()?; // avg300=..., unused
+            let total: u64 = fields.next()?.strip_prefix("total=")?.parse().ok()?;
+            Some((avg10, total))
+        })();
 
         match kind {
             "some" => {
+                let (avg10, total) = parsed?;
                 some_avg10 = Some(avg10);
                 some_total = Some(total);
             }
             "full" => {
-                full_avg10 = avg10;
-                full_total = total;
+                // A malformed `full` line degrades exactly like a missing
+                // one: fields stay at their zero defaults rather than
+                // failing the parse.
+                if let Some((avg10, total)) = parsed {
+                    full_avg10 = avg10;
+                    full_total = total;
+                }
             }
             _ => {}
         }
@@ -112,6 +130,26 @@ mod tests {
     fn psi_missing_full_defaults_zero() {
         let b = "some avg10=1.00 avg60=0.00 avg300=0.00 total=10\n";
         assert_eq!(parse_psi(b), Some((1.0, 0.0, 10, 0)));
+    }
+
+    #[test]
+    fn psi_malformed_full_line_degrades_to_zero_not_none() {
+        // `full` line present but missing its `total=` field: the `some`
+        // reading must still come through, with `full` defaulted to zero
+        // exactly as if the line were absent entirely.
+        let b = "some avg10=12.34 avg60=5.00 avg300=1.00 total=999999\n\
+                 full avg10=3.21 avg60=2.00 avg300=0.50\n";
+        assert_eq!(parse_psi(b), Some((12.34, 0.0, 999999, 0)));
+    }
+
+    #[test]
+    fn psi_malformed_some_line_is_none() {
+        // `some` is the required signal: a malformed `some` line (missing
+        // `total=`) must fail the whole parse, even with a well-formed
+        // `full` line present.
+        let b = "some avg10=12.34 avg60=5.00 avg300=1.00\n\
+                 full avg10=3.21 avg60=2.00 avg300=0.50 total=42424\n";
+        assert_eq!(parse_psi(b), None);
     }
 
     #[test]

@@ -342,6 +342,10 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         return Err("--psi-io requires --psi".into());
     }
 
+    if args.psi && args.mode.is_some() {
+        return Err("--psi and --mode are mutually exclusive".into());
+    }
+
     if args.psi {
         return run_psi(&args);
     }
