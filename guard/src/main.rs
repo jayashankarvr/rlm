@@ -6,7 +6,7 @@
 //! every intervention so nothing is left frozen.
 
 use common::Config;
-use rlm_core::guard::{Effector, PolicyEngine, Sampler};
+use rlm_core::guard::{cgfs, journal_path, Effector, Journal, PolicyEngine, Sampler, SystemdUser};
 use rlm_core::rules::RulesEnforcer;
 use rlm_core::CgroupManager;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -44,7 +44,11 @@ fn run() -> common::Result<()> {
     let uid = unsafe { libc::getuid() };
 
     let manager = CgroupManager::new()?;
-    let effector = Effector::new(&manager);
+    let journal = Journal::open(journal_path(), cgfs::boot_id())?;
+    // No session bus (e.g. headless) -> every action below falls back to raw
+    // cgroupfs writes; SystemdUser::connect() already encodes that.
+    let systemd = SystemdUser::connect();
+    let effector = Effector::new(&manager, &journal, systemd.as_ref());
     let sampler = Sampler::new(gcfg.clone(), self_pid, uid);
     let mut engine = PolicyEngine::new(gcfg.clone());
 
