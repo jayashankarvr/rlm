@@ -183,9 +183,23 @@ impl Sampler {
     /// mapped-file-heavy process can push its `rss_kb` below the min-RSS
     /// floor on the very next tick even though the cgroup, and the process
     /// in it, are both still very much alive (D2 fix).
+    ///
+    /// Deliberately calls [`candidate_target`] directly rather than
+    /// `Self::resolve`: `resolve` (via `finalize`) additionally runs a
+    /// recursive `cgfs::pids_under` tree walk plus a `readlink
+    /// /proc/<pid>/exe` per member to compute `verdict`/`coverage`, neither
+    /// of which this function uses — only `candidate.cgroup` (`finalize`
+    /// passes `candidate.cgroup` through unchanged into `Resolution::cgroup`,
+    /// so the output is identical). Because this function has no min-RSS
+    /// filter (that's the D2 fix above), it runs for every one of the user's
+    /// processes on every tick, not just the heavy ones, so the member-scan
+    /// work `resolve` does is pure waste here (NEW-3 fix).
     pub fn live_cgroups(&self) -> HashSet<String> {
-        let mut resolved: HashMap<String, Resolution> = HashMap::new();
         let mut live = HashSet::new();
+
+        let Some(rlm_base) = self.rlm_base.as_deref() else {
+            return live;
+        };
 
         let Ok(entries) = fs::read_dir("/proc") else {
             return live;
@@ -212,8 +226,14 @@ impl Sampler {
                 continue;
             }
 
-            if let Some(res) = self.resolve(pid, &mut resolved) {
-                live.insert(res.cgroup);
+            let Ok(cgroup_file) = fs::read_to_string(format!("/proc/{pid}/cgroup")) else {
+                continue;
+            };
+            let Some(victim_cgroup) = parse_cgroup_path(&cgroup_file) else {
+                continue;
+            };
+            if let Some(candidate) = candidate_target(&victim_cgroup, self.uid, rlm_base) {
+                live.insert(candidate.cgroup);
             }
         }
         live

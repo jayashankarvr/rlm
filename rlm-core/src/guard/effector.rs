@@ -48,6 +48,10 @@
 //! value restored is always the *oldest* `Cap` entry's `prev_high` — the
 //! true pre-intervention value, not an intermediate entry's `prev_high`
 //! (which is just our own previous `our_high`). See [`restore_target`].
+//! Liveness, however, is judged against the *newest* `Cap` entry, not the
+//! oldest: entries are strictly appended, so a later Cap's write always
+//! supersedes an earlier one's on disk, and `should_restore`'s string
+//! comparison must match what's actually there. See [`restore_decision`].
 
 use super::cgfs;
 use super::journal::{should_restore, Journal, JournalAction, JournalEntry};
@@ -342,36 +346,34 @@ impl<'a> Effector<'a> {
     /// Restore `memory.high` for one cgroup's journal `entries` (oldest-first),
     /// if the chain is still live — called *after* the caller has already
     /// performed the mechanism-independent thaw (see module docs: no path
-    /// here ever means "leave frozen"). Only a `Cap` entry ever has a
-    /// `memory.high` to restore, so liveness is judged against *that*
-    /// specific entry via [`restore_step`] — never against `entries.last()`
-    /// (Promoted Minor B): for a `[Cap, Freeze]` chain the newest entry is
-    /// the `Freeze`, which has no `memory.high` of its own and would make
-    /// `restore_step` report `ThawOnly` ("nothing to restore"), permanently
-    /// stranding `memory.high` at the guard's Cap value once the whole chain
-    /// is cleared. The value actually restored is always [`restore_target`]'s
-    /// oldest-entry `prev_high` — the true pre-intervention value, not any
-    /// intermediate entry's `prev_high` (Important #3, Task 6 review).
-    /// Clears systemd's runtime `MemoryHigh` property *before* raw-writing
-    /// `prev_high` back — the other order lets systemd's own `"max"` write
-    /// clobber the value we just restored (Critical #2, Task 6 review).
+    /// here ever means "leave frozen"). All the decision logic is delegated
+    /// to the pure [`restore_decision`]: liveness is judged against the
+    /// *newest* `Cap` entry (whose write is what's actually on disk right
+    /// now), while the value restored is [`restore_target`]'s *oldest*-entry
+    /// `prev_high` (the true pre-intervention value). Judging liveness
+    /// against the oldest Cap instead (NEW-1 regression) leaves a stacked
+    /// `[Cap, Cap]` chain's on-disk value permanently un-restorable, since
+    /// the oldest entry's `our_high` never matches what a later Cap actually
+    /// wrote. Judging liveness against `entries.last()` has the same failure
+    /// for a `[Cap, Freeze]` chain (Promoted Minor B): the newest entry is
+    /// the `Freeze`, which has no `memory.high` of its own. Clears systemd's
+    /// runtime `MemoryHigh` property *before* raw-writing `prev_high` back —
+    /// the other order lets systemd's own `"max"` write clobber the value we
+    /// just restored (Critical #2, Task 6 review).
     fn restore_high_if_any(&self, cgroup: &str, entries: &[JournalEntry]) {
-        // No Cap entry anywhere in the chain (a Freeze-only chain, possibly
-        // with leaked duplicates): there is no memory.high to restore. The
-        // unconditional thaw already ran in the caller, so there's nothing
-        // left to do here.
-        let Some(cap_entry) = entries.iter().find(|e| e.action == JournalAction::Cap) else {
-            return;
-        };
-
         let inode = cgfs::dir_inode(cgroup);
         let high = cgfs::read_high(cgroup);
-        match restore_step(cap_entry, inode, high.as_deref()) {
-            RestoreStep::ThawAndRestoreHigh { .. } => {
-                let Some(to) = restore_target(entries) else {
-                    return;
-                };
-                if let Some(unit) = cap_entry.unit.as_deref() {
+        match restore_decision(entries, inode, high.as_deref()) {
+            RestoreStep::ThawAndRestoreHigh { to } => {
+                // Clear systemd's runtime MemoryHigh property against the
+                // NEWEST Cap's unit — that's the entry whose write is
+                // actually live on disk right now (see `restore_decision`).
+                let unit = entries
+                    .iter()
+                    .rev()
+                    .find(|e| e.action == JournalAction::Cap)
+                    .and_then(|e| e.unit.as_deref());
+                if let Some(unit) = unit {
                     if let Some(systemd) = self.systemd {
                         if let Err(err) = systemd.set_memory_high(unit, u64::MAX, DBUS_TIMEOUT) {
                             tracing::debug!(
@@ -385,8 +387,10 @@ impl<'a> Effector<'a> {
                     tracing::warn!(cgroup, error = %err, "failed to restore memory.high");
                 }
             }
-            // Unreachable in practice (a Cap entry's own restore_step never
-            // returns ThawOnly), kept for exhaustiveness.
+            // No Cap entry anywhere in the chain (a Freeze-only chain,
+            // possibly with leaked duplicates): there is no memory.high to
+            // restore. The unconditional thaw already ran in the caller, so
+            // there's nothing left to do here.
             RestoreStep::ThawOnly => {}
             RestoreStep::SkipRemove => {
                 tracing::warn!(
@@ -454,6 +458,53 @@ pub fn cap_from_anon(anon_swap: Option<u64>) -> u64 {
     anon_swap
         .map(|b| (b / 10 * 9).max(MIN_CAP_BYTES))
         .unwrap_or(MIN_CAP_BYTES)
+}
+
+/// Pure: the full restore decision for one cgroup's journal `entries`
+/// (oldest-first), given the cgroup's current inode and on-disk
+/// `memory.high` (both already read by the caller — no IO here). Answers two
+/// orthogonal questions with two different entries on purpose:
+///
+/// - **Liveness** (is the guard we wrote still intact?) is judged against
+///   the *newest* `Cap` entry in the chain. Entries are strictly appended,
+///   so a later Cap's write always supersedes an earlier one's on disk —
+///   `should_restore`'s string-equality check must compare against the
+///   entry whose `our_high` is what's actually there right now.
+/// - **Value** (what do we restore to?) is [`restore_target`]'s *oldest*
+///   `Cap` entry's `prev_high` — the true pre-intervention value, not an
+///   intermediate entry's `prev_high` (which is just our own previous
+///   `our_high` from an earlier cap in the same chain).
+///
+/// Judging both against the oldest Cap (NEW-1 regression) makes a stacked
+/// `[Cap, Cap]` chain's liveness check compare a stale `our_high` against
+/// the newer write on disk, so it never matches and the chain is treated as
+/// dead — stranding `memory.high` at the guard's value forever. Judging
+/// liveness against `entries.last()` fails the same way for `[Cap, Freeze]`
+/// (Promoted Minor B): the newest entry is the `Freeze`, which has no
+/// `memory.high` of its own. Returns [`RestoreStep::ThawOnly`] when there's
+/// no `Cap` entry anywhere in the chain (a `Freeze`-only chain) — nothing to
+/// restore beyond the caller's unconditional thaw.
+pub fn restore_decision(
+    entries: &[JournalEntry],
+    inode: Option<u64>,
+    high: Option<&str>,
+) -> RestoreStep {
+    let Some(newest_cap) = entries
+        .iter()
+        .rev()
+        .find(|e| e.action == JournalAction::Cap)
+    else {
+        return RestoreStep::ThawOnly;
+    };
+    match restore_step(newest_cap, inode, high) {
+        RestoreStep::ThawAndRestoreHigh { .. } => match restore_target(entries) {
+            Some(to) => RestoreStep::ThawAndRestoreHigh { to },
+            // Unreachable: `newest_cap` being a Cap guarantees `restore_target`
+            // (which only needs *any* Cap entry) also finds one.
+            None => RestoreStep::ThawOnly,
+        },
+        other => other,
+    }
 }
 
 /// Pure: given all journal entries for one cgroup, oldest-first, select the
@@ -576,6 +627,61 @@ mod tests {
     #[test]
     fn restore_target_none_for_freeze_only_chain() {
         assert_eq!(restore_target(&[entry_freeze("/x", 42)]), None);
+    }
+
+    /// Regression test for NEW-1: `restore_decision`'s liveness check must be
+    /// judged against the NEWEST `Cap` entry (whose `our_high` is what's
+    /// actually on disk), while the value restored stays the OLDEST `Cap`
+    /// entry's `prev_high`. A stacked `[Cap(prev="max", our="A"),
+    /// Cap(prev="A", our="B")]` chain with disk `memory.high == "B"` must
+    /// restore to `"max"` — not `SkipRemove`, which the old
+    /// `entries.iter().find()` (oldest-Cap-for-everything) produced: it
+    /// compared the oldest entry's `our_high` ("A") against disk ("B"),
+    /// never matched, and permanently stranded `memory.high`. Also covers
+    /// `[Cap, Freeze]` (Promoted Minor B's shape) and a bare `[Cap]` chain in
+    /// the same test so a future re-swap of either selection can't slip by.
+    #[test]
+    fn restore_decision_liveness_uses_newest_cap_value_uses_oldest() {
+        // [Cap, Cap]: disk holds the NEWEST Cap's our_high ("B"). Liveness
+        // must be checked against "B", not the oldest entry's "A".
+        let oldest = entry_cap("/x", 42, "max", "A");
+        let newest = entry_cap("/x", 42, "A", "B");
+        assert_eq!(
+            restore_decision(&[oldest.clone(), newest.clone()], Some(42), Some("B")),
+            RestoreStep::ThawAndRestoreHigh { to: "max".into() },
+            "must judge liveness against the newest Cap's our_high (matches disk \"B\"), \
+             but restore the oldest Cap's prev_high (\"max\")"
+        );
+        // Sanity: the stale intermediate value "A" is no longer live on disk,
+        // so checking against it (the old bug) would report SkipRemove.
+        assert_eq!(
+            restore_step(&oldest, Some(42), Some("B")),
+            RestoreStep::SkipRemove,
+            "confirms the bug this guards against: judging liveness against the oldest \
+             entry's our_high against the newer on-disk value mismatches"
+        );
+
+        // [Cap, Freeze]: newest entry has no memory.high of its own; must
+        // still fall through to the Cap for both liveness and value.
+        let cap = entry_cap("/x", 42, "max", "1000");
+        let frz = entry_freeze("/x", 42);
+        assert_eq!(
+            restore_decision(&[cap, frz], Some(42), Some("1000")),
+            RestoreStep::ThawAndRestoreHigh { to: "max".into() }
+        );
+
+        // [Cap] alone: baseline single-entry behavior is unchanged.
+        let cap_only = entry_cap("/x", 42, "max", "1000");
+        assert_eq!(
+            restore_decision(&[cap_only], Some(42), Some("1000")),
+            RestoreStep::ThawAndRestoreHigh { to: "max".into() }
+        );
+
+        // Freeze-only chain: nothing to restore.
+        assert_eq!(
+            restore_decision(&[entry_freeze("/x", 42)], Some(42), None),
+            RestoreStep::ThawOnly
+        );
     }
 
     fn entry_cap(cg: &str, inode: u64, prev: &str, our: &str) -> JournalEntry {

@@ -48,14 +48,23 @@ fn run() -> common::Result<()> {
     // case).
     //
     // A journal-open failure is only fatal when there are no rules to fall
-    // back to: persistent-rule enforcement has no dependency on the journal
-    // at all (D5b fix — this used to be fatal unconditionally, killing rules
-    // enforcement over a guard-only concern like an unwritable
-    // $XDG_STATE_HOME). With rules configured, we log loudly and continue
-    // without journal-backed escalation instead — the daemon structurally
-    // cannot freeze/cap safely without a durable journal anyway (`Effector`
-    // journals before every mutation), so escalation is simply disabled for
-    // this run.
+    // back to AND the guard is actually enabled: persistent-rule enforcement
+    // has no dependency on the journal at all (D5b fix — this used to be
+    // fatal unconditionally, killing rules enforcement over a guard-only
+    // concern like an unwritable $XDG_STATE_HOME). With rules configured, we
+    // log loudly and continue without journal-backed escalation instead —
+    // the daemon structurally cannot freeze/cap safely without a durable
+    // journal anyway (`Effector` journals before every mutation), so
+    // escalation is simply disabled for this run.
+    //
+    // When the guard is disabled and there are no rules either, there is
+    // nothing to recover into: exit cleanly instead of `Err`. Returning
+    // `Err` here used to `exit(1)` unconditionally (NEW-2 regression), which
+    // under the shipped unit's `Restart=on-failure`/`RestartSec=2` restarts
+    // the daemon every 2s forever against a config that can never heal
+    // itself (nothing this process does can fix an unwritable
+    // $XDG_STATE_HOME, and there's no escalation or rules work to attempt
+    // either way).
     let journal = match Journal::open(journal_path(), cgfs::boot_id()) {
         Ok(j) => Some(j),
         Err(e) if enforcer.rule_count() > 0 => {
@@ -65,6 +74,14 @@ fn run() -> common::Result<()> {
                  escalation disabled for this run (persistent rules are unaffected)"
             );
             None
+        }
+        Err(e) if !gcfg.enabled => {
+            tracing::warn!(
+                error = %e,
+                "guard disabled and no rules configured; journal unavailable and there is \
+                 nothing to recover into; exiting cleanly instead of restart-looping"
+            );
+            return Ok(());
         }
         Err(e) => return Err(e),
     };
