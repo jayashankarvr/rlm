@@ -33,8 +33,8 @@
 
 ```rust
 // harness/src/proc_parse.rs — all pure, all unit-tested
-/// Field 8 (0-indexed 7) of /proc/self/schedstat is time spent waiting on a
-/// runqueue, in nanoseconds. Format: "<run_ns> <wait_ns> <timeslices>".
+/// Field 2 (0-indexed 1) of /proc/self/schedstat is time spent waiting on a
+/// runqueue, in nanoseconds. Format: "<run_ns> <wait_ns> <timeslices>" (3 fields).
 pub fn parse_schedstat_wait_ns(s: &str) -> Option<u64>;
 /// Field 12 (1-indexed) of /proc/self/stat is majflt. The comm field may
 /// contain spaces and parentheses — split after the LAST ')'.

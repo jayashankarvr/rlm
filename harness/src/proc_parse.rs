@@ -2,8 +2,8 @@
 //! the probe loop does the (reused-buffer) reading and hands the string to
 //! these functions.
 
-/// Field 8 (0-indexed 7) of /proc/self/schedstat is time spent waiting on a
-/// runqueue, in nanoseconds. Format: "<run_ns> <wait_ns> <timeslices>".
+/// Field 2 (0-indexed 1) of /proc/self/schedstat is time spent waiting on a
+/// runqueue, in nanoseconds. Format: "<run_ns> <wait_ns> <timeslices>" (3 fields).
 pub fn parse_schedstat_wait_ns(s: &str) -> Option<u64> {
     s.split_whitespace().nth(1)?.parse().ok()
 }

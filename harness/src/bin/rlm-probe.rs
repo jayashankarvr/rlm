@@ -44,8 +44,13 @@ struct Args {
 fn main() {
     let args = Args::parse();
 
+    if args.interval_ms == 0 {
+        eprintln!("error: --interval-ms must be greater than 0 (busy-spin prevention)");
+        std::process::exit(1);
+    }
+
     let interval = Duration::from_millis(args.interval_ms);
-    let capacity = (args.duration_s * 1000 / args.interval_ms.max(1)) as usize + 16;
+    let capacity = (args.duration_s * 1000 / args.interval_ms) as usize + 16;
 
     // Pre-allocate every tick slot before the loop starts. `resize` (not
     // `with_capacity`) so the loop below only ever writes into existing
@@ -71,14 +76,25 @@ fn main() {
     let start = Instant::now();
     let mut tick_count = 0usize;
     let mut next_wake = start + interval;
+    let duration = Duration::from_secs(args.duration_s);
 
-    while start.elapsed() < Duration::from_secs(args.duration_s) && tick_count < ticks.len() {
+    // Counters for parse failures (kept allocation-free inside the loop).
+    let mut schedstat_failures: u64 = 0;
+    let mut majflt_failures: u64 = 0;
+
+    while start.elapsed() < duration && tick_count < ticks.len() {
         let now = Instant::now();
         if next_wake > now {
             std::thread::sleep(next_wake - now);
         }
 
         let actual_elapsed = start.elapsed();
+
+        // Stop before emitting a tick that would exceed the requested duration.
+        if actual_elapsed > duration {
+            break;
+        }
+
         let intended_elapsed = interval * (tick_count as u32 + 1);
         let drift_us = actual_elapsed.as_micros() as i64 - intended_elapsed.as_micros() as i64;
 
@@ -87,14 +103,26 @@ fn main() {
             .read_to_string(&mut schedstat_buf)
             .expect("read /proc/self/schedstat");
         seek_to_start(&mut schedstat_file);
-        let wait_ns = parse_schedstat_wait_ns(&schedstat_buf).unwrap_or(0);
+        let wait_ns = match parse_schedstat_wait_ns(&schedstat_buf) {
+            Some(val) => val,
+            None => {
+                schedstat_failures += 1;
+                0
+            }
+        };
 
         stat_buf.clear();
         stat_file
             .read_to_string(&mut stat_buf)
             .expect("read /proc/self/stat");
         seek_to_start(&mut stat_file);
-        let majflt = parse_majflt(&stat_buf).unwrap_or(0);
+        let majflt = match parse_majflt(&stat_buf) {
+            Some(val) => val,
+            None => {
+                majflt_failures += 1;
+                0
+            }
+        };
 
         ticks[tick_count] = Tick {
             t_ms: actual_elapsed.as_millis() as u64,
@@ -108,9 +136,33 @@ fn main() {
 
     ticks.truncate(tick_count);
 
+    // Emit parse failure warnings to stderr if any occurred.
+    if schedstat_failures > 0 {
+        eprintln!(
+            "warning: {} parse failures reading /proc/self/schedstat",
+            schedstat_failures
+        );
+    }
+    if majflt_failures > 0 {
+        eprintln!(
+            "warning: {} parse failures reading /proc/self/stat (majflt field)",
+            majflt_failures
+        );
+    }
+
     // All formatting and I/O happens here, after the loop — never inside it.
     let out_file = File::create(&args.out).expect("create --out file");
     let mut writer = BufWriter::new(out_file);
+
+    // Write header/summary line with failure counts.
+    let header = serde_json::json!({
+        "schedstat_failures": schedstat_failures,
+        "majflt_failures": majflt_failures,
+    });
+    serde_json::to_writer(&mut writer, &header).expect("serialize header");
+    writer.write_all(b"\n").expect("write newline");
+
+    // Write tick data.
     for tick in &ticks {
         serde_json::to_writer(&mut writer, tick).expect("serialize tick");
         writer.write_all(b"\n").expect("write newline");
