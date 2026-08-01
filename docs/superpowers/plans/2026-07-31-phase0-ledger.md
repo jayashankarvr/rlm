@@ -33,3 +33,6 @@ Task 6: complete (commits 8a0cc3c..52523a1, review clean after 2 fix rounds; ful
 Task 6: minor (deferred): reconcile is belt-and-braces not total guarantee (crash-before-replace leaves SkipRemove cap, logged)
 Task 6: minor (deferred): entries_for/replace TOCTOU under hypothetical multi-threaded caller
 Task 6: minor (deferred): Journal::replace lacks debug_assert that entries belong to cgroup
+Task 7: implemented be16f2c (impl-task7 died at rate limit; impl-task7b audited+committed); review round 1 — Critical: non-recursive member scan misses protected exes in descendant cgroups while freeze propagates to subtree (PLAN BRIEF ERRATA — spec's safety-over-coverage governs); Important: strip_cgroup_root unwrap_or_default matches-wrongly on "" rlm_base. Fix dispatched.
+Task 7: minor (deferred): comm_of duplicates Name: parsing from parse_proc_status
+Task 7: spec errata (mine): task-1/7 brief text "every process in the candidate cgroup" should read "in the candidate cgroup's SUBTREE" — freeze is hierarchical
