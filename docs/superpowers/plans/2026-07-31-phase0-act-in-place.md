@@ -710,9 +710,9 @@ pub fn journal_path() -> std::path::PathBuf {
 }
 ```
 
-- [ ] **Step 1: Make the deletions and let the compiler drive the migration; update `rules.rs` tests (drop `guard_held` args).**
-- [ ] **Step 2: `cargo test --workspace` — pass; `cargo build --release` — clean. fmt+clippy.**
-- [ ] **Step 3: Commit** `refactor(guard)!: delete guard-<pid> migration machinery; rules read kernel frozen state; status reads journal`
+- [x] **Step 1: Make the deletions and let the compiler drive the migration; update `rules.rs` tests (drop `guard_held` args).**
+- [x] **Step 2: `cargo test --workspace` — pass; `cargo build --release` — clean. fmt+clippy.**
+- [x] **Step 3: Commit** `refactor(guard)!: delete guard-<pid> migration machinery; rules read kernel frozen state; status reads journal`
 
 ---
 

@@ -39,3 +39,6 @@ Task 7: spec errata (mine): task-1/7 brief text "every process in the candidate 
 Task 7: fix round 1/5 (2 addressed, 0 open — cgfs::pids_under recursive scan + Option rlm_base fail-closed; commits be16f2c..47915cc; re-reviewer live-ran nested-cgroup test independently)
 Task 7: complete (commits afd6a76..47915cc, review clean after 1 fix round)
 Task 8: implemented de2bcef; review round 1 — Critical: CLI Journal::open mutates cross-process (TOCTOU recover_tail can drop live daemon entry); Minor: false "read-only" comment. Fix dispatched (Journal::read_entries).
+Task 8: fix round 1/5 (2 addressed, 0 open — Journal::read_entries read-only parse + accurate comment; commits de2bcef..e704a97; impl-task8 died at rate limit, impl-task8b completed)
+Task 8: complete (commits 30f73e5..e704a97, review clean after 1 fix round)
+PHASE 0 CODE TASKS 1-8 ALL COMPLETE. Task 9 = live gate (needs user) + docs.
