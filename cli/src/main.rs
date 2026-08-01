@@ -726,37 +726,37 @@ fn guard_status(manager: &CgroupManager) {
         None => println!("Memory pressure: PSI unavailable (/proc/pressure/memory)"),
     }
 
-    let base = manager.base_path();
-    let pids = manager.list_guard_pids();
-    if pids.is_empty() {
+    // Active interventions come from the guard's own write-ahead journal
+    // (read-only here — the CLI never clears/modifies entries, only the
+    // daemon does that as it acts and undoes). This reflects what the guard
+    // itself believes it's holding; it does not re-verify against the
+    // kernel's live cgroup.freeze/memory.high, which `rlm guard status` isn't
+    // trying to be a substitute for.
+    let journal = match rlm_core::guard::Journal::open(
+        rlm_core::guard::journal_path(),
+        rlm_core::guard::cgfs::boot_id(),
+    ) {
+        Ok(j) => j,
+        Err(e) => {
+            println!("\nGuard journal unavailable: {e}");
+            return;
+        }
+    };
+    let entries = journal.entries();
+    if entries.is_empty() {
         println!("\nNo active guard interventions.");
         return;
     }
 
-    println!(
-        "\n{:<8} {:<20} {:<8} {:<14}",
-        "PID", "NAME", "STATE", "MEM.HIGH"
-    );
-    println!("{}", "-".repeat(52));
-    for pid in pids {
-        let gpath = base.join(format!("guard-{pid}"));
-        let frozen = std::fs::read_to_string(gpath.join("cgroup.freeze"))
-            .map(|s| s.trim() == "1")
-            .unwrap_or(false);
-        let high = std::fs::read_to_string(gpath.join("memory.high"))
-            .map(|s| s.trim().to_string())
-            .unwrap_or_default();
-        let name = std::fs::read_to_string(format!("/proc/{pid}/comm"))
-            .map(|s| s.trim().to_string())
-            .unwrap_or_else(|_| "?".to_string());
-        let state = if frozen {
-            "frozen"
-        } else if !high.is_empty() && high != "max" {
-            "capped"
-        } else {
-            "active"
+    println!("\nActive guard interventions:");
+    for e in &entries {
+        let state = match e.action {
+            rlm_core::guard::journal::JournalAction::Freeze => "frozen".to_string(),
+            rlm_core::guard::journal::JournalAction::Cap => {
+                format!("capped our_high={}", e.our_high.as_deref().unwrap_or("?"))
+            }
         };
-        println!("{:<8} {:<20} {:<8} {:<14}", pid, name, state, high);
+        println!("  {} [{state}]", e.cgroup);
     }
 }
 

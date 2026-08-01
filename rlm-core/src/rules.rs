@@ -6,6 +6,7 @@
 //! unit-testable without root. [`RulesEnforcer::reconcile`] wires that decision
 //! to real `/proc` enumeration and a [`CgroupManager`].
 
+use crate::guard::cgfs;
 use crate::process::{self, ProcessInfo};
 use crate::CgroupManager;
 use common::{AppRule, Config, Limit};
@@ -67,31 +68,27 @@ impl CompiledRule {
 }
 
 /// Pure planner: decide the actions for one rule given the current process
-/// snapshot, the PIDs already in this rule's cgroup, the PIDs the freeze guard
-/// is currently holding (frozen/capped in a `guard-*` cgroup), and whether this
-/// rule's cgroup currently has any process in it.
+/// snapshot, the PIDs already in this rule's cgroup, and whether this rule's
+/// cgroup currently has any process in it.
 ///
-/// - matches present (excluding guard-held), some not placed -> EnsureCgroup + AddPid(each new)
-/// - matches present, all already placed                     -> EnsureCgroup only (idempotent)
-/// - no placeable matches, cgroup occupied                   -> nothing (don't evict)
-/// - no placeable matches, cgroup empty-but-present          -> TeardownEmpty
-/// - no placeable matches, no cgroup                         -> nothing
+/// - matches present, some not placed              -> EnsureCgroup + AddPid(each new)
+/// - matches present, all already placed            -> EnsureCgroup only (idempotent)
+/// - no matches, cgroup occupied                    -> nothing (don't evict)
+/// - no matches, cgroup empty-but-present            -> TeardownEmpty
+/// - no matches, no cgroup                           -> nothing
 ///
-/// `guard_held` PIDs are skipped entirely: re-adding a soft-capped/frozen
-/// process would migrate it out of its `guard-<pid>` cgroup and discard the
-/// guard's intervention. The freeze guard wins while pressure is high; the rule
-/// re-absorbs the process on a later tick once the guard releases it.
+/// The freeze guard no longer migrates processes into a separate `guard-<pid>`
+/// cgroup (it acts in place on whatever cgroup a process already lives in —
+/// see `guard/effector.rs`), so there is nothing left here to contend over.
+/// `reconcile` still skips a rule's actions for a tick if the kernel reports
+/// the rule's cgroup as frozen (see there).
 pub fn plan(
     rule: &CompiledRule,
     procs: &[ProcessInfo],
     already_placed: &[u32],
-    guard_held: &[u32],
     cgroup_exists: bool,
 ) -> Vec<RuleAction> {
-    let matches: Vec<&ProcessInfo> = procs
-        .iter()
-        .filter(|p| rule.matches(p) && !guard_held.contains(&p.pid))
-        .collect();
+    let matches: Vec<&ProcessInfo> = procs.iter().filter(|p| rule.matches(p)).collect();
 
     if matches.is_empty() {
         // Only tear down a cgroup that exists AND is empty. A populated
@@ -154,18 +151,35 @@ impl RulesEnforcer {
             }
         };
 
-        // PIDs the freeze guard currently holds (frozen/capped). Re-adding one
-        // to a rule cgroup would migrate it out of guard-<pid> and discard the
-        // guard's intervention, so the planner skips these.
-        let guard_held = mgr.list_guard_pids();
+        // rlm's own base cgroup path, relative to /sys/fs/cgroup (same
+        // convention cgfs uses), for building each rule's frozen-check path
+        // below. `None` only if base_path is somehow outside /sys/fs/cgroup
+        // (broken invariant) — the frozen-check is then skipped rather than
+        // guessed at.
+        let rlm_rel = crate::guard::sampler::strip_cgroup_root(mgr.base_path());
 
         let mut applied = Vec::new();
         for rule in &self.rules {
+            // The freeze guard acts in place now, so it may have frozen this
+            // rule's own cgroup. Read the kernel's own view via cgroup.events
+            // rather than trust our own bookkeeping — the freeze may not even
+            // be ours (e.g. a systemd unit paused for an unrelated reason) —
+            // and skip this rule's actions for the tick rather than fight a
+            // paused cgroup (adding a PID to a frozen cgroup silently queues
+            // it frozen; tearing one down while frozen can wedge cleanup).
+            // We'll reconcile normally once it thaws.
+            if let Some(rel) = &rlm_rel {
+                let cg_path = format!("{rel}/{}", rule.cgroup);
+                if cgfs::read_frozen(&cg_path) == Some(true) {
+                    continue;
+                }
+            }
+
             // Which matching PIDs are already in this rule's cgroup?
             let placed = mgr.pids_in_cgroup(&rule.cgroup);
             let exists = !placed.is_empty() || mgr.cgroup_exists(&rule.cgroup);
 
-            for action in plan(rule, &procs, &placed, &guard_held, exists) {
+            for action in plan(rule, &procs, &placed, exists) {
                 if let Err(e) = self.apply(mgr, rule, &action) {
                     tracing::warn!(?action, error = %e, "rules: action failed");
                 } else {
@@ -239,7 +253,7 @@ mod tests {
     fn plan_ensures_and_adds_unplaced_matches() {
         let r = rule("firefox", &["firefox"]);
         let procs = vec![proc(10, "firefox", None), proc(11, "firefox", None)];
-        let actions = plan(&r, &procs, &[], &[], false);
+        let actions = plan(&r, &procs, &[], false);
         assert_eq!(
             actions[0],
             RuleAction::EnsureCgroup {
@@ -260,7 +274,7 @@ mod tests {
     fn plan_is_idempotent_when_all_placed() {
         let r = rule("firefox", &["firefox"]);
         let procs = vec![proc(10, "firefox", None)];
-        let actions = plan(&r, &procs, &[10], &[], true);
+        let actions = plan(&r, &procs, &[10], true);
         // Ensure only; no AddPid for the already-placed pid.
         assert_eq!(
             actions,
@@ -274,7 +288,7 @@ mod tests {
     fn plan_adds_only_new_pid() {
         let r = rule("firefox", &["firefox"]);
         let procs = vec![proc(10, "firefox", None), proc(12, "firefox", None)];
-        let actions = plan(&r, &procs, &[10], &[], true);
+        let actions = plan(&r, &procs, &[10], true);
         assert_eq!(
             actions,
             vec![
@@ -293,7 +307,7 @@ mod tests {
     fn plan_teardown_only_when_empty_and_present() {
         let r = rule("firefox", &["firefox"]);
         // Present + empty (no placed pids) + no matches -> teardown.
-        let actions = plan(&r, &[proc(1, "code", None)], &[], &[], true);
+        let actions = plan(&r, &[proc(1, "code", None)], &[], true);
         assert_eq!(
             actions,
             vec![RuleAction::TeardownEmpty {
@@ -308,7 +322,7 @@ mod tests {
         // manual one-off `--application firefox` sharing the name). Must NOT tear
         // it down out from under its owner.
         let r = rule("firefox", &["firefox"]);
-        let actions = plan(&r, &[proc(1, "code", None)], &[999], &[], true);
+        let actions = plan(&r, &[proc(1, "code", None)], &[999], true);
         assert!(
             actions.is_empty(),
             "must not evict an occupied cgroup: {actions:?}"
@@ -316,29 +330,9 @@ mod tests {
     }
 
     #[test]
-    fn plan_skips_guard_held_pids() {
-        // A matching process the freeze guard is currently holding must not be
-        // re-added (that would migrate it out of guard-<pid> and discard the cap).
-        let r = rule("firefox", &["firefox"]);
-        let procs = vec![proc(10, "firefox", None), proc(11, "firefox", None)];
-        let actions = plan(&r, &procs, &[], &[10], false);
-        assert!(
-            !actions.contains(&RuleAction::AddPid {
-                rule: "firefox".into(),
-                pid: 10
-            }),
-            "guard-held pid 10 must be skipped: {actions:?}"
-        );
-        assert!(actions.contains(&RuleAction::AddPid {
-            rule: "firefox".into(),
-            pid: 11
-        }));
-    }
-
-    #[test]
     fn plan_noop_when_no_matches_and_no_cgroup() {
         let r = rule("firefox", &["firefox"]);
-        let actions = plan(&r, &[proc(1, "code", None)], &[], &[], false);
+        let actions = plan(&r, &[proc(1, "code", None)], &[], false);
         assert!(actions.is_empty());
     }
 }
