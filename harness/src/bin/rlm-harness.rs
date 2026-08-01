@@ -5,38 +5,44 @@
 //!
 //! ## Safety
 //!
-//! This tool runs a memory hog on a real machine. Two guards protect the
+//! This tool runs a memory hog on a real machine. These guards protect the
 //! operator:
 //!
 //! - **Preflight** (`harness::runner::preflight_check`): refuses to run at
 //!   all without `/proc/pressure/memory`, and refuses to run without
-//!   `--i-know` if `MemTotal` is above 12 GiB *and* the requested
-//!   `--hog-fraction` would itself allocate more than 12 GiB — i.e. this
-//!   looks like it could put a real dent in what is plausibly the
-//!   operator's own daily-driver desktop.
-//! - **Cleanup is bulletproof, not best-effort-only-on-the-happy-path.**
-//!   [`UnitGuard`] is a Drop guard covering every `systemd-run` unit this
-//!   process starts (the three probes, the PSI sampler, and the hog scope)
-//!   plus the hog's known tmpfs scratch file. Because it is a Drop guard,
-//!   it runs on every return path out of [`run`] — success, an `Err` from
-//!   any `?`, or a panic unwind — not just the ones we remember to
-//!   hand-write a cleanup call for. `main` follows the same shape as
-//!   `rlm-probe`: all fallible work lives in `run(args) -> Result<...>`,
-//!   and `main` calls `std::process::exit` exactly once, *after* `run`
-//!   returns. `std::process::exit` does not run destructors, so calling it
-//!   from inside `run` (or anywhere `UnitGuard` might still be alive) would
-//!   silently skip the hog teardown — this project has already paid for
-//!   that lesson once (see `rlm-probe.rs`), so this binary is built to the
-//!   same discipline. SIGINT/SIGTERM are handled the same way `rlm-guard`
-//!   does it (`ctrlc` + an `AtomicBool` checked between sleep chunks): a
-//!   signal makes `run` return `Err` promptly, `UnitGuard` still drops
-//!   normally, and the hog/probes still get torn down.
+//!   `--i-know` if `MemTotal` is above 12 GiB *and* the hog would consume a
+//!   large share of `MemAvailable` and/or leave little headroom behind —
+//!   i.e. this looks like it could put a real dent in what is plausibly
+//!   the operator's own daily-driver desktop. Whenever the hog is about to
+//!   run at all, its size/fraction/duration are printed loudly *before* it
+//!   starts, gated or not.
+//! - **`UnitGuard` tears down everything this process starts, on every
+//!   return path it actually executes** — success, an `Err` from any `?`,
+//!   a panic unwind, or SIGINT/SIGTERM (handled the same way `rlm-guard`
+//!   does: `ctrlc` + an `AtomicBool` checked between sleep chunks). `main`
+//!   follows the same shape as `rlm-probe`: all fallible work lives in
+//!   `run(args) -> Result<...>`, and `main` calls `std::process::exit`
+//!   exactly once, *after* `run` returns, so no guard is skipped by an
+//!   early exit.
+//! - **Bounded, not bulletproof, against the scenarios `UnitGuard` cannot
+//!   cover.** Drop is a language-level guarantee, not an OS-level one: it
+//!   cannot run at all if this process is SIGKILLed, SIGSTOPped, OOM-killed
+//!   by the very pressure it induced, or the machine loses power. What
+//!   actually bounds the worst case there is `hog.sh`'s own `--max-seconds`
+//!   cap (`harness::runner::hog_max_seconds`: `baseline_s + duration_s` plus
+//!   a fixed slack), honoured on both the `stress-ng` and `dd` fallback
+//!   paths — the hog frees itself and exits even with nobody left to stop
+//!   it. `RuntimeMaxSec=` on the hog's own transient scope is a second,
+//!   independent backstop for the case where `hog.sh`'s own timer somehow
+//!   never fires, and `MemoryMax=` bounds how large the hog can get
+//!   regardless of duration. Worst case after these: an orphaned hog holds
+//!   its memory for at most `hog_max_seconds`, never until reboot.
 
 use clap::Parser;
-use harness::runner::{self, HostInfo, PreflightInput, Report, RunInfo};
+use harness::runner::{self, HogInfo, HostInfo, PreflightInput, Report, RunInfo};
 use harness::ProbeMode;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -162,15 +168,24 @@ impl UnitGuard {
     /// at the natural end of a successful run (so the report can be
     /// written promptly instead of waiting for Drop) as well as from Drop
     /// itself (so an early-return path still tears everything down).
-    /// Idempotent: stopping an already-stopped unit is a harmless no-op.
+    /// Idempotent: stopping an already-stopped unit is a harmless no-op --
+    /// but `--collect` has already unloaded most units by the time this
+    /// runs twice (explicit call, then Drop), so systemctl prints "Unit …
+    /// not loaded." to stderr for each one. That's expected noise from a
+    /// successful run, not a sign anything is wrong, so it's silenced
+    /// here rather than left to make a green run look broken.
     fn stop_all(&self) {
         for (name, kind) in &self.units {
             let unit = format!("{name}{}", kind.suffix());
             let _ = Command::new("systemctl")
                 .args(["--user", "stop", &unit])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
                 .status();
             let _ = Command::new("systemctl")
                 .args(["--user", "reset-failed", &unit])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
                 .status();
         }
     }
@@ -186,7 +201,7 @@ impl Drop for UnitGuard {
 }
 
 fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
-    if !(0.0..=1.0).contains(&args.hog_fraction) {
+    if !(args.hog_fraction > 0.0 && args.hog_fraction <= 1.0) {
         return Err("--hog-fraction must be in (0, 1]".into());
     }
 
@@ -205,6 +220,7 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|e| format!("failed to read /proc/meminfo: {e}"))?;
     let (mem_total_kb, mem_available_kb) = runner::parse_meminfo(&meminfo)
         .ok_or("failed to parse MemTotal/MemAvailable out of /proc/meminfo")?;
+    let swap_total_kb = runner::parse_swap_total_kb(&meminfo).unwrap_or(0);
 
     let preflight_input = PreflightInput {
         psi_memory_exists: Path::new("/proc/pressure/memory").exists(),
@@ -216,6 +232,29 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     if let Err(e) = runner::preflight_check(&preflight_input) {
         return Err(format!("preflight check failed: {e}").into());
     }
+
+    // Structured facts about the hog this run computed, shared between the
+    // loud pre-run warning, the actual systemd-run invocation (--max-seconds,
+    // RuntimeMaxSec=, MemoryMax=), and the report -- so all three describe
+    // the exact same number.
+    let hog_estimated_mb = runner::hog_estimated_mb(args.hog_fraction, mem_available_kb);
+    let hog_max_seconds = runner::hog_max_seconds(args.baseline_s, args.duration_s);
+    let hog_memory_max_bytes = runner::hog_memory_max_bytes(hog_estimated_mb);
+    let stress_ng_available =
+        runner::command_on_path("stress-ng", &std::env::var("PATH").unwrap_or_default());
+    let hog_backend = runner::hog_backend(stress_ng_available);
+
+    // Loud, unconditional heads-up -- printed whether or not the preflight
+    // gate fired, since an ungated run previously printed nothing at all
+    // before starting the hog.
+    eprintln!(
+        "about to hog ~{hog_estimated_mb} MB (--hog-fraction {} of {} MB MemAvailable, \
+         backend={hog_backend}) for up to {hog_max_seconds}s",
+        args.hog_fraction,
+        mem_available_kb / 1024,
+    );
+
+    let mut warnings: Vec<String> = Vec::new();
 
     std::fs::create_dir_all(&args.out_dir)
         .map_err(|e| format!("failed to create --out-dir {}: {e}", args.out_dir))?;
@@ -264,7 +303,7 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             args.working_set_mb,
         );
         let unit_name = format!("rlm-harness-{run_id}-{label}");
-        let sd_argv = runner::systemd_run_argv(&unit_name, slice, false, &inner);
+        let sd_argv = runner::systemd_run_argv(&unit_name, slice, false, &[], &inner);
         run_systemd_run(&sd_argv).map_err(|e| format!("failed to place probe {label}: {e}"))?;
         guard.track(unit_name, UnitKind::Service);
         probe_paths.push((label.to_string(), out_path));
@@ -285,7 +324,7 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         args.interval_ms,
     );
     let psi_unit_name = format!("rlm-harness-{run_id}-psi");
-    let psi_sd_argv = runner::systemd_run_argv(&psi_unit_name, None, false, &psi_inner);
+    let psi_sd_argv = runner::systemd_run_argv(&psi_unit_name, None, false, &[], &psi_inner);
     run_systemd_run(&psi_sd_argv).map_err(|e| format!("failed to place PSI sampler: {e}"))?;
     guard.track(psi_unit_name, UnitKind::Service);
 
@@ -296,8 +335,14 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 
     // The hog: a --scope unit (not --service) because the runner needs to
     // stop it at an arbitrary moment mid-run, unlike the probes which run
-    // to their own natural completion.
+    // to their own natural completion. It gets its own dedicated slice
+    // (runner::HOG_SLICE), not app.slice (systemd-run's default for a
+    // --user unit given no --slice) -- app-touch is deliberately placed
+    // under app.slice as the sole probe meant to observe Phase 1's future
+    // dynamic cap; sharing a slice with the hog would throttle the probe
+    // alongside the very pressure it exists to measure.
     let hog_unit_name = format!("rlm-harness-{run_id}-hog");
+    let hog_unit_full = format!("{hog_unit_name}.scope");
     let hog_inner = vec![
         "bash".to_string(),
         hog_script_path
@@ -313,8 +358,24 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             .to_str()
             .ok_or("--out-dir path is not valid UTF-8")?
             .to_string(),
+        "--max-seconds".to_string(),
+        hog_max_seconds.to_string(),
     ];
-    let hog_sd_argv = runner::systemd_run_argv(&hog_unit_name, None, true, &hog_inner);
+    // Duration and size backstops in defence of hog.sh's own --max-seconds
+    // cap (see the module doc): RuntimeMaxSec= catches hog.sh wedged where
+    // its own sleep/exec never returns; MemoryMax= bounds an arithmetic
+    // error in the fraction maths so it cannot outrun the preflight gate.
+    let hog_properties = vec![
+        format!("RuntimeMaxSec={hog_max_seconds}s"),
+        format!("MemoryMax={hog_memory_max_bytes}"),
+    ];
+    let hog_sd_argv = runner::systemd_run_argv(
+        &hog_unit_name,
+        Some(runner::HOG_SLICE),
+        true,
+        &hog_properties,
+        &hog_inner,
+    );
     // `--scope` runs synchronously in the invoking process until the
     // wrapped command exits, so this must be `spawn` (background), never
     // `status`/`output` (which would block until the hog is torn down --
@@ -325,23 +386,69 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|e| format!("failed to start hog: {e}"))?;
     guard.track(hog_unit_name.clone(), UnitKind::Scope);
 
+    // Confirm the hog actually started and is holding memory, rather than
+    // trusting that systemd-run exiting 0 means it's doing anything: a
+    // hog that fails to allocate (e.g. /dev/shm ENOSPC -> hog.sh exits
+    // under `set -euo pipefail`) goes inactive within about a second, and
+    // without this check the run would otherwise sleep out the full
+    // duration and write a normal-looking report with near-zero PSI and
+    // no error.
+    let hog_started_ok = wait_for_active(&hog_unit_full, Instant::now() + Duration::from_secs(3));
+    if !hog_started_ok {
+        let msg = format!(
+            "hog scope {hog_unit_full} did not reach 'active' within 3s of starting -- it \
+             may have failed to allocate (e.g. /dev/shm out of space); this run's \
+             measurement window may not reflect any real memory pressure"
+        );
+        eprintln!("warning: {msg}");
+        warnings.push(msg);
+    }
+
     // Hold while the hog runs.
     let interrupted = interruptible_sleep(Duration::from_secs(args.duration_s), &shutdown);
+
+    // Check again right before tearing the hog down: hog_started_ok only
+    // proves it started, not that it was still holding memory for the
+    // whole intended hold period (it could die partway through, e.g. the
+    // OOM killer taking it under the very pressure it created).
+    let hog_active_at_teardown = unit_active_state(&hog_unit_full) == "active";
+    if hog_started_ok && !hog_active_at_teardown && !interrupted {
+        let msg = format!(
+            "hog scope {hog_unit_full} was no longer active at the end of the intended hold \
+             period -- it stopped early; this run's measurement window may only partly \
+             reflect real memory pressure"
+        );
+        eprintln!("warning: {msg}");
+        warnings.push(msg);
+    }
+    let hog_verified_running = hog_started_ok && hog_active_at_teardown;
 
     // Stop the hog now (rather than waiting for `guard`'s Drop at the end
     // of this function) so its memory pressure ends before we wait for the
     // probes to finish writing their output, and so an interrupted run
     // frees memory immediately instead of after a possibly-slow probe
     // wait. `systemctl stop` sends SIGTERM to every process in the scope,
-    // which both `hog.sh`'s own trap and this explicit teardown handle;
-    // `hog_child.kill()` is a hard backstop for the (should-not-happen)
-    // case where the scope somehow didn't tear down its process tree.
-    let hog_unit_full = format!("{hog_unit_name}.scope");
+    // which both `hog.sh`'s own trap and this explicit teardown handle.
+    //
+    // NOTE: `hog_child` is `systemd-run`'s own client process (our direct
+    // child) -- it is NOT an ancestor of the hog's actual process, which
+    // systemd itself spawns as a child of the user service manager. By
+    // the time we reach `hog_child.kill()`/`.wait()` below, that client
+    // process has normally already exited (systemd-run for a --scope
+    // waits on the unit and returns once it's gone); killing/reaping it
+    // here only avoids a zombie of our own child. It is NOT what stops
+    // the hog -- `systemctl --user stop` above is the only thing that
+    // does, and dropping this call (believing `.kill()` covers it) would
+    // leave the hog running.
     let _ = Command::new("systemctl")
         .args(["--user", "stop", &hog_unit_full])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status();
     let _ = Command::new("systemctl")
         .args(["--user", "reset-failed", &hog_unit_full])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status();
     let _ = hog_child.kill();
     let _ = hog_child.wait();
@@ -361,7 +468,16 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         if kind != UnitKind::Service {
             continue;
         }
-        wait_for_unit_inactive(&format!("{name}{}", kind.suffix()), deadline, &shutdown)?;
+        let unit = format!("{name}{}", kind.suffix());
+        let timed_out = wait_for_unit_inactive(&unit, deadline, &shutdown)?;
+        if timed_out {
+            let msg = format!(
+                "unit {unit} did not go inactive before the deadline; its tick data may be \
+                 truncated"
+            );
+            eprintln!("warning: {msg}");
+            warnings.push(msg);
+        }
     }
 
     // Explicit stop for tidiness (a unit that hit the deadline above
@@ -388,14 +504,28 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         kernel: read_kernel_release(),
         rlm_installed: runner::command_on_path("rlm", &std::env::var("PATH").unwrap_or_default()),
         guard_enabled: rlm_guard_running(),
+        hostname: read_hostname(),
+        swap_total_kb,
     };
     let run_info = RunInfo {
         duration_s: args.duration_s,
         baseline_s: args.baseline_s,
         hog_fraction: args.hog_fraction,
         noise_floor_us: args.noise_floor_us,
+        mem_available_kb,
+        interval_ms: args.interval_ms,
+        working_set_mb: args.working_set_mb,
+        timestamp_unix_s: unix_timestamp_now(),
     };
-    let report = runner::assemble_report(host, run_info, probes, psi_report);
+    let hog_info = HogInfo {
+        estimated_mb: hog_estimated_mb,
+        backend: hog_backend.to_string(),
+        max_seconds: hog_max_seconds,
+        memory_max_bytes: hog_memory_max_bytes,
+        slice: runner::HOG_SLICE.to_string(),
+        verified_running: hog_verified_running,
+    };
+    let report = runner::assemble_report(host, run_info, hog_info, probes, psi_report, warnings);
     write_report(&args.out_dir, &report)?;
 
     Ok(())
@@ -468,37 +598,63 @@ fn interruptible_sleep(total: Duration, shutdown: &AtomicBool) -> bool {
     shutdown.load(Ordering::SeqCst)
 }
 
-/// Poll `systemctl --user show <unit> --property=ActiveState --value`
-/// until the unit reports inactive/failed (or is no longer known at all),
-/// `deadline` passes, or `shutdown` fires. A unit that's still running past
-/// `deadline` is not treated as a hard error here -- the caller stops it
-/// explicitly afterward regardless, and a probe that genuinely never wrote
-/// its output surfaces as a read/parse error a few lines later, which is a
-/// clearer failure than this function guessing at a timeout's meaning.
+/// `systemctl --user show <unit> --property=ActiveState --value`, trimmed.
+/// Empty string if the unit is unknown or the command fails -- callers
+/// treat that the same as "not active"/"not running" rather than erroring,
+/// since a unit that's already been collected (`--collect`) after going
+/// inactive looks identical to one that never existed.
+fn unit_active_state(unit: &str) -> String {
+    Command::new("systemctl")
+        .args(["--user", "show", unit, "--property=ActiveState", "--value"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default()
+}
+
+/// Poll `unit_active_state` until the unit reports inactive/failed (or is
+/// no longer known at all), `deadline` passes, or `shutdown` fires.
+/// Returns `Ok(true)` if `deadline` was hit before the unit went inactive
+/// (a timeout -- the caller stops the unit explicitly afterward
+/// regardless, and a probe that genuinely never wrote its output surfaces
+/// as a read/parse error a few lines later, so this isn't treated as a
+/// hard error here), `Ok(false)` if it went inactive normally, or `Err` if
+/// interrupted by `shutdown`.
 fn wait_for_unit_inactive(
     unit: &str,
     deadline: Instant,
     shutdown: &AtomicBool,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<bool, Box<dyn std::error::Error>> {
     loop {
         if shutdown.load(Ordering::SeqCst) {
             return Err(format!("interrupted while waiting for {unit} to finish").into());
         }
 
-        let output = Command::new("systemctl")
-            .args(["--user", "show", unit, "--property=ActiveState", "--value"])
-            .output();
-        if let Ok(output) = output {
-            let state = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if state.is_empty() || state == "inactive" || state == "failed" {
-                return Ok(());
-            }
+        let state = unit_active_state(unit);
+        if state.is_empty() || state == "inactive" || state == "failed" {
+            return Ok(false);
         }
 
         if Instant::now() >= deadline {
-            return Ok(());
+            return Ok(true);
         }
         std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// Poll `unit_active_state` until the unit reports `active` or `deadline`
+/// passes. Used right after starting the hog to confirm it's actually
+/// holding memory rather than trusting `systemd-run` exiting 0 (see I3 in
+/// the module doc / commit history: a hog that fails to allocate can exit
+/// within about a second of starting).
+fn wait_for_active(unit: &str, deadline: Instant) -> bool {
+    loop {
+        if unit_active_state(unit) == "active" {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(150));
     }
 }
 
@@ -506,6 +662,23 @@ fn read_kernel_release() -> String {
     std::fs::read_to_string("/proc/sys/kernel/osrelease")
         .map(|s| s.trim().to_string())
         .unwrap_or_default()
+}
+
+fn read_hostname() -> String {
+    std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default()
+}
+
+/// Unix seconds at call time, for the report's `run.timestamp_unix_s`.
+/// `unwrap_or(0)` rather than propagating an error: a clock that can't be
+/// read at all is not a reason to fail an otherwise-successful run, and
+/// `0` is an unambiguous "not available" sentinel for any consumer.
+fn unix_timestamp_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// Best-effort detection of a running `rlm-guard` process. Never a hard

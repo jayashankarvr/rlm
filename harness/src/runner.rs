@@ -18,6 +18,50 @@ use serde::Serialize;
 /// dent in it needs an explicit `--i-know` rather than a bare invocation.
 pub const LARGE_RAM_THRESHOLD_KB: u64 = 12 * 1024 * 1024;
 
+/// Fraction of `MemAvailable`, at or above which the hog is judged to be
+/// consuming enough of what's currently free to threaten a large-RAM
+/// desktop, regardless of how much absolute headroom is left afterward.
+/// `hog_estimated_kb` can never exceed `mem_available_kb` (it's defined as
+/// a fraction of it), so a second *absolute* threshold on it — the
+/// original bug — can never fire on a machine whose `MemAvailable` sits
+/// below that absolute number, which is the common case (`MemAvailable`
+/// is usually well under `MemTotal`). A relative threshold fires
+/// regardless of how large `MemTotal` is.
+pub const HIGH_HOG_FRACTION_THRESHOLD: f64 = 0.5;
+
+/// Headroom left after the hog runs (`MemAvailable - hog_estimated_kb`),
+/// in kB, below which the hog is judged to threaten a large-RAM desktop
+/// regardless of what fraction was requested — catches a *low*
+/// `--hog-fraction` on a machine that has very little `MemAvailable` to
+/// begin with (so even a "small" fraction leaves almost nothing free).
+pub const LOW_HEADROOM_THRESHOLD_KB: u64 = 2 * 1024 * 1024; // 2 GiB
+
+/// Hard slack, in seconds, added on top of `baseline_s + duration_s` when
+/// computing the hog's `--max-seconds` cap and the transient scope's
+/// `RuntimeMaxSec=`. Covers the dbus round trips in `systemctl --user
+/// stop`/`reset-failed`, `wait_for_unit_inactive`'s own deadline, and
+/// general scheduling jitter — the run's own teardown path should always
+/// finish comfortably inside it, so a hog that's still alive past this
+/// slack is presumed orphaned, not just slow to tear down.
+pub const HOG_MAX_SECONDS_SLACK: u64 = 30;
+
+/// Safety margin applied on top of the hog's estimated size when setting
+/// the transient scope's `MemoryMax=`. This bounds how large a *runaway*
+/// hog can get (an arithmetic bug overshooting the intended fraction)
+/// without clipping a correctly-sized hog due to backend/allocator
+/// overhead (stress-ng's own resident footprint, bash, `dd`'s buffers).
+pub const HOG_MEMORY_MAX_MARGIN: f64 = 1.25;
+
+/// Dedicated transient slice for the hog's scope. Deliberately NOT
+/// `app.slice` (systemd-run's default placement for a `--user` unit given
+/// no `--slice`): `app-touch` is placed under `app.slice` on purpose, as
+/// the sole probe meant to observe Phase 1's future dynamic cap on it. If
+/// the hog shared that slice, any per-slice throttling would hit the hog
+/// and the probe it's meant to pressure together, confounding the single
+/// number `app-touch` exists to produce. `systemd-run --slice=` auto-vivifies
+/// a transient slice by this name if it doesn't already exist.
+pub const HOG_SLICE: &str = "rlm-harness-hog.slice";
+
 /// Everything the preflight decision needs to know. Kept as a plain struct
 /// (rather than reading `/proc` itself) so the decision is testable without
 /// touching the filesystem.
@@ -63,13 +107,23 @@ impl std::fmt::Display for PreflightError {
             } => write!(
                 f,
                 "MemTotal is {mem_total_kb} kB (> {LARGE_RAM_THRESHOLD_KB} kB) and the \
-                 requested --hog-fraction would allocate ~{hog_estimated_kb} kB, which also \
-                 exceeds {LARGE_RAM_THRESHOLD_KB} kB. This looks like it could threaten a \
-                 real desktop with substantial RAM. Re-run with --i-know to confirm you \
-                 intend this."
+                 requested --hog-fraction would allocate ~{hog_estimated_kb} kB of \
+                 MemAvailable, which would consume at least {HIGH_HOG_FRACTION_THRESHOLD} \
+                 of what's currently free and/or leave less than \
+                 {LOW_HEADROOM_THRESHOLD_KB} kB of headroom behind. This looks like it \
+                 could threaten a real desktop with substantial RAM. Re-run with --i-know \
+                 to confirm you intend this."
             ),
         }
     }
+}
+
+/// The hog's estimated size in kB: `hog_fraction` of `mem_available_kb`,
+/// rounded to the nearest kB. Shared by the preflight gate and the report
+/// so both agree on the same number (the exact MB the hog allocates,
+/// matching `hog.sh`'s own math, is `hog_estimated_mb` below).
+pub fn hog_estimated_kb(hog_fraction: f64, mem_available_kb: u64) -> u64 {
+    (hog_fraction * mem_available_kb as f64).round() as u64
 }
 
 /// Refuse-to-run decision. Pure: takes already-read facts, returns a
@@ -79,9 +133,18 @@ pub fn preflight_check(input: &PreflightInput) -> Result<(), PreflightError> {
         return Err(PreflightError::NoPsiMemory);
     }
 
-    let hog_estimated_kb = (input.hog_fraction * input.mem_available_kb as f64).round() as u64;
-    let threatens_large_ram_desktop =
-        input.mem_total_kb > LARGE_RAM_THRESHOLD_KB && hog_estimated_kb > LARGE_RAM_THRESHOLD_KB;
+    let hog_estimated_kb = hog_estimated_kb(input.hog_fraction, input.mem_available_kb);
+    let headroom_after_hog_kb = input.mem_available_kb.saturating_sub(hog_estimated_kb);
+
+    // Relative, not a second absolute threshold (see the constants' doc
+    // comments for why the absolute version was the bug): on a large-RAM
+    // machine, require --i-know when the hog would either consume a large
+    // share of what's currently free, or leave little headroom behind —
+    // whichever condition trips first.
+    let large_ram_machine = input.mem_total_kb > LARGE_RAM_THRESHOLD_KB;
+    let high_fraction = input.hog_fraction >= HIGH_HOG_FRACTION_THRESHOLD;
+    let low_headroom = headroom_after_hog_kb < LOW_HEADROOM_THRESHOLD_KB;
+    let threatens_large_ram_desktop = large_ram_machine && (high_fraction || low_headroom);
 
     if threatens_large_ram_desktop && !input.i_know {
         return Err(PreflightError::NeedsIKnow {
@@ -91,6 +154,50 @@ pub fn preflight_check(input: &PreflightInput) -> Result<(), PreflightError> {
     }
 
     Ok(())
+}
+
+/// The hog's exact size in MB, matching `hog.sh`'s own `awk` computation
+/// byte-for-byte (`(fraction * mem_available_kb) / 1024`, floored, with a
+/// 1 MB floor) — so the report's `hog.estimated_mb` and the `MemoryMax=`
+/// sizing below describe the same number `hog.sh` actually allocates,
+/// not an independently-rounded approximation of it.
+pub fn hog_estimated_mb(hog_fraction: f64, mem_available_kb: u64) -> u64 {
+    let mb = (hog_fraction * mem_available_kb as f64) / 1024.0;
+    let mb = if mb < 1.0 { 1.0 } else { mb };
+    mb.trunc() as u64
+}
+
+/// The hog's `--max-seconds` cap (and the transient scope's
+/// `RuntimeMaxSec=`, set to the same value): long enough to cover the
+/// full intended run (`baseline_s + duration_s`) plus `HOG_MAX_SECONDS_SLACK`
+/// for teardown, short enough that an orphaned hog (runner SIGKILLed,
+/// OOM-killed, terminal closed) self-terminates in bounded time instead of
+/// holding memory until reboot.
+pub fn hog_max_seconds(baseline_s: u64, duration_s: u64) -> u64 {
+    baseline_s + duration_s + HOG_MAX_SECONDS_SLACK
+}
+
+/// `MemoryMax=` for the hog's transient scope, in bytes: the hog's exact
+/// estimated size (`hog_estimated_mb`), scaled up by `HOG_MEMORY_MAX_MARGIN`.
+/// This bounds how large a runaway hog can get — an arithmetic error in the
+/// fraction maths cannot outrun the preflight gate — without clipping a
+/// correctly-sized hog's own backend overhead.
+pub fn hog_memory_max_bytes(hog_estimated_mb: u64) -> u64 {
+    ((hog_estimated_mb as f64) * 1024.0 * 1024.0 * HOG_MEMORY_MAX_MARGIN).round() as u64
+}
+
+/// Which hog backend `hog.sh` will actually use, given whether `stress-ng`
+/// is on `PATH` (the same check `hog.sh` itself makes with
+/// `command -v stress-ng`) — recorded in the report because the two
+/// backends produce materially different pressure (`stress-ng --vm`
+/// touches memory continuously; the `dd`-into-tmpfs fallback just holds a
+/// static allocation).
+pub fn hog_backend(stress_ng_available: bool) -> &'static str {
+    if stress_ng_available {
+        "stress-ng"
+    } else {
+        "dd"
+    }
 }
 
 /// Parse `MemTotal` and `MemAvailable` (both kB) out of `/proc/meminfo`
@@ -116,6 +223,23 @@ pub fn parse_meminfo(content: &str) -> Option<(u64, u64)> {
     }
 
     Some((mem_total?, mem_available?))
+}
+
+/// Parse `SwapTotal` (kB) out of `/proc/meminfo` content. Pure. `None` if
+/// the field is missing or malformed. Recorded in the report so a past
+/// run's numbers can be interpreted correctly — swap changes how much
+/// headroom a hog actually has before triggering real memory pressure.
+pub fn parse_swap_total_kb(content: &str) -> Option<u64> {
+    for line in content.lines() {
+        let mut fields = line.split_whitespace();
+        let Some(key) = fields.next() else {
+            continue;
+        };
+        if key == "SwapTotal:" {
+            return fields.next()?.parse::<u64>().ok();
+        }
+    }
+    None
 }
 
 /// Whether `name` is present as an executable file directly under one of
@@ -219,11 +343,15 @@ pub fn psi_probe_argv(
 /// unit (used for probes, which run to their own completion and write
 /// their output before exiting). `--collect` is always included so systemd
 /// unloads the transient unit's state once it goes inactive, rather than
-/// accumulating unit records across repeated harness runs.
+/// accumulating unit records across repeated harness runs. `properties`
+/// are passed through as `--property=<entry>` (e.g. `RuntimeMaxSec=90s`,
+/// `MemoryMax=123456`) — used on the hog's scope for the duration/size
+/// backstops (see the module doc); empty for the probes/PSI sampler.
 pub fn systemd_run_argv(
     unit_name: &str,
     slice: Option<&str>,
     scope: bool,
+    properties: &[String],
     inner_argv: &[String],
 ) -> Vec<String> {
     let mut argv = vec!["--user".to_string(), "--collect".to_string()];
@@ -233,6 +361,9 @@ pub fn systemd_run_argv(
     argv.push(format!("--unit={unit_name}"));
     if let Some(s) = slice {
         argv.push(format!("--slice={s}"));
+    }
+    for p in properties {
+        argv.push(format!("--property={p}"));
     }
     argv.push("--".to_string());
     argv.extend(inner_argv.iter().cloned());
@@ -250,6 +381,12 @@ pub struct HostInfo {
     pub kernel: String,
     pub rlm_installed: bool,
     pub guard_enabled: bool,
+    pub hostname: String,
+    /// `SwapTotal` from `/proc/meminfo`, kB. Swap configuration materially
+    /// changes how a given `--hog-fraction` translates into real memory
+    /// pressure, so it's recorded rather than left to be guessed from
+    /// context that may no longer be available later.
+    pub swap_total_kb: u64,
 }
 
 /// Parameters of this measurement run.
@@ -264,6 +401,40 @@ pub struct RunInfo {
     /// hardcoding a value that may not match the machine that produced this
     /// particular report.
     pub noise_floor_us: i64,
+    /// `MemAvailable` (kB) at run start — `hog_fraction` is a fraction of
+    /// *this*, not of `MemTotal`, so without it a past run's absolute hog
+    /// size is unrecoverable and two runs with the same fraction are not
+    /// comparable.
+    pub mem_available_kb: u64,
+    pub interval_ms: u64,
+    pub working_set_mb: u64,
+    /// Unix seconds at run start.
+    pub timestamp_unix_s: u64,
+}
+
+/// What actually happened with the hog this run — separate from
+/// `RunInfo` (the requested parameters) because this is what was
+/// *observed*, including whether the hog ever actually held the memory it
+/// was asked to.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct HogInfo {
+    /// Exact MB `hog.sh` computed it would allocate (see `hog_estimated_mb`).
+    pub estimated_mb: u64,
+    /// Which backend actually ran: "stress-ng" or "dd" — materially
+    /// different pressure (see `hog_backend`).
+    pub backend: String,
+    /// The `--max-seconds`/`RuntimeMaxSec=` cap applied to this run's hog.
+    pub max_seconds: u64,
+    /// The `MemoryMax=` applied to the hog's transient scope, in bytes.
+    pub memory_max_bytes: u64,
+    /// The transient slice the hog's scope was placed under.
+    pub slice: String,
+    /// Whether the hog was confirmed `active` shortly after starting AND
+    /// still `active` right before the hold period ended — i.e. it
+    /// actually held memory for (approximately) the intended duration,
+    /// rather than failing silently (e.g. ENOSPC on `/dev/shm`) and
+    /// leaving the rest of the run measuring an unloaded machine.
+    pub verified_running: bool,
 }
 
 /// One probe placement's collected output.
@@ -288,8 +459,15 @@ pub struct Report {
     pub schema: u32,
     pub host: HostInfo,
     pub run: RunInfo,
+    pub hog: HogInfo,
     pub probes: Vec<ProbeReport>,
     pub psi: PsiReport,
+    /// Loud, structured warnings about anything that could make this
+    /// report's numbers unreliable (a probe unit that didn't go inactive
+    /// before its deadline, a hog that failed to start or died early,
+    /// etc.) — surfaced here so a downstream consumer doesn't have to
+    /// scrape stderr to find out.
+    pub warnings: Vec<String>,
 }
 
 /// Parse one probe's JSON-lines output (header line, then one `Tick` per
@@ -376,15 +554,19 @@ pub fn parse_psi_jsonl(jsonl: &str) -> Result<PsiReport, String> {
 pub fn assemble_report(
     host: HostInfo,
     run: RunInfo,
+    hog: HogInfo,
     probes: Vec<ProbeReport>,
     psi: PsiReport,
+    warnings: Vec<String>,
 ) -> Report {
     Report {
-        schema: 1,
+        schema: 2,
         host,
         run,
+        hog,
         probes,
         psi,
+        warnings,
     }
 }
 
@@ -483,6 +665,64 @@ mod tests {
         assert_eq!(preflight_check(&input), Ok(()));
     }
 
+    // -- C2 regression: the three scenarios required by the review's
+    // evidence request, using this machine's own /proc/meminfo profile,
+    // a much larger box, and a modest run. --
+
+    #[test]
+    fn preflight_gates_this_machines_profile_at_full_hog_fraction() {
+        // This dev machine: MemTotal ~14.8 GiB, MemAvailable ~6.0 GiB. The
+        // original absolute-threshold bug never gated here (a fraction of
+        // MemAvailable can never itself exceed 12 GiB when MemAvailable is
+        // only ~6 GiB), even though --hog-fraction 1.0 takes 100% of what's
+        // currently free. The fixed, relative gate must fire.
+        let input = PreflightInput {
+            psi_memory_exists: true,
+            mem_total_kb: 15_522_732,
+            mem_available_kb: 6_244_240,
+            hog_fraction: 1.0,
+            i_know: false,
+        };
+        assert!(matches!(
+            preflight_check(&input),
+            Err(PreflightError::NeedsIKnow { .. })
+        ));
+    }
+
+    #[test]
+    fn preflight_gates_a_64gb_box_at_95_percent_fraction() {
+        // A large box with plenty of absolute headroom left afterward
+        // (2.5 GiB) -- low_headroom alone would not trip -- but the
+        // fraction itself (0.95) is high enough that high_fraction must.
+        let mem_total_kb = 64 * 1024 * 1024;
+        let mem_available_kb = 50 * 1024 * 1024;
+        let input = PreflightInput {
+            psi_memory_exists: true,
+            mem_total_kb,
+            mem_available_kb,
+            hog_fraction: 0.95,
+            i_know: false,
+        };
+        assert!(matches!(
+            preflight_check(&input),
+            Err(PreflightError::NeedsIKnow { .. })
+        ));
+    }
+
+    #[test]
+    fn preflight_allows_a_modest_run_on_a_large_ram_machine() {
+        // Large-RAM machine, low fraction, plenty of headroom left over:
+        // neither high_fraction nor low_headroom trips.
+        let input = PreflightInput {
+            psi_memory_exists: true,
+            mem_total_kb: 15_522_732,
+            mem_available_kb: 6_244_240,
+            hog_fraction: 0.05,
+            i_know: false,
+        };
+        assert_eq!(preflight_check(&input), Ok(()));
+    }
+
     // -- parse_meminfo --
 
     #[test]
@@ -573,7 +813,7 @@ mod tests {
     #[test]
     fn systemd_run_argv_scope_for_hog() {
         let inner = vec!["bash".to_string(), "hog.sh".to_string()];
-        let argv = systemd_run_argv("rlm-harness-hog", None, true, &inner);
+        let argv = systemd_run_argv("rlm-harness-hog", None, true, &[], &inner);
         assert!(argv.contains(&"--scope".to_string()));
         assert!(argv.contains(&"--collect".to_string()));
         assert!(argv.contains(&"--unit=rlm-harness-hog".to_string()));
@@ -583,7 +823,13 @@ mod tests {
     #[test]
     fn systemd_run_argv_service_with_slice_for_probe() {
         let inner = vec!["/bin/rlm-probe".to_string(), "--mode".to_string()];
-        let argv = systemd_run_argv("rlm-harness-probe", Some("session.slice"), false, &inner);
+        let argv = systemd_run_argv(
+            "rlm-harness-probe",
+            Some("session.slice"),
+            false,
+            &[],
+            &inner,
+        );
         assert!(!argv.contains(&"--scope".to_string()));
         assert!(argv.contains(&"--slice=session.slice".to_string()));
         assert!(argv.contains(&"--unit=rlm-harness-probe".to_string()));
@@ -592,8 +838,88 @@ mod tests {
     #[test]
     fn systemd_run_argv_no_slice_when_none() {
         let inner = vec!["/bin/rlm-probe".to_string(), "--psi".to_string()];
-        let argv = systemd_run_argv("rlm-harness-psi", None, false, &inner);
+        let argv = systemd_run_argv("rlm-harness-psi", None, false, &[], &inner);
         assert!(!argv.iter().any(|a| a.starts_with("--slice=")));
+    }
+
+    #[test]
+    fn systemd_run_argv_includes_properties() {
+        let inner = vec!["bash".to_string(), "hog.sh".to_string()];
+        let properties = vec![
+            "RuntimeMaxSec=90s".to_string(),
+            "MemoryMax=123456".to_string(),
+        ];
+        let argv = systemd_run_argv(
+            "rlm-harness-hog",
+            Some(HOG_SLICE),
+            true,
+            &properties,
+            &inner,
+        );
+        assert!(argv.contains(&"--property=RuntimeMaxSec=90s".to_string()));
+        assert!(argv.contains(&"--property=MemoryMax=123456".to_string()));
+        assert!(argv.contains(&format!("--slice={HOG_SLICE}")));
+        // properties must appear before the `--` separator, not swallowed
+        // into the wrapped command's own argv.
+        let sep = argv.iter().position(|a| a == "--").expect("separator");
+        assert_eq!(&argv[sep + 1..], ["bash", "hog.sh"]);
+    }
+
+    #[test]
+    fn systemd_run_argv_no_properties_when_empty() {
+        let inner = vec!["/bin/rlm-probe".to_string()];
+        let argv = systemd_run_argv("rlm-harness-probe", None, false, &[], &inner);
+        assert!(!argv.iter().any(|a| a.starts_with("--property=")));
+    }
+
+    // -- hog_estimated_mb / hog_max_seconds / hog_memory_max_bytes / hog_backend --
+
+    #[test]
+    fn hog_estimated_mb_matches_hog_sh_awk_math() {
+        // 0.3 * 6_244_240 kB / 1024 = 1829.4... MB, truncated (matches
+        // awk's printf "%d" on a non-integer, which truncates).
+        assert_eq!(hog_estimated_mb(0.3, 6_244_240), 1829);
+    }
+
+    #[test]
+    fn hog_estimated_mb_has_a_1mb_floor() {
+        assert_eq!(hog_estimated_mb(0.0001, 100), 1);
+    }
+
+    #[test]
+    fn hog_max_seconds_sums_baseline_duration_and_slack() {
+        assert_eq!(hog_max_seconds(10, 60), 10 + 60 + HOG_MAX_SECONDS_SLACK);
+    }
+
+    #[test]
+    fn hog_memory_max_bytes_applies_margin() {
+        let mb = 1000;
+        let expected = (mb as f64 * 1024.0 * 1024.0 * HOG_MEMORY_MAX_MARGIN).round() as u64;
+        assert_eq!(hog_memory_max_bytes(mb), expected);
+        assert!(
+            hog_memory_max_bytes(mb) > mb * 1024 * 1024,
+            "must be strictly larger than the raw size"
+        );
+    }
+
+    #[test]
+    fn hog_backend_prefers_stress_ng_when_available() {
+        assert_eq!(hog_backend(true), "stress-ng");
+        assert_eq!(hog_backend(false), "dd");
+    }
+
+    // -- parse_swap_total_kb --
+
+    #[test]
+    fn parse_swap_total_kb_extracts_value() {
+        let content = "MemTotal:       15522732 kB\nSwapTotal:       8388604 kB\n";
+        assert_eq!(parse_swap_total_kb(content), Some(8_388_604));
+    }
+
+    #[test]
+    fn parse_swap_total_kb_missing_is_none() {
+        let content = "MemTotal:       15522732 kB\n";
+        assert_eq!(parse_swap_total_kb(content), None);
     }
 
     // -- parse_probe_jsonl / parse_psi_jsonl / assemble_report --
@@ -671,25 +997,39 @@ mod tests {
     }
 
     #[test]
-    fn assemble_report_sets_schema_one() {
+    fn assemble_report_sets_schema_two() {
         let host = HostInfo {
             mem_total_kb: 1,
             kernel: "6.8.0".to_string(),
             rlm_installed: false,
             guard_enabled: false,
+            hostname: "test-host".to_string(),
+            swap_total_kb: 0,
         };
         let run = RunInfo {
             duration_s: 60,
             baseline_s: 10,
             hog_fraction: 0.5,
             noise_floor_us: 40,
+            mem_available_kb: 2,
+            interval_ms: 50,
+            working_set_mb: 2,
+            timestamp_unix_s: 0,
+        };
+        let hog = HogInfo {
+            estimated_mb: 1,
+            backend: "dd".to_string(),
+            max_seconds: 100,
+            memory_max_bytes: 1024 * 1024,
+            slice: HOG_SLICE.to_string(),
+            verified_running: true,
         };
         let psi = PsiReport {
             samples: vec![],
             stall_some_us: 0,
             stall_full_us: 0,
         };
-        let report = assemble_report(host, run, vec![], psi);
-        assert_eq!(report.schema, 1);
+        let report = assemble_report(host, run, hog, vec![], psi, vec![]);
+        assert_eq!(report.schema, 2);
     }
 }

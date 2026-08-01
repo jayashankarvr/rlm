@@ -57,7 +57,11 @@ fn harness_run_produces_report() {
     let report_text = std::fs::read_to_string(&report_path).expect("read report.json");
     let report: Value = serde_json::from_str(&report_text).expect("parse report.json");
 
-    assert_eq!(report["schema"], 1);
+    assert_eq!(report["schema"], 2);
+    assert_eq!(
+        report["hog"]["verified_running"], true,
+        "hog should be confirmed active from start to teardown on a normal run"
+    );
 
     let probes = report["probes"].as_array().expect("probes array");
     assert_eq!(probes.len(), 3, "expected 3 probes, got {probes:?}");
