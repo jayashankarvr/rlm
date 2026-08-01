@@ -113,10 +113,16 @@ impl Sampler {
                 continue;
             }
 
+            // TODO(task 6): resolve each process to its cgroup (resolve::candidate_target
+            // + finalize) and populate `resolution`. Until that's wired up, everything
+            // is reported as unresolved (`None`), so the policy engine — which now
+            // requires a resolution to select a victim — will never select any process
+            // as an escalation target. Fails closed, not open.
             out.push(ProcInfo {
                 pid,
                 name: pname,
                 rss_kb,
+                resolution: None,
             });
         }
 

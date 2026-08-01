@@ -1,8 +1,21 @@
-//! Executes [`Action`]s against real cgroups via [`CgroupManager`]. Every action
-//! is best-effort and logged; a failure must never panic or otherwise crash the
-//! daemon loop. `apply` may return `Err` so the caller can log it, but a missing
+//! Executes [`Action`]s against real cgroups. Every action is best-effort and
+//! logged; a failure must never panic or otherwise crash the daemon loop.
+//! `apply` may return `Err` so the caller can log it, but a missing
 //! `notify-send` (or any other notification failure) is never treated as an error.
-
+//!
+//! STOPGAP (Task 5): actions are now keyed by [`Resolution`](super::resolve::Resolution)
+//! — the *resolved* cgroup (a systemd scope/service, or an existing rlm rule
+//! cgroup) — rather than a pid moved into an ephemeral `guard-<pid>` cgroup.
+//! This impl acts directly on that path via the raw [`cgfs`](super::cgfs)
+//! primitives (`write_freeze`/`write_high`/`anon_swap_bytes`), which is the
+//! most direct mapping available and keeps the workspace compiling, but it is
+//! a minimal bridge, not the final design: it does not yet prefer the
+//! systemd-unit path (`super::systemd`) with raw-cgroup fallback, and
+//! `sweep_leftovers`/`undo_all` below still enumerate the old `guard-<pid>`
+//! model (a no-op now that nothing creates those cgroups anymore) instead of
+//! replaying the write-ahead journal (`super::journal`). Wiring the effector
+//! up to systemd + journal-based crash recovery is follow-up work.
+use super::cgfs;
 use super::types::Action;
 use crate::CgroupManager;
 use common::Result;
@@ -34,29 +47,22 @@ impl<'a> Effector<'a> {
     /// log it (a [`Action::Notify`] always returns `Ok`).
     pub fn apply(&self, action: &Action) -> Result<()> {
         match action {
-            Action::Freeze { pid, name } => {
-                tracing::info!(pid, name = %name, "freezing process");
-                self.manager.freeze_pid(*pid)
+            Action::Freeze { res, name } => {
+                tracing::info!(cgroup = %res.cgroup, name = %name, "freezing cgroup");
+                cgfs::write_freeze(&res.cgroup, true)
             }
-            Action::Thaw { pid } => {
-                tracing::info!(pid, "thawing process");
-                self.manager.thaw_pid(*pid)
+            Action::Thaw { res } => {
+                tracing::info!(cgroup = %res.cgroup, "thawing cgroup");
+                cgfs::write_freeze(&res.cgroup, false)
             }
-            Action::Cap { pid, name } => {
-                let high_bytes = cap_target_bytes(*pid);
-                tracing::info!(pid, name = %name, high_bytes, "soft-capping process");
-                self.manager.soft_cap_pid(*pid, high_bytes)
+            Action::Cap { res, name } => {
+                let high_bytes = cap_target_bytes(&res.cgroup);
+                tracing::info!(cgroup = %res.cgroup, name = %name, high_bytes, "soft-capping cgroup");
+                cgfs::write_high(&res.cgroup, &high_bytes.to_string())
             }
-            Action::LiftCap { pid } => {
-                tracing::info!(pid, "lifting cap and tearing down guard cgroup");
-                // LiftCap doubles as full teardown: lift the cap, then clean up
-                // the `guard-<pid>` cgroup. A cleanup failure is non-fatal (the
-                // startup sweep will mop up any leftover), so it's only logged.
-                let res = self.manager.lift_cap_pid(*pid);
-                if let Err(e) = self.manager.cleanup_guard(*pid) {
-                    tracing::warn!(pid, error = %e, "guard cleanup after lift_cap failed");
-                }
-                res
+            Action::LiftCap { res } => {
+                tracing::info!(cgroup = %res.cgroup, "lifting cap");
+                cgfs::write_high(&res.cgroup, "max")
             }
             Action::Notify { message } => {
                 notify(message);
@@ -100,34 +106,23 @@ impl<'a> Effector<'a> {
     }
 }
 
-/// Read the current RSS of `pid` from `/proc/<pid>/status` and derive the
-/// `memory.high` soft-cap target. On any read failure we fall back to the
-/// minimum cap so the action still applies pressure.
-fn cap_target_bytes(pid: u32) -> u64 {
-    match std::fs::read_to_string(format!("/proc/{pid}/status")) {
-        Ok(status) => cap_target_bytes_from_status(&status),
-        Err(e) => {
-            tracing::warn!(pid, error = %e, "could not read /proc/<pid>/status; using min cap");
+/// Read the current anon+swap usage of `cgroup` and derive the `memory.high`
+/// soft-cap target. On any read failure we fall back to the minimum cap so the
+/// action still applies pressure. `anon+swap` is the cgroup-level equivalent
+/// of a single process's RSS+swap used by the old pid-based cap.
+fn cap_target_bytes(cgroup: &str) -> u64 {
+    match cgfs::anon_swap_bytes(cgroup) {
+        Some(bytes) => cap_target_bytes_from_anon_swap(bytes),
+        None => {
+            tracing::warn!(cgroup, "could not read cgroup memory usage; using min cap");
             MIN_CAP_BYTES
         }
     }
 }
 
-/// Pure helper: parse the `VmRSS` line (value is in kB) from a
-/// `/proc/<pid>/status` body and return 90% of it in bytes, clamped to a
-/// [`MIN_CAP_BYTES`] floor. If `VmRSS` is absent or unparseable, return the floor.
-fn cap_target_bytes_from_status(status: &str) -> u64 {
-    let rss_bytes = status
-        .lines()
-        .find_map(|line| {
-            let rest = line.strip_prefix("VmRSS:")?;
-            // Format: "VmRSS:\t   12345 kB". Take the first numeric token.
-            let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
-            Some(kb * 1024)
-        })
-        .unwrap_or(0);
-
-    let target = rss_bytes / CAP_FRACTION_DEN * CAP_FRACTION_NUM;
+/// Pure helper: 90% of `anon_swap_bytes`, clamped to a [`MIN_CAP_BYTES`] floor.
+fn cap_target_bytes_from_anon_swap(anon_swap_bytes: u64) -> u64 {
+    let target = anon_swap_bytes / CAP_FRACTION_DEN * CAP_FRACTION_NUM;
     target.max(MIN_CAP_BYTES)
 }
 
@@ -154,85 +149,107 @@ fn notify(message: &str) {
 
 #[cfg(test)]
 mod tests {
+    use super::super::resolve::{Coverage, Mechanism, Resolution, Verdict};
     use super::*;
 
     #[test]
-    fn cap_target_is_ninety_percent_of_rss() {
-        // VmRSS 1,000,000 kB = 1,024,000,000 bytes; 90% = 921,600,000.
-        let status = "Name:\tfirefox\nVmHWM:\t  2000000 kB\nVmRSS:\t  1000000 kB\nThreads:\t10\n";
-        let got = cap_target_bytes_from_status(status);
+    fn cap_target_is_ninety_percent_of_anon_swap() {
+        // 1,000,000 kB = 1,024,000,000 bytes; 90% = 921,600,000.
+        let got = cap_target_bytes_from_anon_swap(1_000_000 * 1024);
         assert_eq!(got, 1_000_000 * 1024 / 10 * 9);
         assert!(
             got > MIN_CAP_BYTES,
-            "a 1GB process should cap above the floor"
+            "a 1GB cgroup should cap above the floor"
         );
     }
 
     #[test]
-    fn missing_vmrss_falls_back_to_min() {
-        let status = "Name:\tsomeproc\nState:\tR (running)\nThreads:\t1\n";
-        assert_eq!(cap_target_bytes_from_status(status), MIN_CAP_BYTES);
+    fn tiny_anon_swap_clamps_to_min() {
+        // 1 MB → 90% = ~0.9 MB, below the 64 MiB floor → clamped.
+        assert_eq!(cap_target_bytes_from_anon_swap(1024 * 1024), MIN_CAP_BYTES);
     }
 
     #[test]
-    fn tiny_rss_clamps_to_min() {
-        // 1 MB RSS → 90% = ~0.9 MB, below the 64 MiB floor → clamped.
-        let status = "VmRSS:\t     1024 kB\n";
-        assert_eq!(cap_target_bytes_from_status(status), MIN_CAP_BYTES);
+    fn zero_anon_swap_clamps_to_min() {
+        assert_eq!(cap_target_bytes_from_anon_swap(0), MIN_CAP_BYTES);
     }
 
     #[test]
-    fn unparseable_vmrss_falls_back_to_min() {
-        let status = "VmRSS:\t   notanumber kB\n";
-        assert_eq!(cap_target_bytes_from_status(status), MIN_CAP_BYTES);
-    }
-
-    #[test]
-    fn vmrss_exactly_at_floor_boundary() {
-        // Choose an RSS whose 90% lands just above the floor to exercise max().
-        // floor = 64 MiB = 67,108,864 bytes. Need rss*0.9 just above it.
-        // rss_kb such that (rss_kb*1024)/10*9 > floor → rss_kb ~ 72843.
-        let status = "VmRSS:\t    80000 kB\n";
-        let expected = 80_000u64 * 1024 / 10 * 9;
-        assert_eq!(cap_target_bytes_from_status(status), expected);
+    fn anon_swap_exactly_at_floor_boundary() {
+        // Choose a value whose 90% lands just above the floor to exercise max().
+        // floor = 64 MiB = 67,108,864 bytes. Need val*0.9 just above it.
+        let bytes = 80_000u64 * 1024;
+        let expected = bytes / 10 * 9;
+        assert_eq!(cap_target_bytes_from_anon_swap(bytes), expected);
         assert!(expected > MIN_CAP_BYTES);
     }
 
-    /// Integration smoke test: freeze a real `sleep`, confirm it's paused via the
-    /// `guard-<pid>` `cgroup.freeze` state, then thaw and tear down. Only works
-    /// under cgroup v2 delegation, so it's `#[ignore]`d by default.
+    #[test]
+    fn unreadable_cgroup_falls_back_to_min() {
+        assert_eq!(cap_target_bytes("/no/such/cgroup/at/all"), MIN_CAP_BYTES);
+    }
+
+    fn test_resolution(cgroup: String) -> Resolution {
+        Resolution {
+            cgroup,
+            unit: None,
+            verdict: Verdict::Freeze,
+            coverage: Coverage::Full,
+            mechanism: Mechanism::Raw,
+        }
+    }
+
+    /// Integration smoke test: freeze a real `sleep` via its (raw, rlm-created)
+    /// cgroup, confirm it's paused via `cgroup.freeze`, then thaw and lift.
+    /// Only works under cgroup v2 delegation, so it's `#[ignore]`d by default.
     #[test]
     #[ignore = "requires cgroup v2 delegation; run manually"]
     fn freeze_thaw_real_process() {
+        use common::Limit;
         use std::process::Command;
 
         let manager = CgroupManager::new().expect("create CgroupManager");
         let effector = Effector::new(&manager);
+
+        let abs_path = manager
+            .prepare_cgroup("test-freeze-thaw", &Limit::default())
+            .expect("create test cgroup");
+        let cgroup = format!(
+            "/{}",
+            abs_path
+                .strip_prefix("/sys/fs/cgroup")
+                .expect("cgroup under /sys/fs/cgroup")
+                .display()
+        );
 
         let mut child = Command::new("sleep")
             .arg("30")
             .spawn()
             .expect("spawn sleep");
         let pid = child.id();
+        manager
+            .add_to_cgroup(&abs_path, pid)
+            .expect("add sleep to test cgroup");
+
+        let res = test_resolution(cgroup.clone());
 
         effector
             .apply(&Action::Freeze {
-                pid,
+                res: res.clone(),
                 name: "sleep".into(),
             })
             .expect("freeze");
 
-        // The freezer reports state via `guard-<pid>/cgroup.freeze` ("1" frozen).
-        let freeze_path = format!("/sys/fs/cgroup/rlm/guard-{pid}/cgroup.freeze");
-        let frozen = std::fs::read_to_string(&freeze_path).unwrap_or_default();
-        assert_eq!(frozen.trim(), "1", "process should be frozen");
+        let frozen = std::fs::read_to_string(abs_path.join("cgroup.freeze")).unwrap_or_default();
+        assert_eq!(frozen.trim(), "1", "cgroup should be frozen");
 
-        effector.apply(&Action::Thaw { pid }).expect("thaw");
         effector
-            .apply(&Action::LiftCap { pid })
-            .expect("lift+cleanup");
+            .apply(&Action::Thaw { res: res.clone() })
+            .expect("thaw");
+        effector.apply(&Action::LiftCap { res }).expect("lift");
 
         let _ = child.kill();
         let _ = child.wait();
+        let _ = manager.cleanup_cgroup("test-freeze-thaw");
     }
 }
