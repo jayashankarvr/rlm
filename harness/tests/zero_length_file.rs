@@ -16,7 +16,6 @@ fn rlm_probe_binary() -> PathBuf {
 
 /// Test that --file-mb 0 is rejected cleanly with exit code 1.
 #[test]
-#[ignore]
 fn test_file_mb_zero_rejected() {
     let probe = rlm_probe_binary();
     let temp_dir = TempDir::new().expect("create temp dir");
@@ -73,7 +72,6 @@ fn test_file_mb_zero_rejected() {
 
 /// Test that an empty regular file is rejected cleanly at mmap time.
 #[test]
-#[ignore]
 fn test_empty_file_rejected() {
     let probe = rlm_probe_binary();
     let temp_dir = TempDir::new().expect("create temp dir");
@@ -143,7 +141,6 @@ fn test_empty_file_rejected() {
 
 /// Test that an error during mmap cleanup doesn't leave the scratch file.
 #[test]
-#[ignore]
 fn test_scratch_file_cleanup_on_mmap_error() {
     let probe = rlm_probe_binary();
     let temp_dir = TempDir::new().expect("create temp dir");

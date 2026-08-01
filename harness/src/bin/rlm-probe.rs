@@ -301,14 +301,27 @@ struct Args {
 fn main() {
     let args = Args::parse();
 
-    if args.interval_ms == 0 {
-        eprintln!("error: --interval-ms must be greater than 0 (busy-spin prevention)");
+    // All fallible work lives in `run`, which returns `Err` instead of
+    // calling `std::process::exit` directly. `std::process::exit` does not
+    // run destructors for live stack values (it's not `panic!`, which
+    // unwinds), so any RAII guard live at the moment of exit — e.g.
+    // `ScratchFileGuard` — would silently skip its cleanup. Returning from
+    // `run` instead lets every guard drop normally before `main` decides
+    // whether to exit non-zero, closing that hazard for this exit path and
+    // any future early-return added inside `run`.
+    if let Err(e) = run(args) {
+        eprintln!("error: {e}");
         std::process::exit(1);
+    }
+}
+
+fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
+    if args.interval_ms == 0 {
+        return Err("--interval-ms must be greater than 0 (busy-spin prevention)".into());
     }
 
     if args.file_mb == 0 {
-        eprintln!("error: --file-mb must be greater than 0 (zero-length mmap prevention)");
-        std::process::exit(1);
+        return Err("--file-mb must be greater than 0 (zero-length mmap prevention)".into());
     }
 
     let interval = Duration::from_millis(args.interval_ms);
@@ -341,8 +354,8 @@ fn main() {
     let mlock_ok = match args.mode {
         ProbeMode::Locked => {
             if let Err(e) = try_mlockall() {
-                eprintln!(
-                    "error: mlockall(MCL_CURRENT | MCL_FUTURE) failed: {e}\n\
+                return Err(format!(
+                    "mlockall(MCL_CURRENT | MCL_FUTURE) failed: {e}\n\
                      The locked-mode control probe requires every page to stay \
                      resident so it can never major-fault. MCL_CURRENT locks the \
                      process's *entire* current mapping set — binary text, \
@@ -352,8 +365,8 @@ fn main() {
                      user. Check it with `ulimit -l` and raise it (e.g. `ulimit \
                      -l unlimited`, or LimitMEMLOCK=infinity under systemd), \
                      then retry."
-                );
-                std::process::exit(1);
+                )
+                .into());
             }
             true
         }
@@ -387,11 +400,11 @@ fn main() {
                         Some(p)
                     }
                     Err(e) => {
-                        eprintln!(
-                            "error: failed to create scratch file for --mode touch's \
+                        return Err(format!(
+                            "failed to create scratch file for --mode touch's \
                              file-backed mapping: {e}"
-                        );
-                        std::process::exit(1);
+                        )
+                        .into());
                     }
                 }
             }
@@ -423,9 +436,12 @@ fn main() {
                 Some(mapping)
             }
             Err(e) => {
-                eprintln!("error: failed to mmap --file {path}: {e}");
-                // _scratch_guard's Drop will clean up the file automatically
-                std::process::exit(1);
+                // Returning here (instead of `std::process::exit`) lets
+                // `_scratch_guard` drop normally before `main` exits, which
+                // unlinks the scratch file. `std::process::exit` does not run
+                // destructors, so calling it here with `_scratch_guard` still
+                // live would leak the scratch file on disk.
+                return Err(format!("failed to mmap --file {path}: {e}").into());
             }
         },
         None => None,
@@ -574,6 +590,8 @@ fn main() {
         writer.write_all(b"\n").expect("write newline");
     }
     writer.flush().expect("flush output");
+
+    Ok(())
 }
 
 /// `/proc` files report cumulative counters; re-reading a fresh snapshot
