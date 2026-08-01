@@ -38,6 +38,13 @@ HOG_UNIT="rlm-gate-hog"
 LOG="${LOG:-/tmp/rlm-phase0-gate-$$.log}"
 FAILURES=0
 
+# Hard ceiling on how long the hog may live, enforced in THREE independent
+# places (see below). Learned from the Phase 0.5 harness review, where a
+# SIGKILLed runner left an unbounded hog reparented to the systemd manager,
+# holding memory until a human intervened. A bound that lives only in the
+# supervisor dies with the supervisor; this one has to survive it.
+HOG_MAX_SECONDS="${HOG_MAX_SECONDS:-180}"
+
 log()  { printf '%s %s\n' "$(date +%H:%M:%S)" "$*" | tee -a "$LOG"; }
 pass() { log "PASS  $*"; }
 fail() { log "FAIL  $*"; FAILURES=$((FAILURES + 1)); }
@@ -79,22 +86,68 @@ if systemctl --user list-units --all "${HOG_UNIT}.scope" 2>/dev/null | grep -q "
 fi
 
 MEM_AVAIL_KB=$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)
+MEM_TOTAL_KB=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)
 HOG_MB=$(python3 -c "print(int($MEM_AVAIL_KB / 1024 * $HOG_FRACTION))")
-log "MemAvailable $((MEM_AVAIL_KB / 1024))MB; hog will allocate ${HOG_MB}MB (fraction $HOG_FRACTION)"
+HEADROOM_MB=$(( MEM_AVAIL_KB / 1024 - HOG_MB ))
 [[ "$HOG_MB" -gt 200 ]] || { echo "computed hog size ${HOG_MB}MB is too small to induce pressure; free some memory first" >&2; exit 2; }
+
+# Loud, unconditional statement of intent BEFORE doing anything. The harness
+# review found a gate whose warning printed nothing on the machines it was
+# meant to protect; a warning that only fires in the safe case is not a gate.
+cat <<EOF | tee -a "$LOG"
+
+  !! This will deliberately put this machine under memory pressure. !!
+
+  MemTotal      : $((MEM_TOTAL_KB / 1024)) MB
+  MemAvailable  : $((MEM_AVAIL_KB / 1024)) MB
+  Hog will take : ${HOG_MB} MB (fraction ${HOG_FRACTION})
+  Headroom left : ${HEADROOM_MB} MB
+  Hog lifetime  : hard-capped at ${HOG_MAX_SECONDS}s (three independent bounds)
+
+  Expect the desktop to stutter. Save your work first. If anything goes
+  wrong, the hog dies on its own within ${HOG_MAX_SECONDS}s even if this
+  script is killed.
+
+EOF
+
+# Require explicit consent when the run would leave little headroom. The
+# threshold is RELATIVE to this machine, not an absolute GB figure — the
+# harness review found an absolute second threshold that never fired on the
+# 16GB desktops most likely to be hurt.
+if [[ "$HEADROOM_MB" -lt 1024 && "${I_KNOW:-0}" != "1" ]]; then
+  echo "REFUSING: this would leave only ${HEADROOM_MB}MB headroom." >&2
+  echo "Lower HOG_FRACTION (currently $HOG_FRACTION), free memory, or re-run with I_KNOW=1." >&2
+  exit 2
+fi
+if [[ -t 0 && "${I_KNOW:-0}" != "1" ]]; then
+  read -r -p "Proceed? [y/N] " reply
+  [[ "$reply" == "y" || "$reply" == "Y" ]] || { echo "aborted by user"; exit 2; }
+fi
 
 # ------------------------------------------------- criterion 1: in place ----
 log "--- criterion 1: freeze acts in place ---"
+# Three independent bounds on the hog, because the one that matters is the one
+# that survives this script being killed:
+#   1. the payload's own deadline (below) — cannot be orphaned, it IS the hog
+#   2. RuntimeMaxSec on the scope — catches a payload wedged in an
+#      uninterruptible state; systemd SIGKILLs the whole cgroup at the deadline
+#   3. MemoryMax on the scope — bounds magnitude, so an arithmetic slip in
+#      HOG_MB cannot outrun the headroom check above
 systemd-run --user --scope --unit="$HOG_UNIT" --quiet \
+  --property="RuntimeMaxSec=${HOG_MAX_SECONDS}" \
+  --property="MemoryMax=$((HOG_MB + 256))M" \
   python3 -c "
 import sys, time
 sys.argv[0] = 'rlm-gate-hog-payload'
+deadline = time.monotonic() + $HOG_MAX_SECONDS
 n = $HOG_MB
 chunks = []
 for _ in range(n // 64):
+    if time.monotonic() > deadline: break
     chunks.append(bytearray(64 * 1024 * 1024))   # touched, so it is resident
     time.sleep(0.05)
-time.sleep(120)
+while time.monotonic() < deadline:               # self-limiting: never 'sleep infinity'
+    time.sleep(1)
 " &
 HOG_SHELL_PID=$!
 sleep 3
