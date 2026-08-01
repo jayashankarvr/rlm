@@ -77,14 +77,56 @@ impl Drop for FileMapping {
     }
 }
 
+/// RAII guard for a scratch file: unlinks the file on drop, ensuring cleanup
+/// even if an error or early return happens before the unlink.
+struct ScratchFileGuard {
+    path: Option<PathBuf>,
+}
+
+impl ScratchFileGuard {
+    fn new(path: PathBuf) -> Self {
+        ScratchFileGuard { path: Some(path) }
+    }
+
+    /// Get a reference to the path (if not yet released).
+    fn path(&self) -> Option<&PathBuf> {
+        self.path.as_ref()
+    }
+
+    /// Consume the guard without unlinking (the file is kept); prevents
+    /// Drop from attempting to unlink again.
+    fn release(mut self) {
+        self.path = None;
+    }
+}
+
+impl Drop for ScratchFileGuard {
+    fn drop(&mut self) {
+        if let Some(ref path) = self.path {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
 /// Map up to `max_mb` MiB of `path` read-only, `MAP_PRIVATE`. The file
 /// descriptor does not need to outlive the call: once `mmap` succeeds, the
 /// mapping is independent of the fd.
 fn map_file(path: &str, max_mb: u64) -> std::io::Result<FileMapping> {
     let file = File::open(path)?;
     let file_len = file.metadata()?.len();
+
+    // Reject zero-length backing files: mmap with len=0 is an error, but
+    // mmap with len>0 on a zero-length file succeeds and produces an
+    // unreadable mapping. Dereferencing it causes SIGBUS. Bail out cleanly.
+    if file_len == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("backing file {} is zero-length (cannot mmap)", path),
+        ));
+    }
+
     let max_len = max_mb.saturating_mul(1024 * 1024);
-    let len = std::cmp::min(file_len, max_len).max(1) as usize;
+    let len = std::cmp::min(file_len, max_len) as usize;
 
     let ptr = unsafe {
         libc::mmap(
@@ -264,6 +306,11 @@ fn main() {
         std::process::exit(1);
     }
 
+    if args.file_mb == 0 {
+        eprintln!("error: --file-mb must be greater than 0 (zero-length mmap prevention)");
+        std::process::exit(1);
+    }
+
     let interval = Duration::from_millis(args.interval_ms);
     let capacity = (args.duration_s * 1000 / args.interval_ms) as usize + 16;
 
@@ -318,9 +365,10 @@ fn main() {
     // `/proc/self/exe`: re-reading the probe's own executing code would
     // measure pages the kernel's LRU is least likely to ever reclaim,
     // understating file-backed reclaim sensitivity instead of measuring
-    // it. `scratch_path` is `Some` only when we own the file and must
-    // delete it ourselves; a user-supplied `--file` is never deleted.
-    let mut scratch_path: Option<PathBuf> = None;
+    // it. `_scratch_guard` holds the path and unlinks it on drop (RAII),
+    // so cleanup is guaranteed even if an error occurs; a user-supplied
+    // `--file` is never deleted.
+    let mut _scratch_guard: Option<ScratchFileGuard> = None;
     let file_path: Option<String> = match args.mode {
         ProbeMode::Touch => match &args.file {
             Some(p) => Some(p.clone()),
@@ -335,7 +383,7 @@ fn main() {
                             .to_str()
                             .expect("scratch path is valid UTF-8")
                             .to_string();
-                        scratch_path = Some(path);
+                        _scratch_guard = Some(ScratchFileGuard::new(path));
                         Some(p)
                     }
                     Err(e) => {
@@ -363,16 +411,20 @@ fn main() {
                 // paths") to unlink our own scratch file's directory entry
                 // right away rather than waiting for process exit — the
                 // kernel keeps the inode alive as long as it's mapped.
-                if let Some(p) = &scratch_path {
-                    let _ = std::fs::remove_file(p);
+                if let Some(guard) = _scratch_guard.take() {
+                    // Manually unlink the file, then release the guard to
+                    // prevent Drop from unlinking it again. The inode
+                    // stays alive as long as it's mapped.
+                    if let Some(path) = guard.path() {
+                        let _ = std::fs::remove_file(path);
+                    }
+                    guard.release();
                 }
                 Some(mapping)
             }
             Err(e) => {
-                if let Some(p) = &scratch_path {
-                    let _ = std::fs::remove_file(p);
-                }
                 eprintln!("error: failed to mmap --file {path}: {e}");
+                // _scratch_guard's Drop will clean up the file automatically
                 std::process::exit(1);
             }
         },

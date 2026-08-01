@@ -121,6 +121,8 @@ pub fn parse_majflt(stat: &str) -> Option<u64> {
 
 Rationale (from the spec — state it in the module doc): an mlocked probe can never major-fault, so it cannot measure residency; an unlocked probe's drift conflates scheduling with faulting. One process cannot measure both, so the harness runs a **pair** and takes the difference.
 
+**Measured noise floor** (at default 5s/50ms interval on idle machine, zero memory pressure): over 6 fresh paired trials, the (touch − locked) mean-drift gap exhibited mean ≈ +3.6µs, stdev ≈ 38µs, with individual trial gaps ranging −53 to +43µs. **Note:** these figures are machine-specific; they should be recalibrated for each test environment. Task 5 will use these to mark sub-floor deltas as `suspect: true` (inconclusive).
+
 - [ ] **Step 1: Implement `--mode locked`:**
   - Allocate a small working set (`--working-set-mb`, default 2), write one byte per 4096-byte page to pre-fault it.
   - `mlockall(MCL_CURRENT | MCL_FUTURE)` via `libc`; on `EPERM`/`ENOMEM` (RLIMIT_MEMLOCK too low), print a clear diagnostic naming `ulimit -l` and **exit non-zero** — a silently-unlocked "locked" probe would corrupt the whole comparison.
@@ -248,16 +250,33 @@ pub struct ProbeSummary {
     pub total_wait_ms: u64,         // schedstat delta over the run
     pub total_majflt: u64,          // majflt delta over the run
 }
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct Decomposition {
+    pub p50_memory_drift_us: i64,
+    pub p95_memory_drift_us: i64,
+    pub p99_memory_drift_us: i64,
+    pub max_memory_drift_us: i64,
+    pub suspect: bool,  // true if locked drifted worse than touch (invalid run)
+}
+
 /// Pure. Percentiles by nearest-rank on a sorted copy; empty input -> all zeros.
 pub fn summarize(label: &str, ticks: &[Tick]) -> ProbeSummary;
-/// Pure. The decomposition the spec asks for: (unlocked - locked) drift isolates
-/// the memory-induced component; schedstat isolates scheduling.
-pub fn decompose(locked: &ProbeSummary, touch: &ProbeSummary) -> Decomposition;
+
+/// Pure. The decomposition the spec asks for: (touch − locked) drift isolates
+/// the memory-induced component. `noise_floor_us` (default ~40µs, from Task 2's
+/// measured stdev) marks any result whose magnitude falls below it as
+/// `suspect: true` / inconclusive — preventing false-positive claims of
+/// memory-induced stall on sub-noise-floor deltas. Negative results also
+/// clamp to 0 with `suspect: true`, since a locked probe stalling more than
+/// an unlocked one means the run is invalid. `noise_floor_us` should be
+/// recalibrated per-machine (see Task 2 for the measurement procedure).
+pub fn decompose(locked: &ProbeSummary, touch: &ProbeSummary, noise_floor_us: i64) -> Decomposition;
 ```
 
-- [ ] **Step 1: Write failing tests** for `summarize` (known tick vector → known p50/p95/max, correct `stalls_over_200ms` boundary at exactly 200_000 µs — assert the boundary is exclusive, i.e. exactly 200ms does NOT count) and for `decompose` (locked p95 subtracted from touch p95; negative results clamp to 0 with a `suspect: true` flag, since a locked probe stalling more than an unlocked one means the run is invalid).
+- [ ] **Step 1: Write failing tests** for `summarize` (known tick vector → known p50/p95/max, correct `stalls_over_200ms` boundary at exactly 200_000 µs — assert the boundary is exclusive, i.e. exactly 200ms does NOT count) and for `decompose` (locked p95 subtracted from touch p95; negative results and sub-floor deltas both set `suspect: true`; add a test case for a delta below the noise floor, e.g. 5µs with 40µs floor, confirming `suspect: true`).
 - [ ] **Step 2: Run — fail. Implement — pass.**
-- [ ] **Step 3: `summarize` subcommand** prints a table for one report; `compare A B` prints per-probe deltas and a verdict line (`stall_some_us` delta, p95 drift delta, `stalls_over_200ms` delta).
+- [ ] **Step 3: `summarize` subcommand** prints a table for one report; `compare A B` prints per-probe deltas and a verdict line (`stall_some_us` delta, p95 drift delta, `stalls_over_200ms` delta), passing default noise_floor_us=40_000 to `decompose`.
 - [ ] **Step 4: fmt+clippy, commit** `feat(harness): percentile summary, locked/touch decomposition, run comparison`
 
 ---
