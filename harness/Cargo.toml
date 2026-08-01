@@ -1,0 +1,17 @@
+[package]
+name = "harness"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "rlm stall-measurement harness - drift/schedstat/majflt probe and report tooling"
+publish = false
+
+[[bin]]
+name = "rlm-probe"
+path = "src/bin/rlm-probe.rs"
+
+[dependencies]
+serde.workspace = true
+serde_json = "1"
+clap.workspace = true
