@@ -22,27 +22,38 @@ pub struct Sampler {
     protect: HashSet<String>,
     /// `CgroupManager::base_path()` minus the leading `/sys/fs/cgroup`, e.g.
     /// "/user.slice/user-1000.slice/user@1000.service/rlm". Used to resolve
-    /// raw (non-systemd-unit) rlm cgroups as targets.
-    rlm_base: String,
+    /// raw (non-systemd-unit) rlm cgroups as targets. `None` means the strip
+    /// failed (see [`strip_cgroup_root`]) — resolution assembly is disabled
+    /// entirely rather than risk a bogus permissive match (see [`Sampler::resolve`]).
+    rlm_base: Option<String>,
 }
 
 /// Strip the `/sys/fs/cgroup` prefix from a `CgroupManager::base_path()` so
 /// the result matches the convention `resolve::candidate_target` expects
 /// (paths relative to the cgroupfs root). Pure string manipulation.
-pub fn strip_cgroup_root(base_path: &Path) -> String {
+///
+/// Returns `None` if `base_path` isn't valid UTF-8 or doesn't start with
+/// `/sys/fs/cgroup` — that's a broken invariant (base_path always comes from
+/// `CgroupManager`, which is hardcoded to build under `/sys/fs/cgroup`), and
+/// callers must fail closed rather than substitute an empty string: an empty
+/// `rlm_base` makes `candidate_target`'s raw-cgroup prefix check `""` (i.e.
+/// "/"), which matches almost every absolute cgroup path as a bogus Raw
+/// candidate — the dangerous direction for a freeze decision.
+pub fn strip_cgroup_root(base_path: &Path) -> Option<String> {
     base_path
-        .to_str()
-        .and_then(|s| s.strip_prefix("/sys/fs/cgroup"))
-        .unwrap_or_default()
-        .to_string()
+        .to_str()?
+        .strip_prefix("/sys/fs/cgroup")
+        .map(str::to_string)
 }
 
 impl Sampler {
     /// `self_pid` is the guard's own PID (always excluded). `uid` is the user
     /// whose processes are eligible. `rlm_base` is
     /// `CgroupManager::base_path()` with the `/sys/fs/cgroup` prefix
-    /// stripped (see [`strip_cgroup_root`]).
-    pub fn new(cfg: GuardConfig, self_pid: u32, uid: u32, rlm_base: String) -> Self {
+    /// stripped (see [`strip_cgroup_root`]); `None` disables resolution
+    /// assembly entirely (fail closed — every process reports `resolution:
+    /// None`, so the policy engine can never select an escalation victim).
+    pub fn new(cfg: GuardConfig, self_pid: u32, uid: u32, rlm_base: Option<String>) -> Self {
         // Merge the baked-in protect-list with the user's additions once, up
         // front, so the per-process scan is a cheap hash lookup.
         let mut protect: HashSet<String> =
@@ -164,17 +175,24 @@ impl Sampler {
 
     /// Resolve `pid` to its freeze/cap target, if any. `cache` is keyed by
     /// candidate cgroup so callers in the same eligible-cgroup only pay for
-    /// the member scan once.
+    /// the member scan once. Returns `None` outright if `rlm_base` failed to
+    /// compute at startup — see [`strip_cgroup_root`].
     fn resolve(&self, pid: u32, cache: &mut HashMap<String, Resolution>) -> Option<Resolution> {
+        let rlm_base = self.rlm_base.as_deref()?;
         let cgroup_file = fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
         let victim_cgroup = parse_cgroup_path(&cgroup_file)?;
-        let candidate = candidate_target(&victim_cgroup, self.uid, &self.rlm_base)?;
+        let candidate = candidate_target(&victim_cgroup, self.uid, rlm_base)?;
 
         if let Some(cached) = cache.get(&candidate.cgroup) {
             return Some(cached.clone());
         }
 
-        let member_exes: Vec<String> = cgfs::pids_in(&candidate.cgroup)
+        // Recursive: a protected process nested in a child cgroup (shell in
+        // a terminal scope's descendant, nested systemd-run, app-created
+        // sub-cgroup) is still within the freeze/stop blast radius, so it
+        // must be visible to the protect check even though it isn't a
+        // direct member of the candidate cgroup itself.
+        let member_exes: Vec<String> = cgfs::pids_under(&candidate.cgroup)
             .into_iter()
             .filter_map(|p| cgfs::exe_basename(p).or_else(|| comm_of(p)))
             .collect();

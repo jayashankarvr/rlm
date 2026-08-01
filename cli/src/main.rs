@@ -709,6 +709,12 @@ fn current_uid() -> u32 {
 fn guard_status(manager: &CgroupManager) {
     let cfg = Config::load().unwrap_or_default();
     let rlm_base = rlm_core::guard::sampler::strip_cgroup_root(manager.base_path());
+    if rlm_base.is_none() {
+        tracing::error!(
+            "base_path {:?} isn't under /sys/fs/cgroup; escalation target resolution disabled",
+            manager.base_path()
+        );
+    }
     let sampler =
         rlm_core::guard::Sampler::new(cfg.guard, std::process::id(), current_uid(), rlm_base);
 
@@ -761,6 +767,12 @@ fn guard_test(manager: &CgroupManager) {
     // cooldown behavior, and applies nothing.
     let cfg = Config::load().unwrap_or_default();
     let rlm_base = rlm_core::guard::sampler::strip_cgroup_root(manager.base_path());
+    if rlm_base.is_none() {
+        tracing::error!(
+            "base_path {:?} isn't under /sys/fs/cgroup; escalation target resolution disabled",
+            manager.base_path()
+        );
+    }
     let sampler = rlm_core::guard::Sampler::new(
         cfg.guard.clone(),
         std::process::id(),

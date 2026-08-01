@@ -51,6 +51,12 @@ fn run() -> common::Result<()> {
     let systemd = SystemdUser::connect();
     let effector = Effector::new(&manager, &journal, systemd.as_ref());
     let rlm_base = strip_cgroup_root(manager.base_path());
+    if rlm_base.is_none() {
+        tracing::error!(
+            "base_path {:?} isn't under /sys/fs/cgroup; disabling escalation target resolution (protect-matching and guard-status still work, but no freeze/cap victim will ever be selected)",
+            manager.base_path()
+        );
+    }
     let sampler = Sampler::new(gcfg.clone(), self_pid, uid, rlm_base);
     let mut engine = PolicyEngine::new(gcfg.clone());
 
