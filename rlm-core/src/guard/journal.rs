@@ -3,12 +3,25 @@
 //! Records all freeze/cap actions with boot_id, inode, and value guards to safely restore
 //! memory.high on process restart or boot. Uses append-only JSON lines with a boot_id header;
 //! stale entries are discarded on boot mismatch.
+//!
+//! # Crash Recovery
+//! On open(), the journal performs WAL tail recovery: if a crash left a partial non-newline-terminated
+//! line (torn write), the file is truncated at that point and synced before returning.
+//!
+//! # Concurrency
+//! All mutating operations (append, remove, clear) are serialized via an internal Mutex to prevent
+//! read-modify-write conflicts. Safe for concurrent access from multiple threads, but append() will
+//! block if remove()/clear() is in progress and vice versa.
 
 use common::Error;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
+use std::sync::{atomic::AtomicU64, atomic::Ordering, Mutex};
+
+// Global counter for unique temp file names per call (guards against multi-threaded stomping).
+static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Action recorded in the journal: freeze or soft cap.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -38,6 +51,8 @@ pub struct JournalEntry {
 pub struct Journal {
     path: PathBuf,
     boot_id: String,
+    // Serializes all mutating operations to prevent torn writes and temp-file collisions.
+    mutation_lock: Mutex<()>,
 }
 
 impl Journal {
@@ -58,6 +73,7 @@ impl Journal {
         let journal = Journal {
             path: path.clone(),
             boot_id: boot_id.clone(),
+            mutation_lock: Mutex::new(()),
         };
 
         // If file exists, check boot_id header.
@@ -75,7 +91,8 @@ impl Journal {
                             journal.write_header()?;
                             return Ok(journal);
                         }
-                        // Boot ID matches: file is valid.
+                        // Boot ID matches: perform WAL tail recovery and then return.
+                        journal.recover_tail()?;
                         return Ok(journal);
                     }
                 }
@@ -89,6 +106,63 @@ impl Journal {
         }
 
         Ok(journal)
+    }
+
+    /// Perform WAL tail recovery: truncate at the first line that fails to parse or lacks a newline.
+    /// This recovers from torn writes caused by crashes mid-append.
+    fn recover_tail(&self) -> common::Result<()> {
+        let mut file = File::open(&self.path)?;
+        let mut contents = String::new();
+        file.read_to_string(&mut contents)?;
+
+        let mut byte_offset = 0;
+        let mut found_corruption = false;
+
+        for (idx, line) in contents.lines().enumerate() {
+            if idx == 0 {
+                // Header line: just track bytes.
+                byte_offset += line.len() + 1; // +1 for newline
+                continue;
+            }
+
+            // Check if this line is a valid JournalEntry.
+            let is_valid = serde_json::from_str::<JournalEntry>(line).is_ok();
+
+            // Check if line ends with newline in the original file (the lines iterator strips it).
+            // We need to verify the line is actually followed by a newline in the file content.
+            let line_start = byte_offset;
+            let line_with_newline_len = line.len() + 1;
+            byte_offset += line_with_newline_len;
+
+            // If this line didn't parse, or if we've reached EOF and the last line wasn't terminated
+            // (lines() doesn't tell us if the last line had a newline), we need to check.
+            if !is_valid {
+                found_corruption = true;
+                // Truncate before this line.
+                if line_start > 0 {
+                    self.truncate_at(line_start)?;
+                }
+                break;
+            }
+        }
+
+        // Check if the file ends without a newline (torn write scenario).
+        if !found_corruption && !contents.is_empty() && !contents.ends_with('\n') {
+            // Last line is unterminated. Find where it starts.
+            let last_line_start = contents.rfind('\n').map(|i| i + 1).unwrap_or(0);
+            // Truncate before this unterminated line.
+            self.truncate_at(last_line_start)?;
+        }
+
+        Ok(())
+    }
+
+    /// Truncate the journal file at the given byte offset and sync.
+    fn truncate_at(&self, byte_offset: usize) -> common::Result<()> {
+        let file = OpenOptions::new().write(true).open(&self.path)?;
+        file.set_len(byte_offset as u64)?;
+        file.sync_data()?;
+        Ok(())
     }
 
     /// Write the journal header (boot_id line) and fsync.
@@ -108,6 +182,8 @@ impl Journal {
 
     /// Append a journal entry (write-ahead: fsyncs before returning).
     pub fn append(&self, e: &JournalEntry) -> common::Result<()> {
+        let _guard = self.mutation_lock.lock().unwrap();
+
         let mut file = OpenOptions::new().append(true).open(&self.path)?;
 
         let json_line = serde_json::to_string(e)
@@ -148,6 +224,8 @@ impl Journal {
 
     /// Remove all entries matching the given cgroup (atomic rewrite: temp file + rename + fsync).
     pub fn remove(&self, cgroup: &str) -> common::Result<()> {
+        let _guard = self.mutation_lock.lock().unwrap();
+
         let entries = self
             .entries()
             .into_iter()
@@ -160,6 +238,7 @@ impl Journal {
 
     /// Clear all entries, leaving only the header (clean shutdown compaction).
     pub fn clear(&self) -> common::Result<()> {
+        let _guard = self.mutation_lock.lock().unwrap();
         self.write_entries(&[])?;
         Ok(())
     }
@@ -171,8 +250,9 @@ impl Journal {
             .parent()
             .ok_or_else(|| common::Error::Cgroup("Journal path has no parent".to_string()))?;
 
-        // Create temp file in the same directory (atomic rename).
-        let temp_path = parent.join(format!(".journal-tmp-{}", std::process::id()));
+        // Create temp file with unique name: pid + per-call counter (prevents multi-threaded stomping).
+        let counter = TEMP_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let temp_path = parent.join(format!(".journal-tmp-{}-{}", std::process::id(), counter));
 
         let mut file = OpenOptions::new()
             .write(true)
@@ -326,5 +406,36 @@ mod tests {
             should_restore(&f, Some(42), None),
             "freeze entries only need inode"
         );
+    }
+
+    #[test]
+    fn wal_tail_recovery_on_reopen() {
+        // Regression test for torn-write recovery: crash during append leaves partial line,
+        // next open() truncates it, next append() succeeds with synced data.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("j.jsonl");
+
+        // Write a valid entry.
+        let j = Journal::open(p.clone(), "boot-a".into()).unwrap();
+        j.append(&entry("/x/a")).unwrap();
+        drop(j);
+
+        // Simulate crash: append raw unterminated garbage to the file.
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new().append(true).open(&p).unwrap();
+        write!(f, "{{partial").unwrap(); // No newline, incomplete JSON.
+        drop(f);
+
+        // Re-open journal (same boot_id): should truncate the garbage and recover.
+        let j2 = Journal::open(p.clone(), "boot-a".into()).unwrap();
+
+        // Append a new entry: this should succeed and be readable.
+        j2.append(&entry("/x/b")).unwrap();
+
+        // Both entries must be present: old entry + new entry (garbage discarded).
+        let entries = j2.entries();
+        assert_eq!(entries.len(), 2, "both old and new entry must survive");
+        assert_eq!(entries[0].cgroup, "/x/a", "old entry first");
+        assert_eq!(entries[1].cgroup, "/x/b", "new entry second");
     }
 }
