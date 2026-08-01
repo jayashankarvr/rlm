@@ -22,3 +22,9 @@ Task 6: implemented aa08663; review round 1 (opus) — Critical: kernel page-tru
 Task 6: minor (deferred): inode unwrap_or(0) poison value — Cap in that state never lifted (effector.rs:95,145)
 Task 6: minor (deferred): Journal::open failure silently fatal at daemon startup; boot_id "" self-matches (main.rs:47, cgfs.rs:83)
 Task 6: spec errata (mine): carry-forward #2 "byte-identical" unachievable vs page-truncation; "additionally set u64::MAX" ambiguous ordering — plan text was the root cause of both Criticals
+Task 6: fix round 1/5 (3 addressed, 1 NEW open — reconcile_our_high remove-then-append durability gap; commits 9203c34..4ec8aac; re-reviewer ran full ignored suite live, 4/4)
+Task 6: minor (deferred): cap_page_aligns test can go vacuous on slow machine (assert bytes > MIN_CAP_BYTES)
+Task 6: minor (deferred): page-align test is belt-and-braces, not pinpoint (reconcile self-corrects)
+Task 6: minor (deferred): RestoreStep::ThawAndRestoreHigh{to} payload vestigial — collapse to unit variant
+Task 6: minor (deferred): restore_high_if_any judges liveness on newest entry only ([Cap,Freeze] chain edge)
+Task 6: minor (deferred): page_align_down returns 0 for bytes<page — add .max(page) insurance (memory.high=0 would be catastrophic)
