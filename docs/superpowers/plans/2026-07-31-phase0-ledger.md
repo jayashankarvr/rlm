@@ -36,3 +36,5 @@ Task 6: minor (deferred): Journal::replace lacks debug_assert that entries belon
 Task 7: implemented be16f2c (impl-task7 died at rate limit; impl-task7b audited+committed); review round 1 — Critical: non-recursive member scan misses protected exes in descendant cgroups while freeze propagates to subtree (PLAN BRIEF ERRATA — spec's safety-over-coverage governs); Important: strip_cgroup_root unwrap_or_default matches-wrongly on "" rlm_base. Fix dispatched.
 Task 7: minor (deferred): comm_of duplicates Name: parsing from parse_proc_status
 Task 7: spec errata (mine): task-1/7 brief text "every process in the candidate cgroup" should read "in the candidate cgroup's SUBTREE" — freeze is hierarchical
+Task 7: fix round 1/5 (2 addressed, 0 open — cgfs::pids_under recursive scan + Option rlm_base fail-closed; commits be16f2c..47915cc; re-reviewer live-ran nested-cgroup test independently)
+Task 7: complete (commits afd6a76..47915cc, review clean after 1 fix round)

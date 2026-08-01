@@ -682,10 +682,10 @@ fn cgroup_path_parses_v2_line() {
 }
 ```
 
-- [ ] **Step 1: Write `parse_cgroup_path` tests — fail — implement — pass.**
-- [ ] **Step 2: Implement protect-by-exe + resolution assembly.** Update `Sampler::new` callers (`guard/src/main.rs`, `cli` guard test path if it constructs one — grep `Sampler::new`).
-- [ ] **Step 3: `cargo test --workspace` — pass. fmt+clippy.**
-- [ ] **Step 4: Commit** `feat(guard): sampler resolves targets and matches protect-list on exe basename`
+- [x] **Step 1: Write `parse_cgroup_path` tests — fail — implement — pass.**
+- [x] **Step 2: Implement protect-by-exe + resolution assembly.** Update `Sampler::new` callers (`guard/src/main.rs`, `cli` guard test path if it constructs one — grep `Sampler::new`).
+- [x] **Step 3: `cargo test --workspace` — pass. fmt+clippy.**
+- [x] **Step 4: Commit** `feat(guard): sampler resolves targets and matches protect-list on exe basename`
 
 ---
 
