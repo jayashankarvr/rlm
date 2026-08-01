@@ -38,6 +38,7 @@
 
 use clap::Parser;
 use harness::proc_parse::{parse_majflt, parse_schedstat_wait_ns};
+use harness::psi::{parse_psi, PsiSample};
 use harness::{ProbeMode, Tick};
 use std::fs::File;
 use std::io::{BufWriter, Read, Write};
@@ -263,9 +264,11 @@ struct Args {
     label: String,
 
     /// Which half of the probe pair to run: `locked` (scheduling-only
-    /// control) or `touch` (memory-pressure treatment).
+    /// control) or `touch` (memory-pressure treatment). Required unless
+    /// `--psi` is given, since PSI-sampling mode replaces the tick loop
+    /// entirely rather than running alongside it.
     #[arg(long, value_enum)]
-    mode: ProbeMode,
+    mode: Option<ProbeMode>,
 
     /// Size of the anonymous working set, in mebibytes. Pre-faulted before
     /// the loop in both modes; `locked` pins it with `mlockall`, `touch`
@@ -296,6 +299,21 @@ struct Args {
     /// Carried into the header as `slice`.
     #[arg(long, default_value = "")]
     slice_label: String,
+
+    /// Run in PSI-sampling mode instead of the tick loop: samples
+    /// `/proc/pressure/memory` (or `/proc/pressure/io` with `--psi-io`) at
+    /// `--interval-ms` and writes `PsiSample` JSON lines. Mutually
+    /// exclusive with `--mode` — the harness runs a dedicated PSI-sampler
+    /// process alongside the tick-loop probes, rather than mixing the two
+    /// signal shapes into one JSON-lines stream.
+    #[arg(long)]
+    psi: bool,
+
+    /// In `--psi` mode, sample `/proc/pressure/io` instead of the default
+    /// `/proc/pressure/memory`. Ignored (and rejected, see `run`) without
+    /// `--psi`.
+    #[arg(long)]
+    psi_io: bool,
 }
 
 fn main() {
@@ -319,6 +337,18 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     if args.interval_ms == 0 {
         return Err("--interval-ms must be greater than 0 (busy-spin prevention)".into());
     }
+
+    if args.psi_io && !args.psi {
+        return Err("--psi-io requires --psi".into());
+    }
+
+    if args.psi {
+        return run_psi(&args);
+    }
+
+    let mode = args
+        .mode
+        .ok_or("--mode is required unless --psi is given")?;
 
     if args.file_mb == 0 {
         return Err("--file-mb must be greater than 0 (zero-length mmap prevention)".into());
@@ -351,7 +381,7 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     // Mode-specific setup. `locked` must exit non-zero if it cannot
     // actually lock — a silently-unlocked "locked" probe would corrupt the
     // whole comparison by measuring the same thing as the treatment arm.
-    let mlock_ok = match args.mode {
+    let mlock_ok = match mode {
         ProbeMode::Locked => {
             if let Err(e) = try_mlockall() {
                 return Err(format!(
@@ -382,7 +412,7 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     // so cleanup is guaranteed even if an error occurs; a user-supplied
     // `--file` is never deleted.
     let mut _scratch_guard: Option<ScratchFileGuard> = None;
-    let file_path: Option<String> = match args.mode {
+    let file_path: Option<String> = match mode {
         ProbeMode::Touch => match &args.file {
             Some(p) => Some(p.clone()),
             None => {
@@ -567,7 +597,7 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     // header line, never two.
     let header = serde_json::json!({
         "label": args.label,
-        "mode": args.mode,
+        "mode": mode,
         "interval_ms": args.interval_ms,
         "working_set_mb": args.working_set_mb,
         "mlock_ok": mlock_ok,
@@ -587,6 +617,125 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     // Write tick data.
     for tick in &ticks {
         serde_json::to_writer(&mut writer, tick).expect("serialize tick");
+        writer.write_all(b"\n").expect("write newline");
+    }
+    writer.flush().expect("flush output");
+
+    Ok(())
+}
+
+/// PSI-sampling mode (`--psi`): samples `/proc/pressure/memory` (or
+/// `/proc/pressure/io` with `--psi-io`) on the same fixed-schedule loop as
+/// the tick loop, and writes `PsiSample` JSON lines instead of `Tick`
+/// lines. Same no-allocation-in-loop discipline: the sample `Vec` is
+/// pre-sized before the loop, the one `/proc` read reuses a single `String`
+/// buffer (`clear()` + `read_to_string`, seeking back to start rather than
+/// reopening), and no formatting/logging happens until after the loop ends.
+fn run_psi(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
+    let interval = Duration::from_millis(args.interval_ms);
+    let capacity = (args.duration_s * 1000 / args.interval_ms) as usize + 16;
+
+    let mut samples: Vec<PsiSample> = Vec::new();
+    samples.resize(
+        capacity,
+        PsiSample {
+            t_ms: 0,
+            some_avg10: 0.0,
+            full_avg10: 0.0,
+            some_total_us: 0,
+            full_total_us: 0,
+        },
+    );
+
+    let psi_path = if args.psi_io {
+        "/proc/pressure/io"
+    } else {
+        "/proc/pressure/memory"
+    };
+    let mut psi_file = File::open(psi_path).map_err(|e| {
+        format!("failed to open {psi_path}: {e} (does this kernel/cgroup config expose PSI?)")
+    })?;
+    let mut psi_buf = String::with_capacity(256);
+
+    let start = Instant::now();
+    let mut sample_count = 0usize;
+    let mut next_wake = start + interval;
+    let duration = Duration::from_secs(args.duration_s);
+
+    // Parse-failure counter, kept allocation-free inside the loop; on a
+    // failed parse the previous sample's values are carried forward rather
+    // than zero-filled, so a single hiccup can't be mistaken for a counter
+    // reset by `stall_us`.
+    let mut psi_parse_failures: u64 = 0;
+    let mut last = (0.0f64, 0.0f64, 0u64, 0u64);
+
+    while start.elapsed() < duration && sample_count < samples.len() {
+        let now = Instant::now();
+        if next_wake > now {
+            std::thread::sleep(next_wake - now);
+        }
+
+        let actual_elapsed = start.elapsed();
+        if actual_elapsed > duration {
+            break;
+        }
+
+        psi_buf.clear();
+        psi_file
+            .read_to_string(&mut psi_buf)
+            .expect("read PSI pressure file");
+        seek_to_start(&mut psi_file);
+        let (some_avg10, full_avg10, some_total_us, full_total_us) = match parse_psi(&psi_buf) {
+            Some(v) => {
+                last = v;
+                v
+            }
+            None => {
+                psi_parse_failures += 1;
+                last
+            }
+        };
+
+        samples[sample_count] = PsiSample {
+            t_ms: actual_elapsed.as_millis() as u64,
+            some_avg10,
+            full_avg10,
+            some_total_us,
+            full_total_us,
+        };
+        sample_count += 1;
+        next_wake += interval;
+    }
+
+    samples.truncate(sample_count);
+
+    if psi_parse_failures > 0 {
+        eprintln!(
+            "warning: {} parse failures reading {}",
+            psi_parse_failures, psi_path
+        );
+    }
+
+    // All formatting and I/O happens here, after the loop — never inside it.
+    let out_file = File::create(&args.out).expect("create --out file");
+    let mut writer = BufWriter::new(out_file);
+
+    // Exactly one header line (line 1 of --out), same contract as the tick
+    // loop — a `--psi` run never emits a second header, it just carries a
+    // different (smaller) set of fields than the tick-loop header.
+    let header = serde_json::json!({
+        "label": args.label,
+        "mode": "psi",
+        "interval_ms": args.interval_ms,
+        "psi_resource": if args.psi_io { "io" } else { "memory" },
+        "slice": args.slice_label,
+        "psi_parse_failures": psi_parse_failures,
+    });
+    serde_json::to_writer(&mut writer, &header).expect("serialize header");
+    writer.write_all(b"\n").expect("write newline");
+
+    for sample in &samples {
+        serde_json::to_writer(&mut writer, sample).expect("serialize PsiSample");
         writer.write_all(b"\n").expect("write newline");
     }
     writer.flush().expect("flush output");
