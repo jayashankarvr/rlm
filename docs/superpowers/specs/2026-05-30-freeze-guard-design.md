@@ -130,6 +130,17 @@ calm 30s → lift.** No kill action is ever emitted.
 
 ## 6. Effector mechanics
 
+> **SUPERSEDED (2026-08-01).** Everything in this section describes the original
+> migrate-the-PID mechanism, which Phase 0 of
+> `2026-07-31-roadmap.md` replaced with **acting in place**: the guard now
+> freezes or caps the cgroup a process already lives in (its `*.scope`, or an
+> `app-<exe>` rule group), never moving it. `guard-<pid>` cgroups, the
+> `unlimit`-migration recovery, and the `CgroupManager` helpers listed below no
+> longer exist. Read the roadmap's Phase 0 section for the current mechanics
+> (`resolve_target`, the write-ahead restore journal, D-Bus `FreezeUnit` with a
+> raw-write fallback). The rest of this document — architecture, pure-engine
+> split, policy ladder, never-kill guarantee — still holds.
+
 - **Freeze:** create `<base>/guard-<pid>`, write PID to its `cgroup.procs`, write
   `1` to `guard-<pid>/cgroup.freeze`. (Freezer is unconditional in cgroup v2.)
 - **Thaw:** write `0` to `cgroup.freeze`; process stays in `guard-<pid>`.
