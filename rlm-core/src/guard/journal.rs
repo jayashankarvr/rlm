@@ -17,7 +17,7 @@ use common::Error;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{atomic::AtomicU64, atomic::Ordering, Mutex};
 
 // Global counter for unique temp file names per call (guards against multi-threaded stomping).
@@ -56,6 +56,49 @@ pub struct Journal {
 }
 
 impl Journal {
+    /// Read journal entries straight off disk without opening a `Journal`
+    /// handle — safe to call from a *second* process (e.g. the CLI) while
+    /// the daemon holds its own live `Journal` and may be appending.
+    ///
+    /// Unlike [`Journal::open`]/[`Journal::entries`], this never truncates,
+    /// rewrites, or performs WAL tail recovery: `open()`'s recovery path
+    /// (`set_len` from a stale read, or a boot-mismatch truncate) is a
+    /// TOCTOU race against the daemon's own writes when run from an
+    /// unrelated process with no cross-process lock — a daemon `append`
+    /// landing between this function's read and a hypothetical fix-up would
+    /// be silently discarded, losing a crash-restore record. This function
+    /// only ever reads: a torn trailing line or any other unparseable line
+    /// is skipped in memory, the file on disk is left byte-for-byte as it
+    /// was found.
+    ///
+    /// Returns an empty vec if the file is missing/unreadable, the header is
+    /// missing/invalid, or the header's `boot_id` doesn't match `boot_id`
+    /// (stale entries from a prior boot are not "current", but reading them
+    /// is not this function's job to discard on disk).
+    pub fn read_entries(path: &Path, boot_id: &str) -> Vec<JournalEntry> {
+        let Ok(contents) = fs::read_to_string(path) else {
+            return vec![];
+        };
+        let mut lines = contents.lines();
+
+        let Some(header_line) = lines.next() else {
+            return vec![];
+        };
+        let Ok(header) = serde_json::from_str::<serde_json::Value>(header_line) else {
+            return vec![];
+        };
+        let Some(stored_boot_id) = header.get("boot_id").and_then(|v| v.as_str()) else {
+            return vec![];
+        };
+        if stored_boot_id != boot_id {
+            return vec![];
+        }
+
+        lines
+            .filter_map(|line| serde_json::from_str::<JournalEntry>(line).ok())
+            .collect()
+    }
+
     /// Opens the journal file, creating parent directories if needed.
     ///
     /// If the file exists and its boot_id header differs from the provided `boot_id`,
@@ -512,5 +555,70 @@ mod tests {
         assert_eq!(entries.len(), 2, "both old and new entry must survive");
         assert_eq!(entries[0].cgroup, "/x/a", "old entry first");
         assert_eq!(entries[1].cgroup, "/x/b", "new entry second");
+    }
+
+    /// Task 8 review fix: `read_entries` (used by a second process, e.g. the
+    /// CLI, that must never race the daemon's live `Journal` handle) skips a
+    /// torn trailing line in memory instead of `open()`'s WAL tail recovery
+    /// (which would `set_len` the file on disk). Proves both halves: the
+    /// valid entries are still returned, and the on-disk bytes are provably
+    /// untouched (identical before/after).
+    #[test]
+    fn read_entries_is_read_only_and_skips_torn_trailing_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("j.jsonl");
+
+        let j = Journal::open(p.clone(), "boot-a".into()).unwrap();
+        j.append(&entry("/x/a")).unwrap();
+        j.append(&entry("/x/b")).unwrap();
+        drop(j);
+
+        // Simulate a crash mid-append: torn, non-newline-terminated trailing line.
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new().append(true).open(&p).unwrap();
+        write!(f, "{{partial").unwrap();
+        drop(f);
+
+        let before = fs::read(&p).unwrap();
+        let entries = Journal::read_entries(&p, "boot-a");
+        let after = fs::read(&p).unwrap();
+
+        assert_eq!(
+            entries.len(),
+            2,
+            "torn trailing line must be skipped, not recovered: {entries:?}"
+        );
+        assert_eq!(entries[0].cgroup, "/x/a");
+        assert_eq!(entries[1].cgroup, "/x/b");
+        assert_eq!(
+            before, after,
+            "read_entries must never mutate the journal file on disk"
+        );
+    }
+
+    /// A boot_id mismatch means the entries are stale, but `read_entries`
+    /// must never truncate the file to express that (only `open()`, which
+    /// owns the file, is allowed to do that) — it just reports nothing.
+    #[test]
+    fn read_entries_returns_empty_on_boot_mismatch_without_mutating() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("j.jsonl");
+
+        let j = Journal::open(p.clone(), "boot-a".into()).unwrap();
+        j.append(&entry("/x/a")).unwrap();
+        drop(j);
+
+        let before = fs::read(&p).unwrap();
+        let entries = Journal::read_entries(&p, "boot-b");
+        let after = fs::read(&p).unwrap();
+
+        assert!(
+            entries.is_empty(),
+            "stale-boot entries must not be returned"
+        );
+        assert_eq!(
+            before, after,
+            "read_entries must not truncate on boot_id mismatch"
+        );
     }
 }

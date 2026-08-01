@@ -726,23 +726,20 @@ fn guard_status(manager: &CgroupManager) {
         None => println!("Memory pressure: PSI unavailable (/proc/pressure/memory)"),
     }
 
-    // Active interventions come from the guard's own write-ahead journal
-    // (read-only here — the CLI never clears/modifies entries, only the
-    // daemon does that as it acts and undoes). This reflects what the guard
-    // itself believes it's holding; it does not re-verify against the
-    // kernel's live cgroup.freeze/memory.high, which `rlm guard status` isn't
-    // trying to be a substitute for.
-    let journal = match rlm_core::guard::Journal::open(
-        rlm_core::guard::journal_path(),
-        rlm_core::guard::cgfs::boot_id(),
-    ) {
-        Ok(j) => j,
-        Err(e) => {
-            println!("\nGuard journal unavailable: {e}");
-            return;
-        }
-    };
-    let entries = journal.entries();
+    // Active interventions come from the guard's own write-ahead journal.
+    // We use `Journal::read_entries` rather than `Journal::open` here
+    // because this is the CLI, a *second* process running alongside the
+    // daemon's own live `Journal` handle: `open()` can truncate/rewrite the
+    // file (header repair) or run WAL tail recovery (`set_len` from a stale
+    // read), and with no cross-process lock a daemon `append` landing
+    // between that read and truncate would be silently dropped. Reflects
+    // what the guard itself believes it's holding; it does not re-verify
+    // against the kernel's live cgroup.freeze/memory.high, which
+    // `rlm guard status` isn't trying to be a substitute for.
+    let entries = rlm_core::guard::Journal::read_entries(
+        &rlm_core::guard::journal_path(),
+        &rlm_core::guard::cgfs::boot_id(),
+    );
     if entries.is_empty() {
         println!("\nNo active guard interventions.");
         return;
