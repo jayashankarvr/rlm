@@ -5,6 +5,15 @@ use std::process::Command;
 
 const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 
+/// Name of the shared, controller-free leaf cgroup that every `cleanup_cgroup`
+/// (i.e. every `rlm unlimit`, `remove_limit`/`remove_application_limit`, and
+/// `RuleAction::TeardownEmpty`) moves released processes into so the cgroup
+/// being torn down can be emptied and removed. It is a grab-bag of unrelated
+/// processes the user has explicitly released from rlm's control, so nothing
+/// in rlm may treat it as an actionable target (see `status.rs` and
+/// `guard/resolve.rs`).
+pub const UNLIMIT_CGROUP_NAME: &str = "unlimit";
+
 /// Sanitize cgroup name to prevent path traversal attacks.
 /// Only allows alphanumeric characters, dashes, and underscores.
 fn sanitize_cgroup_name(name: &str) -> Result<&str> {
@@ -333,7 +342,7 @@ impl CgroupManager {
 
             if !pids.is_empty() {
                 // Create/use an "unlimit" leaf cgroup (no controllers = no limits)
-                let unlimit_path = self.base_path.join("unlimit");
+                let unlimit_path = self.base_path.join(UNLIMIT_CGROUP_NAME);
                 let _ = fs::create_dir(&unlimit_path);
                 let unlimit_procs = unlimit_path.join("cgroup.procs");
 

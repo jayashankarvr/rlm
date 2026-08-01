@@ -783,6 +783,7 @@ fn guard_test(manager: &CgroupManager) {
         return;
     };
     let procs = sampler.eligible();
+    let live = sampler.live_cgroups();
     println!(
         "Pressure: some={:.1}%  full={:.1}%  available={} MB  |  {} eligible process(es)",
         sample.some_avg10,
@@ -791,7 +792,7 @@ fn guard_test(manager: &CgroupManager) {
         procs.len()
     );
 
-    let actions = engine.tick(0, sample, &procs);
+    let actions = engine.tick(0, sample, &procs, &live);
     if actions.is_empty() {
         println!("No action would be taken right now.");
     } else {

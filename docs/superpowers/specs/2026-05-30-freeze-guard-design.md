@@ -141,15 +141,28 @@ calm 30s → lift.** No kill action is ever emitted.
 > raw-write fallback). The rest of this document — architecture, pure-engine
 > split, policy ladder, never-kill guarantee — still holds.
 
-- **Freeze:** create `<base>/guard-<pid>`, write PID to its `cgroup.procs`, write
-  `1` to `guard-<pid>/cgroup.freeze`. (Freezer is unconditional in cgroup v2.)
-- **Thaw:** write `0` to `cgroup.freeze`; process stays in `guard-<pid>`.
-- **Cap:** set `memory.high` on `guard-<pid>` to ~90% of the process's current
-  `RSS` (forces reclaim/throttle, never an OOM-kill).
-- **LiftCap / recovery:** `memory.high=max`; once Calm sustained, move the process
-  to the controller-free `unlimit` cgroup and `rmdir guard-<pid>`.
-- **`CgroupManager` additions:** `freeze_pid`, `thaw_pid`, `soft_cap_pid`,
-  `lift_cap_pid`, `cleanup_guard`, `list_guard_pids`, `sweep_guard_leftovers`.
+- ~~**Freeze:** create `<base>/guard-<pid>`, write PID to its `cgroup.procs`, write
+  `1` to `guard-<pid>/cgroup.freeze`. (Freezer is unconditional in cgroup v2.)~~
+  **[DELETED in `de2bcef`]** — replaced by `Effector::freeze` acting in place on
+  the resolved target cgroup (`guard/effector.rs`).
+- ~~**Thaw:** write `0` to `cgroup.freeze`; process stays in `guard-<pid>`.~~
+  **[DELETED in `de2bcef`]** — replaced by `Effector::thaw`'s mechanism-independent
+  raw `cgroup.freeze` write on the in-place target.
+- ~~**Cap:** set `memory.high` on `guard-<pid>` to ~90% of the process's current
+  `RSS` (forces reclaim/throttle, never an OOM-kill).~~
+  **[DELETED in `de2bcef`]** — replaced by `Effector::cap`, which sizes off the
+  cgroup's anon+swap (`cgfs::anon_swap_bytes`), not one process's RSS.
+- ~~**LiftCap / recovery:** `memory.high=max`; once Calm sustained, move the process
+  to the controller-free `unlimit` cgroup and `rmdir guard-<pid>`.~~
+  **[DELETED in `de2bcef`]** — replaced by `Effector::lift_cap`, which restores
+  the journaled `prev_high` in place; the process is never moved anywhere.
+- ~~**`CgroupManager` additions:** `freeze_pid`, `thaw_pid`, `soft_cap_pid`,
+  `lift_cap_pid`, `cleanup_guard`, `list_guard_pids`, `sweep_guard_leftovers`.~~
+  **[DELETED in `de2bcef`]** — six of these seven no longer exist on
+  `CgroupManager` at all (grep confirms). `sweep_guard_leftovers` is the one
+  survivor, repurposed as a one-release upgrade path that cleans up legacy
+  `guard-<pid>` leftovers on startup (`CgroupManager::sweep_guard_leftovers`,
+  called from `Effector::sweep_leftovers`) — it no longer creates them.
 
 **Eligibility** (Sampler filters, engine enforces):
 - Only the user's own processes (`/proc/<pid>` owner uid == our uid).

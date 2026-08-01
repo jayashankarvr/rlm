@@ -1,10 +1,11 @@
 //! Pure policy state machine — the self-healing circuit breaker at the heart of
 //! the freeze guard.
 //!
-//! Contract: [`PolicyEngine::tick`] is pure given `(now_ms, sample, procs)` plus
-//! the engine's own internal state. It performs **no** syscalls and reads **no**
-//! clock — `now_ms` (monotonic milliseconds) is injected by the caller. That is
-//! what makes the whole escalation/recovery ladder unit-testable without root.
+//! Contract: [`PolicyEngine::tick`] is pure given `(now_ms, sample, procs,
+//! live_cgroups)` plus the engine's own internal state. It performs **no**
+//! syscalls and reads **no** clock — `now_ms` (monotonic milliseconds) is
+//! injected by the caller. That is what makes the whole escalation/recovery
+//! ladder unit-testable without root.
 
 use std::collections::HashMap;
 
@@ -67,7 +68,26 @@ impl PolicyEngine {
     }
 
     /// Advance the state machine one tick and return the actions to apply.
-    pub fn tick(&mut self, now_ms: u64, sample: Sample, procs: &[ProcInfo]) -> Vec<Action> {
+    ///
+    /// `live_cgroups` is the set of cgroups the Sampler currently resolves
+    /// for *any* of the user's real processes, with no min-RSS or protect
+    /// filtering applied (see `Sampler::live_cgroups`) — it is deliberately
+    /// a superset of `procs`' own resolutions. Pruning (step 3) checks
+    /// liveness against this set, not against `procs`: a successful `Cap`
+    /// sizes off anon+swap but `memory.high` also bounds file-backed pages,
+    /// so capping a mapped-file-heavy process can push its `rss_kb` below
+    /// the min-RSS floor on the very next tick, dropping it out of `procs`
+    /// even though the cgroup is very much still alive. Pruning against
+    /// `procs` there would lift the cap while pressure is still Critical and
+    /// immediately re-trigger it — a ~5s cap/lift/re-cap oscillation. Victim
+    /// *selection* (step 5) deliberately keeps using the filtered `procs`.
+    pub fn tick(
+        &mut self,
+        now_ms: u64,
+        sample: Sample,
+        procs: &[ProcInfo],
+        live_cgroups: &std::collections::HashSet<String>,
+    ) -> Vec<Action> {
         // 1. Disabled guard is inert.
         if !self.cfg.enabled {
             return Vec::new();
@@ -87,18 +107,14 @@ impl PolicyEngine {
             _ => self.calm_since_ms = None,
         }
 
-        // 3. Prune interventions whose cgroup no longer appears among `procs`'
-        //    resolutions. LiftCap doubles as "tear down the cap", so it's the
-        //    right cleanup for both frozen and capped dead cgroups; the
-        //    effector's LiftCap tolerates a missing cgroup.
-        let alive: std::collections::HashSet<&str> = procs
-            .iter()
-            .filter_map(|p| p.resolution.as_ref().map(|r| r.cgroup.as_str()))
-            .collect();
+        // 3. Prune interventions whose cgroup is no longer live (see
+        //    `live_cgroups` doc above). LiftCap doubles as "tear down the
+        //    cap", so it's the right cleanup for both frozen and capped dead
+        //    cgroups; the effector's LiftCap tolerates a missing cgroup.
         let dead: Vec<String> = self
             .interventions
             .keys()
-            .filter(|cg| !alive.contains(cg.as_str()))
+            .filter(|cg| !live_cgroups.contains(cg.as_str()))
             .cloned()
             .collect();
         for cg in dead {
@@ -245,6 +261,18 @@ impl PolicyEngine {
             .collect();
         out.sort_by(|(a, _), (b, _)| a.cmp(b));
         out
+    }
+
+    /// Cgroup paths the engine currently holds an intervention on — frozen
+    /// *or* capped. Interventions are already keyed by cgroup, so this is
+    /// just the key set. For external callers (e.g.
+    /// `RulesEnforcer::reconcile`, D1) that must not fight/revert an active
+    /// guard action: rewriting `memory.high` on a cgroup the engine just
+    /// capped would silently no-op the cap and leave `PolicyEngine` holding
+    /// a stale `Capped` intervention that then blocks victim re-selection
+    /// for the rest of the pressure episode.
+    pub fn intervened_cgroups(&self) -> Vec<String> {
+        self.interventions.keys().cloned().collect()
     }
 
     /// Compute the next level from the current level + a fresh sample, applying
@@ -409,11 +437,22 @@ mod tests {
             .any(|a| matches!(a, Action::LiftCap { res } if res.cgroup == cg))
     }
 
+    /// Default `live_cgroups` for tests that aren't specifically exercising
+    /// the D2 liveness-vs-eligibility distinction: derive it straight from
+    /// `procs`, which reproduces the old (pre-fix) behavior where liveness
+    /// was just cgroup membership in the eligible set.
+    fn live_from(procs: &[ProcInfo]) -> std::collections::HashSet<String> {
+        procs
+            .iter()
+            .filter_map(|p| p.resolution.as_ref().map(|r| r.cgroup.clone()))
+            .collect()
+    }
+
     #[test]
     fn calm_yields_no_actions() {
         let mut e = PolicyEngine::new(cfg());
         let procs = vec![proc(100, "firefox", 2000)];
-        let actions = e.tick(1000, calm(), &procs);
+        let actions = e.tick(1000, calm(), &procs, &live_from(&procs));
         assert!(actions.is_empty(), "calm produced actions: {actions:?}");
         assert_eq!(e.level, Level::Calm);
     }
@@ -423,12 +462,12 @@ mod tests {
         // Enter High purely via PSI `full` (some stays low): full=4.0 >= FULL_HIGH_RISE(3.0).
         let mut e = PolicyEngine::new(cfg());
         let procs = vec![proc(100, "firefox", 4000)];
-        e.tick(1_000, sample(0.0, 4.0, 8000), &procs);
+        e.tick(1_000, sample(0.0, 4.0, 8000), &procs, &live_from(&procs));
         assert_eq!(e.level, Level::High, "full=4.0 should enter High");
 
         // full drifts to 2.0 — between the fall (1.5) and rise (3.0) thresholds.
         // With hysteresis it must HOLD High, not flap back to Calm.
-        e.tick(2_000, sample(0.0, 2.0, 8000), &procs);
+        e.tick(2_000, sample(0.0, 2.0, 8000), &procs, &live_from(&procs));
         assert_eq!(
             e.level,
             Level::High,
@@ -436,7 +475,7 @@ mod tests {
         );
 
         // full drops below the fall threshold (1.0 < 1.5): now it may step down.
-        e.tick(3_000, sample(0.0, 1.0, 8000), &procs);
+        e.tick(3_000, sample(0.0, 1.0, 8000), &procs, &live_from(&procs));
         assert_eq!(
             e.level,
             Level::Calm,
@@ -450,7 +489,7 @@ mod tests {
         c.enabled = false;
         let mut e = PolicyEngine::new(c);
         let procs = vec![proc(100, "firefox", 4000)];
-        assert!(e.tick(1000, high(), &procs).is_empty());
+        assert!(e.tick(1000, high(), &procs, &live_from(&procs)).is_empty());
     }
 
     #[test]
@@ -461,7 +500,7 @@ mod tests {
             proc(2, "biggest", 4000),
             proc(3, "medium", 1000),
         ];
-        let actions = e.tick(1000, high(), &procs);
+        let actions = e.tick(1000, high(), &procs, &live_from(&procs));
         // Only the single largest hog is frozen, not the smaller ones.
         assert_eq!(
             freeze_targets(&actions),
@@ -475,7 +514,7 @@ mod tests {
         let mut e = PolicyEngine::new(cfg());
         // Both below the 200 MB default floor.
         let procs = vec![proc(1, "tiny", 50), proc(2, "small", 150)];
-        let actions = e.tick(1000, high(), &procs);
+        let actions = e.tick(1000, high(), &procs, &live_from(&procs));
         assert!(
             freeze_targets(&actions).is_empty(),
             "froze a sub-min-rss process: {actions:?}"
@@ -488,15 +527,15 @@ mod tests {
         let procs = vec![proc(2, "hog", 4000)];
         let cg = "/app.slice/app-hog-2.scope";
 
-        let a0 = e.tick(0, high(), &procs);
+        let a0 = e.tick(0, high(), &procs, &live_from(&procs));
         assert_eq!(freeze_targets(&a0), vec![cg]);
 
         // Before the hold elapses: no thaw yet (and escalation gate keeps it quiet).
-        let a1 = e.tick(4_000, high(), &procs);
+        let a1 = e.tick(4_000, high(), &procs, &live_from(&procs));
         assert!(!has_thaw_target(&a1, cg), "thawed too early: {a1:?}");
 
         // At/after 5s the freeze auto-thaws.
-        let a2 = e.tick(5_000, high(), &procs);
+        let a2 = e.tick(5_000, high(), &procs, &live_from(&procs));
         assert!(has_thaw_target(&a2, cg), "expected thaw at hold: {a2:?}");
         assert!(e.interventions().is_empty());
     }
@@ -508,13 +547,19 @@ mod tests {
         let cg = "/app.slice/app-hog-2.scope";
 
         // Freeze at t=0.
-        assert_eq!(freeze_targets(&e.tick(0, high(), &procs)), vec![cg]);
+        assert_eq!(
+            freeze_targets(&e.tick(0, high(), &procs, &live_from(&procs))),
+            vec![cg]
+        );
         // Auto-thaw at t=5s.
-        assert!(has_thaw_target(&e.tick(5_000, high(), &procs), cg));
+        assert!(has_thaw_target(
+            &e.tick(5_000, high(), &procs, &live_from(&procs)),
+            cg
+        ));
 
         // Still high, and within the 60s freeze cooldown -> Cap, not re-Freeze.
         // t must clear the escalation gate (>= last_action 5000 + 5000 hold).
-        let a = e.tick(10_000, high(), &procs);
+        let a = e.tick(10_000, high(), &procs, &live_from(&procs));
         assert!(
             has_cap_target(&a, cg),
             "expected cap within cooldown: {a:?}"
@@ -533,11 +578,11 @@ mod tests {
         let cg = "/app.slice/app-hog-2.scope";
 
         // Rise to High.
-        e.tick(0, high(), &procs);
+        e.tick(0, high(), &procs, &live_from(&procs));
         assert_eq!(e.level, Level::High);
 
         // some=20 is below rise(30) but above fall(15): stay High, no lift.
-        let a = e.tick(20_000, sample(20.0, 0.0, 8000), &procs);
+        let a = e.tick(20_000, sample(20.0, 0.0, 8000), &procs, &live_from(&procs));
         assert_eq!(e.level, Level::High, "dropped out of High prematurely");
         // A thaw here is expected (the freeze hold elapsed), but the cap must not
         // be lifted while we're still High.
@@ -547,7 +592,7 @@ mod tests {
         );
 
         // Drop below the fall threshold (some < 15 and full < 3): fall to Warn.
-        e.tick(21_000, sample(12.0, 0.0, 8000), &procs);
+        e.tick(21_000, sample(12.0, 0.0, 8000), &procs, &live_from(&procs));
         assert_eq!(e.level, Level::Warn);
     }
 
@@ -558,25 +603,25 @@ mod tests {
         let cg = "/app.slice/app-hog-2.scope";
 
         // Drive a freeze, thaw, then a cap (still hot within cooldown).
-        e.tick(0, high(), &procs);
-        e.tick(5_000, high(), &procs); // thaw
-        let a = e.tick(10_000, high(), &procs); // cap
+        e.tick(0, high(), &procs, &live_from(&procs));
+        e.tick(5_000, high(), &procs, &live_from(&procs)); // thaw
+        let a = e.tick(10_000, high(), &procs, &live_from(&procs)); // cap
         assert!(has_cap_target(&a, cg));
 
         // Calm starts at t=15s. Before 30s of calm: no lift.
-        let a1 = e.tick(15_000, calm(), &procs);
+        let a1 = e.tick(15_000, calm(), &procs, &live_from(&procs));
         assert!(
             !has_liftcap_target(&a1, cg),
             "lifted before calm sustained: {a1:?}"
         );
-        let a2 = e.tick(44_000, calm(), &procs); // 29s of calm
+        let a2 = e.tick(44_000, calm(), &procs, &live_from(&procs)); // 29s of calm
         assert!(
             !has_liftcap_target(&a2, cg),
             "lifted just before hold: {a2:?}"
         );
 
         // 30s of sustained calm -> lift the cap.
-        let a3 = e.tick(45_000, calm(), &procs);
+        let a3 = e.tick(45_000, calm(), &procs, &live_from(&procs));
         assert!(
             has_liftcap_target(&a3, cg),
             "expected lift after calm hold: {a3:?}"
@@ -589,15 +634,18 @@ mod tests {
         let mut e = PolicyEngine::new(cfg());
         let procs = vec![proc(2, "hog", 4000)];
         let cg = "/app.slice/app-hog-2.scope";
-        e.tick(0, high(), &procs);
-        e.tick(5_000, high(), &procs);
-        assert!(has_cap_target(&e.tick(10_000, high(), &procs), cg));
+        e.tick(0, high(), &procs, &live_from(&procs));
+        e.tick(5_000, high(), &procs, &live_from(&procs));
+        assert!(has_cap_target(
+            &e.tick(10_000, high(), &procs, &live_from(&procs)),
+            cg
+        ));
 
-        e.tick(15_000, calm(), &procs); // calm clock starts
-        e.tick(20_000, high(), &procs); // pressure returns -> calm clock cleared
-                                        // New calm window starts at 25s; at 50s only 25s have passed -> no lift.
-        e.tick(25_000, calm(), &procs);
-        let a = e.tick(50_000, calm(), &procs);
+        e.tick(15_000, calm(), &procs, &live_from(&procs)); // calm clock starts
+        e.tick(20_000, high(), &procs, &live_from(&procs)); // pressure returns -> calm clock cleared
+                                                            // New calm window starts at 25s; at 50s only 25s have passed -> no lift.
+        e.tick(25_000, calm(), &procs, &live_from(&procs));
+        let a = e.tick(50_000, calm(), &procs, &live_from(&procs));
         assert!(
             !has_liftcap_target(&a, cg),
             "calm clock should have reset: {a:?}"
@@ -612,18 +660,18 @@ mod tests {
         let cg_b = "/app.slice/app-hog-b-2.scope";
 
         // First High tick freezes hog-a.
-        let a0 = e.tick(0, high(), &procs);
+        let a0 = e.tick(0, high(), &procs, &live_from(&procs));
         assert_eq!(freeze_targets(&a0), vec![cg_a]);
 
         // Second High tick within the 5s hold: gate closed, no new freeze.
-        let a1 = e.tick(2_000, high(), &procs);
+        let a1 = e.tick(2_000, high(), &procs, &live_from(&procs));
         assert!(
             freeze_targets(&a1).is_empty(),
             "gate should suppress second freeze: {a1:?}"
         );
 
         // After the gate reopens, the next hog can be frozen.
-        let a2 = e.tick(5_000, high(), &procs);
+        let a2 = e.tick(5_000, high(), &procs, &live_from(&procs));
         assert_eq!(freeze_targets(&a2), vec![cg_b]);
     }
 
@@ -634,15 +682,60 @@ mod tests {
         let cg = "/app.slice/app-hog-2.scope";
 
         // Freeze the hog's cgroup.
-        assert_eq!(freeze_targets(&e.tick(0, high(), &procs)), vec![cg]);
+        assert_eq!(
+            freeze_targets(&e.tick(0, high(), &procs, &live_from(&procs))),
+            vec![cg]
+        );
         assert_eq!(e.interventions().len(), 1);
 
         // Next tick the process (and its resolution) has vanished -> LiftCap
         // cleanup, intervention dropped.
-        let a = e.tick(1_000, calm(), &[]);
+        let a = e.tick(1_000, calm(), &[], &live_from(&[]));
         assert!(
             has_liftcap_target(&a, cg),
             "expected LiftCap for dead cgroup: {a:?}"
+        );
+        assert!(e.interventions().is_empty());
+    }
+
+    /// D2 regression: a cgroup absent from `procs` (e.g. the cap evicted
+    /// enough file pages to drop the process below `min_rss_mb`) but still
+    /// present in `live_cgroups` must NOT be pruned — the cgroup is real and
+    /// alive, just not currently eligible for (re-)selection. A cgroup
+    /// absent from *both* sets must still be pruned with a LiftCap.
+    #[test]
+    fn intervention_survives_in_live_cgroups_but_absent_from_procs() {
+        let mut e = PolicyEngine::new(cfg());
+        let procs = vec![proc(2, "hog", 4000)];
+        let cg = "/app.slice/app-hog-2.scope";
+
+        // Freeze the hog's cgroup.
+        assert_eq!(
+            freeze_targets(&e.tick(0, high(), &procs, &live_from(&procs))),
+            vec![cg]
+        );
+        assert_eq!(e.interventions().len(), 1);
+
+        // Next tick: the process no longer appears in `procs` (as if the cap
+        // evicted its file pages below the min-RSS floor), but its cgroup is
+        // still in `live_cgroups` — must NOT be pruned.
+        let live: std::collections::HashSet<String> = [cg.to_string()].into();
+        let a1 = e.tick(1_000, calm(), &[], &live);
+        assert!(
+            !has_liftcap_target(&a1, cg),
+            "must not prune a cgroup still present in live_cgroups: {a1:?}"
+        );
+        assert_eq!(
+            e.interventions().len(),
+            1,
+            "intervention must survive while the cgroup is live"
+        );
+
+        // Now the cgroup is gone from both sets entirely -> pruned.
+        let a2 = e.tick(2_000, calm(), &[], &std::collections::HashSet::new());
+        assert!(
+            has_liftcap_target(&a2, cg),
+            "expected LiftCap once absent from live_cgroups too: {a2:?}"
         );
         assert!(e.interventions().is_empty());
     }
@@ -662,14 +755,17 @@ mod tests {
         // so two Capped interventions coexist. Caps persist while High (never
         // auto-thaw), which is what lets two interventions overlap under
         // default timing.
-        assert_eq!(freeze_targets(&e.tick(0, high(), &procs)), vec![cg_a]); // freeze a
-        let a1 = e.tick(5_000, high(), &procs); // thaw a, freeze b
+        assert_eq!(
+            freeze_targets(&e.tick(0, high(), &procs, &live_from(&procs))),
+            vec![cg_a]
+        ); // freeze a
+        let a1 = e.tick(5_000, high(), &procs, &live_from(&procs)); // thaw a, freeze b
         assert!(has_thaw_target(&a1, cg_a));
         assert_eq!(freeze_targets(&a1), vec![cg_b]);
-        let a2 = e.tick(10_000, high(), &procs); // thaw b, cap a (in cooldown)
+        let a2 = e.tick(10_000, high(), &procs, &live_from(&procs)); // thaw b, cap a (in cooldown)
         assert!(has_thaw_target(&a2, cg_b));
         assert!(has_cap_target(&a2, cg_a));
-        let a3 = e.tick(15_000, high(), &procs); // cap b (in cooldown)
+        let a3 = e.tick(15_000, high(), &procs, &live_from(&procs)); // cap b (in cooldown)
         assert!(has_cap_target(&a3, cg_b));
 
         let ivs = e.interventions();
@@ -687,7 +783,7 @@ mod tests {
         let mut e = PolicyEngine::new(cfg());
         let procs = vec![proc(2, "hog", 4000)];
         // No PSI pressure, but MemAvailable below the 400 MB floor -> Critical.
-        let a = e.tick(0, sample(0.0, 0.0, 100), &procs);
+        let a = e.tick(0, sample(0.0, 0.0, 100), &procs, &live_from(&procs));
         assert_eq!(e.level, Level::Critical);
         assert_eq!(freeze_targets(&a), vec!["/app.slice/app-hog-2.scope"]);
     }
@@ -698,7 +794,7 @@ mod tests {
         let procs = vec![proc(2, "hog", 4000)];
 
         // Warn level: some>=10 but below high; just notify, no freeze.
-        let a0 = e.tick(0, sample(12.0, 0.0, 8000), &procs);
+        let a0 = e.tick(0, sample(12.0, 0.0, 8000), &procs, &live_from(&procs));
         assert!(
             a0.iter().any(|x| matches!(x, Action::Notify { .. })),
             "expected a notify at Warn: {a0:?}"
@@ -706,14 +802,14 @@ mod tests {
         assert!(freeze_targets(&a0).is_empty());
 
         // Within 60s: no second notify.
-        let a1 = e.tick(30_000, sample(12.0, 0.0, 8000), &procs);
+        let a1 = e.tick(30_000, sample(12.0, 0.0, 8000), &procs, &live_from(&procs));
         assert!(
             !a1.iter().any(|x| matches!(x, Action::Notify { .. })),
             "notify should be rate-limited: {a1:?}"
         );
 
         // After 60s: notify again.
-        let a2 = e.tick(60_000, sample(12.0, 0.0, 8000), &procs);
+        let a2 = e.tick(60_000, sample(12.0, 0.0, 8000), &procs, &live_from(&procs));
         assert!(a2.iter().any(|x| matches!(x, Action::Notify { .. })));
     }
 
@@ -723,7 +819,7 @@ mod tests {
         c.notify = false;
         let mut e = PolicyEngine::new(c);
         let procs = vec![proc(2, "hog", 4000)];
-        let a = e.tick(0, sample(12.0, 0.0, 8000), &procs);
+        let a = e.tick(0, sample(12.0, 0.0, 8000), &procs, &live_from(&procs));
         assert!(!a.iter().any(|x| matches!(x, Action::Notify { .. })));
     }
 
@@ -736,7 +832,8 @@ mod tests {
         let r = p.resolution.as_mut().unwrap();
         r.verdict = Verdict::CapOnly;
         r.coverage = Coverage::Partial;
-        let a = e.tick(0, high(), &[p]);
+        let procs = [p];
+        let a = e.tick(0, high(), &procs, &live_from(&procs));
         assert!(
             freeze_targets(&a).is_empty(),
             "CapOnly must not freeze: {a:?}"
@@ -754,11 +851,12 @@ mod tests {
             r.coverage = Coverage::Partial;
         }
         let p2 = proc_at(2, "hog", 3000, "/app.slice/b.scope");
+        let procs = [p1.clone(), p2.clone()];
         // Partial action at t=0...
-        let a0 = e.tick(0, high(), &[p1.clone(), p2.clone()]);
+        let a0 = e.tick(0, high(), &procs, &live_from(&procs));
         assert!(has_cap_target(&a0, "/app.slice/a.scope"));
         // ...gate must already be open on the very next tick (1s later, < freeze_hold).
-        let a1 = e.tick(1_000, high(), &[p1, p2]);
+        let a1 = e.tick(1_000, high(), &procs, &live_from(&procs));
         assert!(
             has_freeze_target(&a1, "/app.slice/b.scope"),
             "gate should be open after Partial: {a1:?}"
@@ -778,7 +876,8 @@ mod tests {
         // covered elsewhere (`notify_emitted_and_rate_limited`). What this test
         // guards is that an unresolvable process is never escalated: no
         // Freeze/Cap is ever produced for it, and no intervention is created.
-        let a = e.tick(0, high(), &[p]);
+        let procs = [p];
+        let a = e.tick(0, high(), &procs, &live_from(&procs));
         assert!(
             !a.iter()
                 .any(|x| matches!(x, Action::Freeze { .. } | Action::Cap { .. })),
@@ -799,7 +898,7 @@ mod tests {
                 "/app.slice/app-firefox-1.scope",
             ),
         ];
-        let a = e.tick(0, high(), &procs);
+        let a = e.tick(0, high(), &procs, &live_from(&procs));
         assert_eq!(
             freeze_targets(&a).len(),
             1,

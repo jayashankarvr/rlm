@@ -6,6 +6,8 @@
 //! unit-testable without root. [`RulesEnforcer::reconcile`] wires that decision
 //! to real `/proc` enumeration and a [`CgroupManager`].
 
+use std::collections::HashSet;
+
 use crate::guard::cgfs;
 use crate::process::{self, ProcessInfo};
 use crate::CgroupManager;
@@ -78,16 +80,25 @@ impl CompiledRule {
 /// - no matches, no cgroup                           -> nothing
 ///
 /// The freeze guard no longer migrates processes into a separate `guard-<pid>`
-/// cgroup (it acts in place on whatever cgroup a process already lives in —
-/// see `guard/effector.rs`), so there is nothing left here to contend over.
-/// `reconcile` still skips a rule's actions for a tick if the kernel reports
-/// the rule's cgroup as frozen (see there).
+/// cgroup — it acts in place on whatever cgroup a process already lives in
+/// (see `guard/effector.rs`), and rule cgroups are first-class guard targets.
+/// So there IS something left to contend over: `held` is `true` when the
+/// guard currently holds a freeze or cap intervention on this rule's cgroup
+/// (see `RulesEnforcer::reconcile`), in which case this rule's actions are
+/// skipped outright for the tick — rewriting `memory.high`/adding PIDs out
+/// from under an active intervention would silently no-op the guard's action
+/// while leaving `PolicyEngine` believing it still holds one.
 pub fn plan(
     rule: &CompiledRule,
     procs: &[ProcessInfo],
     already_placed: &[u32],
     cgroup_exists: bool,
+    held: bool,
 ) -> Vec<RuleAction> {
+    if held {
+        return Vec::new();
+    }
+
     let matches: Vec<&ProcessInfo> = procs.iter().filter(|p| rule.matches(p)).collect();
 
     if matches.is_empty() {
@@ -141,7 +152,18 @@ impl RulesEnforcer {
     /// Reconcile every rule once. Best-effort: a failure on one rule or PID is
     /// logged and never aborts the others. Returns the actions that were applied
     /// (useful for logging/tests).
-    pub fn reconcile(&self, mgr: &CgroupManager) -> Vec<RuleAction> {
+    ///
+    /// `held_cgroups` is `PolicyEngine::intervened_cgroups()` — the set of
+    /// cgroups the freeze guard currently holds a freeze *or* cap
+    /// intervention on (D1 fix). A rule whose cgroup is in that set is
+    /// skipped entirely for the tick: `RulesEnforcer` and the guard now both
+    /// write to the same rule cgroup (act-in-place makes rule cgroups
+    /// first-class guard targets), and rewriting `memory.high` on a cgroup
+    /// the guard just capped would silently revert the cap within the same
+    /// daemon-loop tick while leaving `PolicyEngine` believing it still holds
+    /// one — which then blocks the real culprit from being re-selected as a
+    /// victim for the rest of the pressure episode.
+    pub fn reconcile(&self, mgr: &CgroupManager, held_cgroups: &[String]) -> Vec<RuleAction> {
         // One /proc scan shared across all rules.
         let procs = match process::list_all() {
             Ok(p) => p,
@@ -152,26 +174,36 @@ impl RulesEnforcer {
         };
 
         // rlm's own base cgroup path, relative to /sys/fs/cgroup (same
-        // convention cgfs uses), for building each rule's frozen-check path
-        // below. `None` only if base_path is somehow outside /sys/fs/cgroup
-        // (broken invariant) — the frozen-check is then skipped rather than
-        // guessed at.
+        // convention cgfs uses), for building each rule's held/frozen-check
+        // path below. `None` only if base_path is somehow outside
+        // /sys/fs/cgroup (broken invariant) — both checks are then skipped
+        // rather than guessed at.
         let rlm_rel = crate::guard::sampler::strip_cgroup_root(mgr.base_path());
+        let held: HashSet<&str> = held_cgroups.iter().map(String::as_str).collect();
 
         let mut applied = Vec::new();
         for rule in &self.rules {
-            // The freeze guard acts in place now, so it may have frozen this
-            // rule's own cgroup. Read the kernel's own view via cgroup.events
-            // rather than trust our own bookkeeping — the freeze may not even
-            // be ours (e.g. a systemd unit paused for an unrelated reason) —
-            // and skip this rule's actions for the tick rather than fight a
-            // paused cgroup (adding a PID to a frozen cgroup silently queues
-            // it frozen; tearing one down while frozen can wedge cleanup).
-            // We'll reconcile normally once it thaws.
+            let mut blocked = false;
             if let Some(rel) = &rlm_rel {
                 let cg_path = format!("{rel}/{}", rule.cgroup);
-                if cgfs::read_frozen(&cg_path) == Some(true) {
-                    continue;
+
+                // First guard: the engine's own bookkeeping says it currently
+                // holds a freeze or cap on this cgroup — skip so we don't
+                // fight/revert it (D1).
+                if held.contains(cg_path.as_str()) {
+                    blocked = true;
+                }
+
+                // Second, independent guard: ask the kernel directly whether
+                // the cgroup is frozen, regardless of our own bookkeeping —
+                // the freeze may not even be ours (e.g. a systemd unit
+                // paused for an unrelated reason) — and skip this rule's
+                // actions for the tick rather than fight a paused cgroup
+                // (adding a PID to a frozen cgroup silently queues it
+                // frozen; tearing one down while frozen can wedge cleanup).
+                // We'll reconcile normally once it thaws.
+                if !blocked && cgfs::read_frozen(&cg_path) == Some(true) {
+                    blocked = true;
                 }
             }
 
@@ -179,7 +211,7 @@ impl RulesEnforcer {
             let placed = mgr.pids_in_cgroup(&rule.cgroup);
             let exists = !placed.is_empty() || mgr.cgroup_exists(&rule.cgroup);
 
-            for action in plan(rule, &procs, &placed, exists) {
+            for action in plan(rule, &procs, &placed, exists, blocked) {
                 if let Err(e) = self.apply(mgr, rule, &action) {
                     tracing::warn!(?action, error = %e, "rules: action failed");
                 } else {
@@ -253,7 +285,7 @@ mod tests {
     fn plan_ensures_and_adds_unplaced_matches() {
         let r = rule("firefox", &["firefox"]);
         let procs = vec![proc(10, "firefox", None), proc(11, "firefox", None)];
-        let actions = plan(&r, &procs, &[], false);
+        let actions = plan(&r, &procs, &[], false, false);
         assert_eq!(
             actions[0],
             RuleAction::EnsureCgroup {
@@ -274,7 +306,7 @@ mod tests {
     fn plan_is_idempotent_when_all_placed() {
         let r = rule("firefox", &["firefox"]);
         let procs = vec![proc(10, "firefox", None)];
-        let actions = plan(&r, &procs, &[10], true);
+        let actions = plan(&r, &procs, &[10], true, false);
         // Ensure only; no AddPid for the already-placed pid.
         assert_eq!(
             actions,
@@ -288,7 +320,7 @@ mod tests {
     fn plan_adds_only_new_pid() {
         let r = rule("firefox", &["firefox"]);
         let procs = vec![proc(10, "firefox", None), proc(12, "firefox", None)];
-        let actions = plan(&r, &procs, &[10], true);
+        let actions = plan(&r, &procs, &[10], true, false);
         assert_eq!(
             actions,
             vec![
@@ -307,7 +339,7 @@ mod tests {
     fn plan_teardown_only_when_empty_and_present() {
         let r = rule("firefox", &["firefox"]);
         // Present + empty (no placed pids) + no matches -> teardown.
-        let actions = plan(&r, &[proc(1, "code", None)], &[], true);
+        let actions = plan(&r, &[proc(1, "code", None)], &[], true, false);
         assert_eq!(
             actions,
             vec![RuleAction::TeardownEmpty {
@@ -322,7 +354,7 @@ mod tests {
         // manual one-off `--application firefox` sharing the name). Must NOT tear
         // it down out from under its owner.
         let r = rule("firefox", &["firefox"]);
-        let actions = plan(&r, &[proc(1, "code", None)], &[999], true);
+        let actions = plan(&r, &[proc(1, "code", None)], &[999], true, false);
         assert!(
             actions.is_empty(),
             "must not evict an occupied cgroup: {actions:?}"
@@ -332,7 +364,39 @@ mod tests {
     #[test]
     fn plan_noop_when_no_matches_and_no_cgroup() {
         let r = rule("firefox", &["firefox"]);
-        let actions = plan(&r, &[proc(1, "code", None)], &[], false);
+        let actions = plan(&r, &[proc(1, "code", None)], &[], false, false);
         assert!(actions.is_empty());
+    }
+
+    // ---- D1: guard-held rule cgroups --------------------------------------
+
+    #[test]
+    fn plan_produces_no_actions_when_rule_cgroup_is_guard_held() {
+        // Matching processes exist and the cgroup is populated, which would
+        // normally yield EnsureCgroup (+ AddPid for anything unplaced) — but
+        // the guard currently holds a freeze/cap intervention on this rule's
+        // cgroup, so nothing should be emitted at all.
+        let r = rule("firefox", &["firefox"]);
+        let procs = vec![proc(10, "firefox", None), proc(11, "firefox", None)];
+        let actions = plan(&r, &procs, &[10], true, true);
+        assert!(
+            actions.is_empty(),
+            "a guard-held rule cgroup must get no actions: {actions:?}"
+        );
+    }
+
+    #[test]
+    fn plan_unheld_rule_is_unaffected() {
+        // Same scenario, `held = false`: normal EnsureCgroup + AddPid(new).
+        let r = rule("firefox", &["firefox"]);
+        let procs = vec![proc(10, "firefox", None), proc(11, "firefox", None)];
+        let actions = plan(&r, &procs, &[10], true, false);
+        assert!(actions.contains(&RuleAction::EnsureCgroup {
+            rule: "firefox".into()
+        }));
+        assert!(actions.contains(&RuleAction::AddPid {
+            rule: "firefox".into(),
+            pid: 11
+        }));
     }
 }

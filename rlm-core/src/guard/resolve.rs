@@ -68,6 +68,15 @@ pub fn candidate_target(victim_cgroup: &str, uid: u32, rlm_base: &str) -> Option
     let rlm_root = format!("{}/", rlm_base.trim_end_matches('/'));
     if let Some(rest) = victim_cgroup.strip_prefix(&rlm_root) {
         let first = rest.split('/').find(|c| !c.is_empty())?;
+        // The shared "unlimit" leaf is where every `rlm unlimit`/teardown
+        // dumps released processes (and where `sweep_guard_leftovers` dumps
+        // legacy `guard-<pid>` victims on upgrade) — it's a grab-bag of
+        // processes the user explicitly released from rlm's control, not a
+        // valid freeze/cap target. `status.rs` already excludes it by the
+        // same name; mirror that here (D3 fix).
+        if first == crate::cgroup::UNLIMIT_CGROUP_NAME {
+            return None;
+        }
         return Some(Candidate {
             cgroup: format!("{rlm_root}{first}"),
             unit: None,
@@ -147,6 +156,32 @@ mod tests {
         assert_eq!(c.cgroup, format!("{RLM}/app-firefox"));
         assert_eq!(c.unit, None);
         assert_eq!(c.mechanism, Mechanism::Raw);
+    }
+
+    /// D3 fix: the shared `unlimit` leaf holds processes the user explicitly
+    /// released from rlm's control (and, on upgrade, legacy `guard-<pid>`
+    /// victims swept there at startup) — it must never resolve as a
+    /// freeze/cap target, mirroring `status.rs`'s exclusion of the same
+    /// cgroup.
+    #[test]
+    fn unlimit_bucket_is_not_a_target() {
+        assert_eq!(
+            candidate_target(
+                &format!("{RLM}/{}", crate::cgroup::UNLIMIT_CGROUP_NAME),
+                1000,
+                RLM,
+            ),
+            None
+        );
+        // Nor is a process nested somewhere below it.
+        assert_eq!(
+            candidate_target(
+                &format!("{RLM}/{}/child", crate::cgroup::UNLIMIT_CGROUP_NAME),
+                1000,
+                RLM,
+            ),
+            None
+        );
     }
 
     #[test]

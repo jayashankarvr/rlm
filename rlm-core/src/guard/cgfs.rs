@@ -44,15 +44,28 @@ pub fn write_high(cg: &str, val: &str) -> Result<()> {
 }
 
 /// Get total anonymous + swap memory (anon from memory.stat + memory.swap.current).
+/// `anon` is required — without it we have nothing to cap against. `swap` is
+/// tolerant: a merely-unreadable `memory.swap.current` (the norm when swap is
+/// disabled, or `swapaccount=0`) must not discard a perfectly good `anon`
+/// value and collapse the caller's cap to the `MIN_CAP_BYTES` floor (D4 fix)
+/// — it defaults to 0 instead.
 pub fn anon_swap_bytes(cg: &str) -> Option<u64> {
     let stat = fs::read_to_string(abs(cg).join("memory.stat")).ok()?;
     let anon = parse_anon(&stat)?;
-    let swap = fs::read_to_string(abs(cg).join("memory.swap.current"))
-        .ok()?
-        .trim()
-        .parse::<u64>()
+    let swap_content = fs::read_to_string(abs(cg).join("memory.swap.current")).ok();
+    Some(combine_anon_swap(anon, swap_content.as_deref()))
+}
+
+/// Pure: add a possibly-unreadable/unparseable swap reading to a required
+/// `anon` value, defaulting the swap half to 0 rather than discarding
+/// `anon` (D4 fix — only the parse used to be tolerant; the read wasn't,
+/// so a merely-absent swap file threw away a perfectly good `anon` and
+/// forced the caller's cap down to its most aggressive floor).
+fn combine_anon_swap(anon: u64, swap_content: Option<&str>) -> u64 {
+    let swap = swap_content
+        .and_then(|s| s.trim().parse::<u64>().ok())
         .unwrap_or(0);
-    Some(anon + swap)
+    anon + swap
 }
 
 /// Get the inode number of the cgroup directory.
@@ -161,6 +174,24 @@ mod tests {
         let stat = "anon 1073741824\nfile 536870912\nkernel 1000\n";
         assert_eq!(parse_anon(stat), Some(1_073_741_824));
         assert_eq!(parse_anon("file 5\n"), None);
+    }
+
+    #[test]
+    fn combine_anon_swap_tolerates_missing_or_unparseable_swap() {
+        // The common case on the target platforms: no memory.swap.current
+        // at all (swap disabled) must NOT discard a perfectly good `anon`.
+        assert_eq!(
+            combine_anon_swap(1_000_000, None),
+            1_000_000,
+            "missing swap file must not zero out anon"
+        );
+        // Unparseable content degrades the same way: swap defaults to 0.
+        assert_eq!(
+            combine_anon_swap(1_000_000, Some("not-a-number")),
+            1_000_000
+        );
+        // A real, readable swap value is added on top of anon.
+        assert_eq!(combine_anon_swap(1_000_000, Some("500\n")), 1_000_500);
     }
 
     #[test]

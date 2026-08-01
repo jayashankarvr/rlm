@@ -173,6 +173,52 @@ impl Sampler {
         out
     }
 
+    /// Every cgroup currently resolved for one of the user's own, live
+    /// processes — deliberately with **no** min-RSS or protect filtering
+    /// applied (unlike [`Sampler::eligible`]). This is a liveness signal,
+    /// not an escalation candidate list: `PolicyEngine::tick` prunes its
+    /// interventions against this set rather than against `eligible()`'s
+    /// filtered output, because a successful `Cap` sizes off anon+swap while
+    /// `memory.high` also bounds file-backed pages — capping a
+    /// mapped-file-heavy process can push its `rss_kb` below the min-RSS
+    /// floor on the very next tick even though the cgroup, and the process
+    /// in it, are both still very much alive (D2 fix).
+    pub fn live_cgroups(&self) -> HashSet<String> {
+        let mut resolved: HashMap<String, Resolution> = HashMap::new();
+        let mut live = HashSet::new();
+
+        let Ok(entries) = fs::read_dir("/proc") else {
+            return live;
+        };
+        for entry in entries.flatten() {
+            let file_name = entry.file_name();
+            let Some(name) = file_name.to_str() else {
+                continue;
+            };
+            let Ok(pid) = name.parse::<u32>() else {
+                continue;
+            };
+            if pid == self.self_pid {
+                continue;
+            }
+
+            let Ok(status) = fs::read_to_string(format!("/proc/{pid}/status")) else {
+                continue;
+            };
+            let Some((owner_uid, _, _)) = parse_proc_status(&status) else {
+                continue;
+            };
+            if owner_uid != self.uid {
+                continue;
+            }
+
+            if let Some(res) = self.resolve(pid, &mut resolved) {
+                live.insert(res.cgroup);
+            }
+        }
+        live
+    }
+
     /// Resolve `pid` to its freeze/cap target, if any. `cache` is keyed by
     /// candidate cgroup so callers in the same eligible-cgroup only pay for
     /// the member scan once. Returns `None` outright if `rlm_base` failed to

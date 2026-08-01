@@ -40,8 +40,12 @@
 //! order lets systemd's own `"max"` write clobber the value we just
 //! restored. If more than one journal entry ever coexists for the same
 //! cgroup (a leak from an incomplete prior removal), every restore path
-//! treats them as one chain: liveness is judged against the newest entry,
-//! but the value restored is always the *oldest* entry's `prev_high` — the
+//! treats them as one chain: liveness is judged against the chain's `Cap`
+//! entry specifically (only a `Cap` has a `memory.high` to restore — a
+//! `Freeze` entry does not, so judging against `entries.last()` when it
+//! happens to be a newer `Freeze` would wrongly look like "nothing to
+//! restore" and strand `memory.high` at the guard's value forever), and the
+//! value restored is always the *oldest* `Cap` entry's `prev_high` — the
 //! true pre-intervention value, not an intermediate entry's `prev_high`
 //! (which is just our own previous `our_high`). See [`restore_target`].
 
@@ -105,9 +109,28 @@ impl<'a> Effector<'a> {
     }
 
     fn freeze(&self, res: &Resolution, name: &str) -> Result<()> {
+        // The inode is the guard that lets a later restore tell "this is
+        // still the same cgroup" from "this cgroup was torn down and
+        // recreated" (`should_restore`). `unwrap_or(0)` used to substitute a
+        // poison sentinel here: 0 is never a real inode, so the guard could
+        // never match again and the entry became permanently unrestorable —
+        // yet it was still journaled-and-acted-on, then later cleared and
+        // logged as if it were an intentional skip (Promoted Minor A). Fail
+        // closed instead: refuse to freeze at all rather than act with a
+        // record we can never safely restore from.
+        let Some(inode) = cgfs::dir_inode(&res.cgroup) else {
+            tracing::warn!(
+                cgroup = %res.cgroup, name,
+                "cannot read cgroup inode; refusing to freeze (would be unrestorable)"
+            );
+            return Err(common::Error::Cgroup(format!(
+                "cannot read inode for {}; refusing to freeze",
+                res.cgroup
+            )));
+        };
         let entry = JournalEntry {
             cgroup: res.cgroup.clone(),
-            inode: cgfs::dir_inode(&res.cgroup).unwrap_or(0),
+            inode,
             unit: res.unit.clone(),
             action: JournalAction::Freeze,
             prev_high: None,
@@ -151,6 +174,20 @@ impl<'a> Effector<'a> {
     }
 
     fn cap(&self, res: &Resolution, name: &str) -> Result<()> {
+        // See `freeze`'s matching comment (Promoted Minor A): a `0` inode
+        // sentinel here would make this Cap permanently unrestorable while
+        // looking like a real guard, so fail closed instead of
+        // journal-and-act with an unrestorable record.
+        let Some(inode) = cgfs::dir_inode(&res.cgroup) else {
+            tracing::warn!(
+                cgroup = %res.cgroup, name,
+                "cannot read cgroup inode; refusing to cap (would be unrestorable)"
+            );
+            return Err(common::Error::Cgroup(format!(
+                "cannot read inode for {}; refusing to cap",
+                res.cgroup
+            )));
+        };
         let prev_high = cgfs::read_high(&res.cgroup);
         // The kernel truncates `memory.high` writes to page multiples, so we
         // must journal/write the value it will actually store — not the raw
@@ -172,7 +209,7 @@ impl<'a> Effector<'a> {
 
         let entry = JournalEntry {
             cgroup: res.cgroup.clone(),
-            inode: cgfs::dir_inode(&res.cgroup).unwrap_or(0),
+            inode,
             unit: res.unit.clone(),
             action: JournalAction::Cap,
             prev_high,
@@ -305,27 +342,36 @@ impl<'a> Effector<'a> {
     /// Restore `memory.high` for one cgroup's journal `entries` (oldest-first),
     /// if the chain is still live — called *after* the caller has already
     /// performed the mechanism-independent thaw (see module docs: no path
-    /// here ever means "leave frozen"). Liveness is judged against the
-    /// *newest* entry via [`restore_step`] (that's the entry whose write
-    /// should currently be reflected on disk, if nothing else touched it
-    /// since); the value actually restored is always [`restore_target`]'s
+    /// here ever means "leave frozen"). Only a `Cap` entry ever has a
+    /// `memory.high` to restore, so liveness is judged against *that*
+    /// specific entry via [`restore_step`] — never against `entries.last()`
+    /// (Promoted Minor B): for a `[Cap, Freeze]` chain the newest entry is
+    /// the `Freeze`, which has no `memory.high` of its own and would make
+    /// `restore_step` report `ThawOnly` ("nothing to restore"), permanently
+    /// stranding `memory.high` at the guard's Cap value once the whole chain
+    /// is cleared. The value actually restored is always [`restore_target`]'s
     /// oldest-entry `prev_high` — the true pre-intervention value, not any
     /// intermediate entry's `prev_high` (Important #3, Task 6 review).
     /// Clears systemd's runtime `MemoryHigh` property *before* raw-writing
     /// `prev_high` back — the other order lets systemd's own `"max"` write
     /// clobber the value we just restored (Critical #2, Task 6 review).
     fn restore_high_if_any(&self, cgroup: &str, entries: &[JournalEntry]) {
-        let Some(newest) = entries.last() else {
+        // No Cap entry anywhere in the chain (a Freeze-only chain, possibly
+        // with leaked duplicates): there is no memory.high to restore. The
+        // unconditional thaw already ran in the caller, so there's nothing
+        // left to do here.
+        let Some(cap_entry) = entries.iter().find(|e| e.action == JournalAction::Cap) else {
             return;
         };
+
         let inode = cgfs::dir_inode(cgroup);
         let high = cgfs::read_high(cgroup);
-        match restore_step(newest, inode, high.as_deref()) {
+        match restore_step(cap_entry, inode, high.as_deref()) {
             RestoreStep::ThawAndRestoreHigh { .. } => {
                 let Some(to) = restore_target(entries) else {
                     return;
                 };
-                if let Some(unit) = newest.unit.as_deref() {
+                if let Some(unit) = cap_entry.unit.as_deref() {
                     if let Some(systemd) = self.systemd {
                         if let Err(err) = systemd.set_memory_high(unit, u64::MAX, DBUS_TIMEOUT) {
                             tracing::debug!(
@@ -339,9 +385,11 @@ impl<'a> Effector<'a> {
                     tracing::warn!(cgroup, error = %err, "failed to restore memory.high");
                 }
             }
+            // Unreachable in practice (a Cap entry's own restore_step never
+            // returns ThawOnly), kept for exhaustiveness.
             RestoreStep::ThawOnly => {}
             RestoreStep::SkipRemove => {
-                tracing::info!(
+                tracing::warn!(
                     cgroup,
                     "not restoring memory.high (cgroup recreated or value changed since our write)"
                 );
@@ -930,5 +978,96 @@ mod tests {
         let _ = Command::new("systemctl")
             .args(["--user", "stop", &unit])
             .status();
+    }
+
+    /// Regression test for Promoted Minor B: a leaked `[Cap, Freeze]` chain
+    /// (Cap journaled first, then the same cgroup frozen later without the
+    /// Cap entry ever being cleared) must still restore the Cap's
+    /// `prev_high` on thaw. Before the fix, liveness was judged against
+    /// `entries.last()` — the Freeze entry, which has no `memory.high` of
+    /// its own — so `restore_step` reported "nothing to restore" and
+    /// `memory.high` stayed pinned at the guard's Cap value forever once the
+    /// whole chain was cleared. Requires cgroup v2 delegation, so it's
+    /// `#[ignore]`d.
+    #[test]
+    #[ignore = "requires cgroup v2 delegation; run manually"]
+    fn chain_restores_cap_value_when_newest_entry_is_freeze() {
+        use common::Limit;
+        use std::process::Command;
+
+        let manager = CgroupManager::new().expect("create CgroupManager");
+        let journal_dir = tempfile::tempdir().unwrap();
+        let journal =
+            Journal::open(journal_dir.path().join("j.jsonl"), "test-boot".into()).unwrap();
+        let effector = Effector::new(&manager, &journal, None);
+
+        let abs_path = manager
+            .prepare_cgroup("test-chain-restore", &Limit::default())
+            .expect("create test cgroup");
+        let cgroup = format!(
+            "/{}",
+            abs_path
+                .strip_prefix("/sys/fs/cgroup")
+                .expect("cgroup under /sys/fs/cgroup")
+                .display()
+        );
+
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id();
+        manager
+            .add_to_cgroup(&abs_path, pid)
+            .expect("add sleep to test cgroup");
+
+        let original_high = cgfs::read_high(&cgroup).expect("read initial memory.high");
+        let res = test_resolution(cgroup.clone());
+
+        // Cap first (oldest entry)...
+        effector
+            .apply(&Action::Cap {
+                res: res.clone(),
+                name: "sleep".into(),
+            })
+            .expect("cap");
+        assert_ne!(
+            cgfs::read_high(&cgroup),
+            Some(original_high.clone()),
+            "cap should have changed memory.high"
+        );
+
+        // ...then freeze the same cgroup without ever clearing the Cap
+        // entry — this is the leaked-chain scenario: two coexisting entries,
+        // Freeze newest.
+        effector
+            .apply(&Action::Freeze {
+                res: res.clone(),
+                name: "sleep".into(),
+            })
+            .expect("freeze");
+
+        let entries = journal.entries();
+        assert_eq!(entries.len(), 2, "both Cap and Freeze entries coexist");
+        assert_eq!(entries[0].action, JournalAction::Cap, "Cap is oldest");
+        assert_eq!(entries[1].action, JournalAction::Freeze, "Freeze is newest");
+
+        // Thaw (the action that would naturally follow a Freeze) must still
+        // restore the Cap's prev_high, not skip restoration just because the
+        // newest entry is a Freeze with no memory.high of its own.
+        effector.apply(&Action::Thaw { res }).expect("thaw");
+        assert_eq!(
+            cgfs::read_high(&cgroup),
+            Some(original_high),
+            "thaw must restore the chain's Cap value even though Freeze is the newest entry"
+        );
+        assert!(
+            journal.entries().is_empty(),
+            "both chain entries removed after thaw"
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = manager.cleanup_cgroup("test-chain-restore");
     }
 }
