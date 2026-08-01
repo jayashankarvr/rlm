@@ -2,9 +2,12 @@
 //! `/proc`; no decisions. The parsing is factored into small pure free
 //! functions so it can be unit-tested without touching the filesystem.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::path::Path;
 
+use super::cgfs;
+use super::resolve::{candidate_target, finalize, Resolution};
 use super::types::{ProcInfo, Sample};
 use common::{GuardConfig, BUILTIN_PROTECT};
 
@@ -17,12 +20,29 @@ pub struct Sampler {
     uid: u32,
     /// Precomputed protect-set: builtin names ∪ config additions.
     protect: HashSet<String>,
+    /// `CgroupManager::base_path()` minus the leading `/sys/fs/cgroup`, e.g.
+    /// "/user.slice/user-1000.slice/user@1000.service/rlm". Used to resolve
+    /// raw (non-systemd-unit) rlm cgroups as targets.
+    rlm_base: String,
+}
+
+/// Strip the `/sys/fs/cgroup` prefix from a `CgroupManager::base_path()` so
+/// the result matches the convention `resolve::candidate_target` expects
+/// (paths relative to the cgroupfs root). Pure string manipulation.
+pub fn strip_cgroup_root(base_path: &Path) -> String {
+    base_path
+        .to_str()
+        .and_then(|s| s.strip_prefix("/sys/fs/cgroup"))
+        .unwrap_or_default()
+        .to_string()
 }
 
 impl Sampler {
     /// `self_pid` is the guard's own PID (always excluded). `uid` is the user
-    /// whose processes are eligible.
-    pub fn new(cfg: GuardConfig, self_pid: u32, uid: u32) -> Self {
+    /// whose processes are eligible. `rlm_base` is
+    /// `CgroupManager::base_path()` with the `/sys/fs/cgroup` prefix
+    /// stripped (see [`strip_cgroup_root`]).
+    pub fn new(cfg: GuardConfig, self_pid: u32, uid: u32, rlm_base: String) -> Self {
         // Merge the baked-in protect-list with the user's additions once, up
         // front, so the per-process scan is a cheap hash lookup.
         let mut protect: HashSet<String> =
@@ -34,6 +54,7 @@ impl Sampler {
             self_pid,
             uid,
             protect,
+            rlm_base,
         }
     }
 
@@ -62,6 +83,11 @@ impl Sampler {
     /// config protect-list), `rss_kb >= min_rss_mb * 1024`, excluding the guard
     /// itself. Sorted by `rss_kb` descending. Robust to processes vanishing
     /// mid-scan — any unreadable entry is simply skipped.
+    ///
+    /// Also resolves each surviving process to its freeze/cap target (see
+    /// [`ProcInfo::resolution`]). Resolutions are cached per candidate cgroup
+    /// for the duration of this call, so N processes sharing one cgroup (e.g.
+    /// N Firefox content processes) cost a single member scan.
     pub fn eligible(&self) -> Vec<ProcInfo> {
         let min_rss_kb = self.cfg.selection.min_rss_mb.saturating_mul(1024);
 
@@ -70,6 +96,7 @@ impl Sampler {
             Err(_) => return Vec::new(),
         };
 
+        let mut resolved: HashMap<String, Resolution> = HashMap::new();
         let mut out = Vec::new();
         for entry in entries.flatten() {
             // `/proc/<pid>` directories are named by their numeric PID; skip
@@ -108,21 +135,25 @@ impl Sampler {
             if rss_kb < min_rss_kb {
                 continue;
             }
-            // Protected by builtin defaults or user config (exact, case-sensitive).
-            if self.protect.contains(&pname) {
+            // Protected by builtin defaults or user config. The exe basename
+            // (realpath, full name) is authoritative — it's what avoids the
+            // kernel's 15-char `comm` truncation silently missing
+            // user-configured names like "gnome-control-center". Comm is
+            // kept as a fallback for processes whose /proc/<pid>/exe isn't
+            // readable (e.g. already exited, or a kernel thread).
+            let protected_by_exe =
+                cgfs::exe_basename(pid).is_some_and(|exe| self.protect.contains(&exe));
+            if protected_by_exe || self.protect.contains(&pname) {
                 continue;
             }
 
-            // TODO(task 6): resolve each process to its cgroup (resolve::candidate_target
-            // + finalize) and populate `resolution`. Until that's wired up, everything
-            // is reported as unresolved (`None`), so the policy engine — which now
-            // requires a resolution to select a victim — will never select any process
-            // as an escalation target. Fails closed, not open.
+            let resolution = self.resolve(pid, &mut resolved);
+
             out.push(ProcInfo {
                 pid,
                 name: pname,
                 rss_kb,
-                resolution: None,
+                resolution,
             });
         }
 
@@ -130,6 +161,46 @@ impl Sampler {
         out.sort_by_key(|p| std::cmp::Reverse(p.rss_kb));
         out
     }
+
+    /// Resolve `pid` to its freeze/cap target, if any. `cache` is keyed by
+    /// candidate cgroup so callers in the same eligible-cgroup only pay for
+    /// the member scan once.
+    fn resolve(&self, pid: u32, cache: &mut HashMap<String, Resolution>) -> Option<Resolution> {
+        let cgroup_file = fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
+        let victim_cgroup = parse_cgroup_path(&cgroup_file)?;
+        let candidate = candidate_target(&victim_cgroup, self.uid, &self.rlm_base)?;
+
+        if let Some(cached) = cache.get(&candidate.cgroup) {
+            return Some(cached.clone());
+        }
+
+        let member_exes: Vec<String> = cgfs::pids_in(&candidate.cgroup)
+            .into_iter()
+            .filter_map(|p| cgfs::exe_basename(p).or_else(|| comm_of(p)))
+            .collect();
+
+        let key = candidate.cgroup.clone();
+        let resolution = finalize(candidate, &member_exes, &self.protect);
+        cache.insert(key, resolution.clone());
+        Some(resolution)
+    }
+}
+
+/// Parse the v2 line of /proc/<pid>/cgroup ("0::<path>"). Hybrid-mode lines
+/// for other controllers are noise and skipped.
+pub fn parse_cgroup_path(content: &str) -> Option<String> {
+    content
+        .lines()
+        .find_map(|l| l.strip_prefix("0::").map(|p| p.to_string()))
+}
+
+/// Fallback comm lookup (`Name:` in /proc/<pid>/status) for member processes
+/// whose `/proc/<pid>/exe` isn't readable.
+fn comm_of(pid: u32) -> Option<String> {
+    let status = fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    status
+        .lines()
+        .find_map(|l| l.strip_prefix("Name:").map(|r| r.trim().to_string()))
 }
 
 /// Parse `/proc/pressure/memory`, returning `(some_avg10, full_avg10)`.
@@ -221,6 +292,22 @@ fn first_kb(rest: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- parse_cgroup_path ------------------------------------------------
+
+    #[test]
+    fn cgroup_path_parses_v2_line() {
+        assert_eq!(
+            parse_cgroup_path("0::/user.slice/x.scope\n"),
+            Some("/user.slice/x.scope".into())
+        );
+        // Hybrid line noise is skipped; only the "0::" entry counts.
+        assert_eq!(
+            parse_cgroup_path("1:name=systemd:/foo\n0::/bar\n"),
+            Some("/bar".into())
+        );
+        assert_eq!(parse_cgroup_path(""), None);
+    }
 
     // ---- parse_psi -------------------------------------------------------
 

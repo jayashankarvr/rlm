@@ -681,7 +681,7 @@ fn run_guard(manager: &CgroupManager, action: GuardAction) -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         GuardAction::Test => {
-            guard_test();
+            guard_test(manager);
             Ok(ExitCode::SUCCESS)
         }
     }
@@ -708,7 +708,9 @@ fn current_uid() -> u32 {
 
 fn guard_status(manager: &CgroupManager) {
     let cfg = Config::load().unwrap_or_default();
-    let sampler = rlm_core::guard::Sampler::new(cfg.guard, std::process::id(), current_uid());
+    let rlm_base = rlm_core::guard::sampler::strip_cgroup_root(manager.base_path());
+    let sampler =
+        rlm_core::guard::Sampler::new(cfg.guard, std::process::id(), current_uid(), rlm_base);
 
     match sampler.sample() {
         Some(s) => println!(
@@ -752,14 +754,19 @@ fn guard_status(manager: &CgroupManager) {
     }
 }
 
-fn guard_test() {
+fn guard_test(manager: &CgroupManager) {
     // Single-shot preview: ticks a FRESH engine once at now_ms=0, so it shows
     // what the guard's *first* action would be right now (the escalation gate is
     // open and no prior interventions exist). It does not simulate recovery or
     // cooldown behavior, and applies nothing.
     let cfg = Config::load().unwrap_or_default();
-    let sampler =
-        rlm_core::guard::Sampler::new(cfg.guard.clone(), std::process::id(), current_uid());
+    let rlm_base = rlm_core::guard::sampler::strip_cgroup_root(manager.base_path());
+    let sampler = rlm_core::guard::Sampler::new(
+        cfg.guard.clone(),
+        std::process::id(),
+        current_uid(),
+        rlm_base,
+    );
     let mut engine = rlm_core::guard::PolicyEngine::new(cfg.guard);
 
     let Some(sample) = sampler.sample() else {

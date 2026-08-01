@@ -6,6 +6,7 @@
 //! every intervention so nothing is left frozen.
 
 use common::Config;
+use rlm_core::guard::sampler::strip_cgroup_root;
 use rlm_core::guard::{cgfs, journal_path, Effector, Journal, PolicyEngine, Sampler, SystemdUser};
 use rlm_core::rules::RulesEnforcer;
 use rlm_core::CgroupManager;
@@ -49,7 +50,8 @@ fn run() -> common::Result<()> {
     // cgroupfs writes; SystemdUser::connect() already encodes that.
     let systemd = SystemdUser::connect();
     let effector = Effector::new(&manager, &journal, systemd.as_ref());
-    let sampler = Sampler::new(gcfg.clone(), self_pid, uid);
+    let rlm_base = strip_cgroup_root(manager.base_path());
+    let sampler = Sampler::new(gcfg.clone(), self_pid, uid, rlm_base);
     let mut engine = PolicyEngine::new(gcfg.clone());
 
     // Startup recovery: thaw/clean anything a prior crash left behind so no
