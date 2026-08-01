@@ -123,16 +123,16 @@ Rationale (from the spec — state it in the module doc): an mlocked probe can n
 
 **Measured noise floor** (at default 5s/50ms interval on idle machine, zero memory pressure): over 6 fresh paired trials, the (touch − locked) mean-drift gap exhibited mean ≈ +3.6µs, stdev ≈ 38µs, with individual trial gaps ranging −53 to +43µs. **Note:** these figures are machine-specific; they should be recalibrated for each test environment. Task 5 will use these to mark sub-floor deltas as `suspect: true` (inconclusive).
 
-- [ ] **Step 1: Implement `--mode locked`:**
+- [x] **Step 1: Implement `--mode locked`:**
   - Allocate a small working set (`--working-set-mb`, default 2), write one byte per 4096-byte page to pre-fault it.
   - `mlockall(MCL_CURRENT | MCL_FUTURE)` via `libc`; on `EPERM`/`ENOMEM` (RLIMIT_MEMLOCK too low), print a clear diagnostic naming `ulimit -l` and **exit non-zero** — a silently-unlocked "locked" probe would corrupt the whole comparison.
   - Record `mode: "locked"` and `mlock_ok: true` in the output header line.
-- [ ] **Step 2: Implement `--mode touch`:**
+- [x] **Step 2: Implement `--mode touch`:**
   - Same working set, **not** locked. Each iteration, touch one byte per page across the whole working set, plus read a fixed 1 MB file-backed mapping (`--file <path>`, default: the probe binary itself via `/proc/self/exe`) to keep file pages in play.
   - No mlock.
-- [ ] **Step 3: Write the header line** as the first line of `--out`: `{"label":..,"mode":..,"interval_ms":..,"working_set_mb":..,"mlock_ok":..,"slice":<from --slice-label>}`.
-- [ ] **Step 4: Test** — run both modes for 5s each with no pressure; assert (manually, recorded in the report) that locked-mode `majflt` stays 0 and touch-mode drift is comparable when the machine is idle.
-- [ ] **Step 5: fmt+clippy, commit** `feat(harness): locked-control and touch-treatment probe modes`
+- [x] **Step 3: Write the header line** as the first line of `--out`: `{"label":..,"mode":..,"interval_ms":..,"working_set_mb":..,"mlock_ok":..,"slice":<from --slice-label>}`.
+- [x] **Step 4: Test** — run both modes for 5s each with no pressure; assert (manually, recorded in the report) that locked-mode `majflt` stays 0 and touch-mode drift is comparable when the machine is idle.
+- [x] **Step 5: fmt+clippy, commit** `feat(harness): locked-control and touch-treatment probe modes`
 
 ---
 
