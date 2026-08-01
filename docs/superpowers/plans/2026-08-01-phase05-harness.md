@@ -157,7 +157,7 @@ pub fn parse_psi(body: &str) -> Option<(f64, f64, u64, u64)>; // some_avg10, ful
 pub fn stall_us(first: &PsiSample, last: &PsiSample) -> (u64, u64);
 ```
 
-- [ ] **Step 1: Write failing tests:**
+- [x] **Step 1: Write failing tests:**
 
 ```rust
 #[test]
@@ -189,9 +189,9 @@ fn stall_us_tolerates_counter_reset() {
 }
 ```
 
-- [ ] **Step 2: Run — fail. Implement (`saturating_sub` for the deltas) — pass.**
-- [ ] **Step 3: Add `--psi` mode to `rlm-probe`** that samples `/proc/pressure/memory` (and `/proc/pressure/io` when `--psi-io` is given) at `--interval-ms` and writes `PsiSample` JSON lines. Same no-allocation-in-loop discipline.
-- [ ] **Step 4: fmt+clippy, commit** `feat(harness): PSI sampler with exact counter-delta stall integral`
+- [x] **Step 2: Run — fail. Implement (`saturating_sub` for the deltas) — pass.**
+- [x] **Step 3: Add `--psi` mode to `rlm-probe`** that samples `/proc/pressure/memory` (and `/proc/pressure/io` when `--psi-io` is given) at `--interval-ms` and writes `PsiSample` JSON lines. Same no-allocation-in-loop discipline.
+- [x] **Step 4: fmt+clippy, commit** `feat(harness): PSI sampler with exact counter-delta stall integral`
 
 ---
 
