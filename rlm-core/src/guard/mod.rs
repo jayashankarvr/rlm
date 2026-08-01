@@ -9,6 +9,7 @@ pub mod journal;
 pub mod policy;
 pub mod resolve;
 pub mod sampler;
+pub mod systemd;
 pub mod types;
 
 pub use effector::Effector;
