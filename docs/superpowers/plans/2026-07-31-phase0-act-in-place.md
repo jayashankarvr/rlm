@@ -613,7 +613,7 @@ Behavior (each point is spec, verbatim):
 - `undo_all`: identical replay over live entries (without the legacy sweep), then `clear`.
 - `Notify`: unchanged (`notify-send`, best-effort — replacement is Phase 4).
 
-- [ ] **Step 1: Extract the journal-replay decision into a pure function and test it:**
+- [x] **Step 1: Extract the journal-replay decision into a pure function and test it:**
 
 ```rust
 /// Pure: what to do for one journal entry at restore time.
@@ -634,8 +634,8 @@ fn restore_step_matrix() {
 }
 ```
 
-- [ ] **Step 2: Run — fail. Implement `restore_step` (delegating to `should_restore`) — pass.**
-- [ ] **Step 3: Rewrite `apply`/`sweep_leftovers`/`undo_all` per the behavior list.** Keep `cap_target_bytes`-style pure sizing helper but source it from `anon_swap_bytes`:
+- [x] **Step 2: Run — fail. Implement `restore_step` (delegating to `should_restore`) — pass.**
+- [x] **Step 3: Rewrite `apply`/`sweep_leftovers`/`undo_all` per the behavior list.** Keep `cap_target_bytes`-style pure sizing helper but source it from `anon_swap_bytes`:
 
 ```rust
 pub fn cap_from_anon(anon_swap: Option<u64>) -> u64 {
@@ -650,8 +650,8 @@ fn cap_from_anon_sizes_and_floors() {
 ```
 
   Delete `cap_target_bytes_from_status` and its tests (RSS-of-one-process is the wrong denominator now — spec). Replace the old `#[ignore]` integration test with an act-in-place one: `systemd-run --user --scope --unit=rlm-e2e-<rand> sleep 30`, resolve its cgroup, `apply(Freeze)`, assert `cgfs::read_frozen == Some(true)` and the journal has one entry, `apply(Thaw)`, assert thawed + journal empty.
-- [ ] **Step 4: `cargo test -p rlm-core` — all pass. fmt+clippy.**
-- [ ] **Step 5: Commit** `feat(guard): act-in-place effector — write-ahead journal, D-Bus freeze with raw fallback, mechanism-independent restore`
+- [x] **Step 4: `cargo test -p rlm-core` — all pass. fmt+clippy.**
+- [x] **Step 5: Commit** `feat(guard): act-in-place effector — write-ahead journal, D-Bus freeze with raw fallback, mechanism-independent restore`
 
 ---
 

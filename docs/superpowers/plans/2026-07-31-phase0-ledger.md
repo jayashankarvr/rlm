@@ -28,3 +28,8 @@ Task 6: minor (deferred): page-align test is belt-and-braces, not pinpoint (reco
 Task 6: minor (deferred): RestoreStep::ThawAndRestoreHigh{to} payload vestigial — collapse to unit variant
 Task 6: minor (deferred): restore_high_if_any judges liveness on newest entry only ([Cap,Freeze] chain edge)
 Task 6: minor (deferred): page_align_down returns 0 for bytes<page — add .max(page) insurance (memory.high=0 would be catastrophic)
+Task 6: fix round 2/5 (1 addressed, 0 open — atomic Journal::replace; commits 4ec8aac..52523a1)
+Task 6: complete (commits 8a0cc3c..52523a1, review clean after 2 fix rounds; full ignored suite live-verified twice)
+Task 6: minor (deferred): reconcile is belt-and-braces not total guarantee (crash-before-replace leaves SkipRemove cap, logged)
+Task 6: minor (deferred): entries_for/replace TOCTOU under hypothetical multi-threaded caller
+Task 6: minor (deferred): Journal::replace lacks debug_assert that entries belong to cgroup
