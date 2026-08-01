@@ -37,6 +37,7 @@
 
 pub mod proc_parse;
 pub mod psi;
+pub mod runner;
 
 /// Which half of the probe pair this process instance is.
 #[derive(

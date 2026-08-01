@@ -11,11 +11,16 @@ publish = false
 name = "rlm-probe"
 path = "src/bin/rlm-probe.rs"
 
+[[bin]]
+name = "rlm-harness"
+path = "src/bin/rlm-harness.rs"
+
 [dependencies]
 serde.workspace = true
 serde_json = "1"
 clap.workspace = true
 libc = "0.2.178"
+ctrlc.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
