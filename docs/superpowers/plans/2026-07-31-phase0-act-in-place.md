@@ -458,7 +458,7 @@ Implementation notes for the engineer:
 - The connection is created once in `connect()` (pre-storm) and reused. `Connection::session()` blocking variant.
 - `set_memory_high` body: `conn.call_method(Some("org.freedesktop.systemd1"), "/org/freedesktop/systemd1", Some("org.freedesktop.systemd1.Manager"), "SetUnitProperties", &(unit, true, vec![("MemoryHigh", zbus::zvariant::Value::from(bytes))]))` — exact zvariant signature is `(sba(sv))`; the implementer should confirm against zbus docs/compile errors.
 
-- [ ] **Step 1: Write the one pure test** (timeout wrapper) plus an `#[ignore]` live test:
+- [x] **Step 1: Write the one pure test** (timeout wrapper) plus an `#[ignore]` live test:
 
 ```rust
 #[test]
@@ -471,9 +471,9 @@ fn freeze_thaw_transient_unit_roundtrip() {
 }
 ```
 
-- [ ] **Step 2: Implement `SystemdUser` as specified. `cargo build -p rlm-core` clean.**
-- [ ] **Step 3: Manual verification (once, by the reviewer):** `systemd-run --user --unit=rlm-dbus-test sleep 30`, then `cargo test -p rlm-core --ignored freeze_thaw_transient_unit_roundtrip`. Confirm via `systemctl --user status rlm-dbus-test` that the unit froze/thawed.
-- [ ] **Step 4: fmt+clippy. Commit** `feat(guard): blocking systemd user-bus client with hard call timeouts`
+- [x] **Step 2: Implement `SystemdUser` as specified. `cargo build -p rlm-core` clean.**
+- [x] **Step 3: Manual verification (once, by the reviewer):** `systemd-run --user --unit=rlm-dbus-test sleep 30`, then `cargo test -p rlm-core --ignored freeze_thaw_transient_unit_roundtrip`. Confirm via `systemctl --user status rlm-dbus-test` that the unit froze/thawed.
+- [x] **Step 4: fmt+clippy. Commit** `feat(guard): blocking systemd user-bus client with hard call timeouts`
 
 ---
 

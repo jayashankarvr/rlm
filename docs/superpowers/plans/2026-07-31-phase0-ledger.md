@@ -12,3 +12,6 @@ Task 3: minor (deferred): temp filename pid-reuse collision (cosmetic)
 Task 3: reviewer cannot-verify (track at integration): daemon call pattern single-threaded?; cgfs read_high trim consistency vs our_high string equality in should_restore
 Task 3: fix round 1/5 (2 addressed, 0 open — WAL tail recovery + mutation lock/unique temp names; commits 692bd86..9439119)
 Task 3: complete (commits e05d7c2..9439119, review clean after 1 fix round)
+Task 4: complete (commits 35ad886..8f4788e, review clean first pass; live freeze/thaw roundtrip verified via journalctl)
+Task 4: minor (deferred): run_with_timeout maps Disconnected(panic) to "timed out" message (systemd.rs ~1304)
+Task 4: minor (deferred): D-Bus errors reuse Error::Cgroup variant; revisit if branches grow
