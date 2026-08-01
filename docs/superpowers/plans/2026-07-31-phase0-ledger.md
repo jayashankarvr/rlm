@@ -18,3 +18,7 @@ Task 4: minor (deferred): D-Bus errors reuse Error::Cgroup variant; revisit if b
 Task 5: complete (commits a97b196..8b59c41, review clean first pass; effector stopgap graded non-destructive+inert)
 Task 5: CARRY-FORWARD to Task 6 (Important): dead-prune LiftCap must also thaw (or emit Thaw+LiftCap for Frozen) — a still-frozen cgroup that transiently fails to resolve must never be dropped from tracking while frozen
 Task 5: note: plan test unresolvable_process_is_never_selected corrected in substance (Notify fires at High regardless); plan text had a bug
+Task 6: implemented aa08663; review round 1 (opus) — Critical: kernel page-truncation defeats should_restore equality (every cap permanent); Critical: lift ordering raw-restore-then-u64::MAX clobbers user MemoryHigh; Important: single-entry replay + remove-all leaks coexisting entries. All empirically verified. Fix dispatched to impl-task6.
+Task 6: minor (deferred): inode unwrap_or(0) poison value — Cap in that state never lifted (effector.rs:95,145)
+Task 6: minor (deferred): Journal::open failure silently fatal at daemon startup; boot_id "" self-matches (main.rs:47, cgfs.rs:83)
+Task 6: spec errata (mine): carry-forward #2 "byte-identical" unachievable vs page-truncation; "additionally set u64::MAX" ambiguous ordering — plan text was the root cause of both Criticals
