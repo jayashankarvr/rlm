@@ -5,6 +5,7 @@
 
 pub mod cgfs;
 pub mod effector;
+pub mod journal;
 pub mod policy;
 pub mod resolve;
 pub mod sampler;

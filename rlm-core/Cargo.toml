@@ -10,3 +10,8 @@ common.workspace = true
 dirs.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+serde.workspace = true
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"
