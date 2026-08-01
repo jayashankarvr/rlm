@@ -215,7 +215,12 @@ impl<'a> Effector<'a> {
     /// the cap becomes permanent (Task 6 review, Critical #1). Rebuilds
     /// only this cgroup's entries, preserving any others that might coexist
     /// (Important #3), with `written`'s `our_high` corrected to the
-    /// read-back value.
+    /// read-back value. Uses `Journal::replace` (a single atomic rewrite),
+    /// not a separate `remove` then `append`: the latter has a window where
+    /// the cgroup has no journal record at all, so a crash/SIGKILL/append
+    /// failure right there would leave a permanent, unrecoverable cap —
+    /// exactly the invariant the journal exists to prevent (Task 6 review,
+    /// fix round 2).
     fn reconcile_our_high(&self, written: &JournalEntry) {
         let cgroup: &str = &written.cgroup;
         let Some(actual) = cgfs::read_high(cgroup) else {
@@ -228,21 +233,15 @@ impl<'a> Effector<'a> {
             cgroup = %cgroup, journaled = ?written.our_high, actual = %actual,
             "memory.high on disk differs from what we journaled; correcting journal entry"
         );
-        let mut entries = self.journal.entries();
+        let mut entries = self.entries_for(cgroup);
         let Some(pos) = entries.iter().rposition(|e| e == written) else {
             // Already removed/replaced by something else (e.g. a concurrent
             // Thaw/LiftCap) — nothing left to correct.
             return;
         };
         entries[pos].our_high = Some(actual);
-        if let Err(e) = self.journal.remove(cgroup) {
-            tracing::warn!(cgroup = %cgroup, error = %e, "failed to remove stale journal entry during our_high correction");
-            return;
-        }
-        for e in entries.iter().filter(|e| e.cgroup == cgroup) {
-            if let Err(e2) = self.journal.append(e) {
-                tracing::warn!(cgroup = %cgroup, error = %e2, "failed to re-append journal entry during our_high correction");
-            }
+        if let Err(e) = self.journal.replace(cgroup, &entries) {
+            tracing::warn!(cgroup = %cgroup, error = %e, "failed to correct journal entry (atomic replace)");
         }
     }
 

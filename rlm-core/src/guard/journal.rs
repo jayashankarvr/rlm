@@ -243,6 +243,28 @@ impl Journal {
         Ok(())
     }
 
+    /// Atomically swap all entries for `cgroup` with `entries` (an empty
+    /// slice removes them), in a single rewrite — every other cgroup's
+    /// entries are preserved untouched. Unlike a separate `remove` followed
+    /// by `append`, there is no window where the on-disk journal has fewer
+    /// (or zero) records for `cgroup` than reality: the old and new entries
+    /// for `cgroup` are swapped in one `write_entries` call under the
+    /// mutation lock, so a crash either lands before (old entries intact)
+    /// or after (new entries intact) — never in between.
+    pub fn replace(&self, cgroup: &str, entries: &[JournalEntry]) -> common::Result<()> {
+        let _guard = self.mutation_lock.lock().unwrap();
+
+        let mut all: Vec<JournalEntry> = self
+            .entries()
+            .into_iter()
+            .filter(|e| e.cgroup != cgroup)
+            .collect();
+        all.extend(entries.iter().cloned());
+
+        self.write_entries(&all)?;
+        Ok(())
+    }
+
     /// Rewrite the journal with a new set of entries (atomic: temp file + rename + fsync).
     fn write_entries(&self, entries: &[JournalEntry]) -> common::Result<()> {
         let parent = self
@@ -357,6 +379,59 @@ mod tests {
         let e = j.entries();
         assert_eq!(e.len(), 1);
         assert_eq!(e[0].cgroup, "/x/b");
+    }
+
+    /// Task 6 review, fix round 2: `replace` must swap only the target
+    /// cgroup's entries in one atomic rewrite — another cgroup's entry is
+    /// left byte-for-byte untouched, and everything survives a re-open
+    /// under the same boot_id (proving it's durably on disk, not just
+    /// in-memory).
+    #[test]
+    fn replace_swaps_only_target_cgroup_atomically() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("j.jsonl");
+        let j = Journal::open(p.clone(), "boot-a".into()).unwrap();
+        j.append(&entry("/x")).unwrap();
+        j.append(&entry("/y")).unwrap();
+
+        let mut corrected = entry("/x");
+        corrected.our_high = Some("corrected".into());
+        j.replace("/x", &[corrected]).unwrap();
+
+        let entries = j.entries();
+        assert_eq!(entries.len(), 2, "one entry per cgroup, as before");
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.cgroup == "/y" && e == &entry("/y")),
+            "y's entry must be byte-for-byte untouched: {entries:?}"
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.cgroup == "/x" && e.our_high.as_deref() == Some("corrected")),
+            "x's entry must be replaced with the corrected value: {entries:?}"
+        );
+
+        drop(j);
+        let j2 = Journal::open(p, "boot-a".into()).unwrap();
+        assert_eq!(
+            j2.entries().len(),
+            2,
+            "both entries still readable after re-open with the same boot_id"
+        );
+    }
+
+    #[test]
+    fn replace_with_empty_slice_removes_the_cgroup() {
+        let dir = tempfile::tempdir().unwrap();
+        let j = Journal::open(dir.path().join("j.jsonl"), "b".into()).unwrap();
+        j.append(&entry("/x")).unwrap();
+        j.append(&entry("/y")).unwrap();
+        j.replace("/x", &[]).unwrap();
+        let e = j.entries();
+        assert_eq!(e.len(), 1);
+        assert_eq!(e[0].cgroup, "/y");
     }
 
     #[test]
