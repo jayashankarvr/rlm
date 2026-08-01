@@ -5,8 +5,44 @@
 //! any other workspace crate: the harness must be able to measure a machine
 //! where rlm is not installed at all, since that is the control arm of
 //! every comparison it produces.
+//!
+//! ## Why the probe runs as a pair, not a single process
+//!
+//! An mlocked probe can never major-fault — its pages are pinned resident by
+//! `mlockall`, so it cannot measure residency pressure at all. An unlocked
+//! probe's drift, on the other hand, conflates two different delays: time
+//! spent waiting for a runqueue slot (scheduling) and time spent blocked on
+//! a major fault (reclaim/refault). No single process can measure both the
+//! scheduling-only baseline and the memory-induced component, because
+//! locking out faults to measure scheduling cleanly is exactly what removes
+//! the thing the treatment arm needs to expose.
+//!
+//! So the harness always runs a **pair**: [`ProbeMode::Locked`] is the
+//! scheduling-only control (never major-faults by construction), and
+//! [`ProbeMode::Touch`] is the treatment that actively re-touches its
+//! working set and stays eligible for eviction. `touch − locked` isolates
+//! the memory-induced component of stall — that difference is the number
+//! later phases are judged on.
 
 pub mod proc_parse;
+
+/// Which half of the probe pair this process instance is.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum ProbeMode {
+    /// Scheduling-only control: working set is pre-faulted then `mlockall`'d
+    /// (`MCL_CURRENT | MCL_FUTURE`), so it can never major-fault. Its drift
+    /// is scheduling delay only.
+    Locked,
+    /// Memory-pressure treatment: same working set, not locked, re-touched
+    /// (write) every tick, plus a small file-backed mapping re-touched
+    /// (read) every tick to keep file pages in play. Its drift conflates
+    /// scheduling delay with fault delay; `touch − locked` recovers the
+    /// fault-delay component.
+    Touch,
+}
 
 /// One measurement sample from the probe's sleep loop.
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]

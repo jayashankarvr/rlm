@@ -11,13 +11,117 @@
 //! iteration (`String::clear()` then `File::read_to_string`, since
 //! `read_to_string` appends rather than overwrites). No formatting or
 //! logging happens inside the loop; all output is written after it ends.
+//!
+//! ## Modes
+//!
+//! `--mode locked` is the scheduling-only control: its working set is
+//! pre-faulted and then `mlockall`'d, so it can never major-fault. `--mode
+//! touch` is the treatment: the same working set, left unlocked and
+//! actively re-touched every tick (plus a small file-backed mapping), so it
+//! stays eligible for eviction and refault under pressure. One process
+//! cannot measure both signals — see the crate-level doc in `lib.rs` for
+//! why — so the harness runs this pair and takes the difference.
 
 use clap::Parser;
 use harness::proc_parse::{parse_majflt, parse_schedstat_wait_ns};
-use harness::Tick;
+use harness::{ProbeMode, Tick};
 use std::fs::File;
 use std::io::{BufWriter, Read, Write};
+use std::os::unix::io::AsRawFd;
 use std::time::{Duration, Instant};
+
+/// Working-set and file-mapping touches operate one byte per page: enough
+/// to force the kernel to resolve (and, if evicted, refault) each page,
+/// without formatting or allocating.
+const PAGE_SIZE: usize = 4096;
+
+/// A fixed-size, read-only mapping of (a prefix of) a file, used by
+/// `--mode touch` to keep file-backed pages in play alongside the
+/// anonymous working set.
+struct FileMapping {
+    ptr: *mut libc::c_void,
+    len: usize,
+}
+
+impl FileMapping {
+    fn as_slice(&self) -> &[u8] {
+        // SAFETY: `ptr` is a valid PROT_READ/MAP_PRIVATE mapping of `len`
+        // bytes, established by `mmap` in `map_file` and unmapped only in
+        // `Drop`, so it stays valid for the lifetime of this borrow.
+        unsafe { std::slice::from_raw_parts(self.ptr as *const u8, self.len) }
+    }
+}
+
+impl Drop for FileMapping {
+    fn drop(&mut self) {
+        // SAFETY: `ptr`/`len` are exactly the region returned by the
+        // `mmap` call that created this mapping.
+        unsafe {
+            libc::munmap(self.ptr, self.len);
+        }
+    }
+}
+
+/// Map up to 1 MiB of `path` read-only, `MAP_PRIVATE`. The file descriptor
+/// does not need to outlive the call: once `mmap` succeeds, the mapping is
+/// independent of the fd.
+fn map_file(path: &str) -> std::io::Result<FileMapping> {
+    let file = File::open(path)?;
+    let file_len = file.metadata()?.len();
+    let len = std::cmp::min(file_len, 1024 * 1024).max(1) as usize;
+
+    let ptr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            len,
+            libc::PROT_READ,
+            libc::MAP_PRIVATE,
+            file.as_raw_fd(),
+            0,
+        )
+    };
+    if ptr == libc::MAP_FAILED {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(FileMapping { ptr, len })
+}
+
+/// Touch (write) one byte per page of `bytes`. Uses `write_volatile`
+/// rather than a plain slice write: a plain repeated write with no
+/// subsequent read is a no-observable-effect store the compiler is
+/// licensed to eliminate across loop iterations, which would silently
+/// turn this into a no-op and stop pre-faulting/re-touching anything.
+fn touch_pages_write(bytes: &mut [u8]) {
+    for page_start in (0..bytes.len()).step_by(PAGE_SIZE) {
+        unsafe {
+            std::ptr::write_volatile(bytes.as_mut_ptr().add(page_start), 0u8);
+        }
+    }
+}
+
+/// Touch (read) one byte per page of `bytes`. `read_volatile` for the same
+/// reason as `touch_pages_write`: an unused plain read is eligible for
+/// elimination, and eliminating it would defeat the point of re-touching
+/// file pages every tick.
+fn touch_pages_read(bytes: &[u8]) {
+    for page_start in (0..bytes.len()).step_by(PAGE_SIZE) {
+        unsafe {
+            std::ptr::read_volatile(bytes.as_ptr().add(page_start));
+        }
+    }
+}
+
+/// `mlockall(MCL_CURRENT | MCL_FUTURE)` — pins every page currently mapped
+/// and every page mapped in the future, so a `locked`-mode probe can never
+/// major-fault.
+fn try_mlockall() -> std::io::Result<()> {
+    let ret = unsafe { libc::mlockall(libc::MCL_CURRENT | libc::MCL_FUTURE) };
+    if ret != 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "rlm-probe")]
@@ -30,15 +134,38 @@ struct Args {
     #[arg(long, default_value_t = 60)]
     duration_s: u64,
 
-    /// Output path for JSON-lines of `Tick`.
+    /// Output path for JSON-lines: a header object on line 1, then one
+    /// `Tick` object per subsequent line.
     #[arg(long)]
     out: String,
 
-    /// Free-text label for this probe instance, carried into later report
-    /// tooling (not written by Task 1's bare loop, but parsed now so the
-    /// CLI surface is stable across tasks).
+    /// Free-text label for this probe instance, carried into the header
+    /// and later report tooling.
     #[arg(long, default_value = "")]
     label: String,
+
+    /// Which half of the probe pair to run: `locked` (scheduling-only
+    /// control) or `touch` (memory-pressure treatment).
+    #[arg(long, value_enum)]
+    mode: ProbeMode,
+
+    /// Size of the anonymous working set, in mebibytes. Pre-faulted before
+    /// the loop in both modes; `locked` pins it with `mlockall`, `touch`
+    /// re-touches it every tick.
+    #[arg(long, default_value_t = 2)]
+    working_set_mb: u64,
+
+    /// File to memory-map (up to 1 MiB) and re-touch every tick in
+    /// `--mode touch`, to keep file-backed pages in play alongside the
+    /// anonymous working set. Ignored in `--mode locked`.
+    #[arg(long, default_value = "/proc/self/exe")]
+    file: String,
+
+    /// Free-text label for the cgroup slice this probe was placed under
+    /// (set by the runner; not read from `/proc` by the probe itself).
+    /// Carried into the header as `slice`.
+    #[arg(long, default_value = "")]
+    slice_label: String,
 }
 
 fn main() {
@@ -66,6 +193,51 @@ fn main() {
         },
     );
 
+    // Anonymous working set, common to both modes. Pre-fault it (one byte
+    // per page) here, before the loop and before `mlockall`, so neither
+    // mode's first tick measures its own first-touch faults, and so that
+    // `mlockall` (locked mode) has nothing left to fault in.
+    let mut working_set = vec![0u8; (args.working_set_mb as usize) * 1024 * 1024];
+    touch_pages_write(&mut working_set);
+
+    // Mode-specific setup. `locked` must exit non-zero if it cannot
+    // actually lock — a silently-unlocked "locked" probe would corrupt the
+    // whole comparison by measuring the same thing as the treatment arm.
+    let mlock_ok = match args.mode {
+        ProbeMode::Locked => {
+            if let Err(e) = try_mlockall() {
+                eprintln!(
+                    "error: mlockall(MCL_CURRENT | MCL_FUTURE) failed: {e}\n\
+                     The locked-mode control probe requires every page to stay \
+                     resident so it can never major-fault; this almost always \
+                     means RLIMIT_MEMLOCK is too low for this user. Check it \
+                     with `ulimit -l` and raise it (e.g. `ulimit -l unlimited`, \
+                     or LimitMEMLOCK=infinity under systemd), then retry."
+                );
+                std::process::exit(1);
+            }
+            true
+        }
+        ProbeMode::Touch => false,
+    };
+
+    let file_mapping = match args.mode {
+        ProbeMode::Touch => match map_file(&args.file) {
+            Ok(mapping) => {
+                // Warm up the mapping before the loop for the same reason
+                // the working set is pre-faulted: the first tick shouldn't
+                // pay for this probe's own setup.
+                touch_pages_read(mapping.as_slice());
+                Some(mapping)
+            }
+            Err(e) => {
+                eprintln!("error: failed to mmap --file {}: {e}", args.file);
+                std::process::exit(1);
+            }
+        },
+        ProbeMode::Locked => None,
+    };
+
     // Buffers reused every iteration; cleared, never reallocated.
     let mut schedstat_buf = String::with_capacity(256);
     let mut stat_buf = String::with_capacity(512);
@@ -86,6 +258,18 @@ fn main() {
         let now = Instant::now();
         if next_wake > now {
             std::thread::sleep(next_wake - now);
+        }
+
+        // Touch mode's whole point: pages that are NOT locked can be
+        // reclaimed between ticks, so re-touching them here is what makes
+        // this mode's drift/majflt sensitive to memory pressure. This
+        // touches only pre-allocated memory — no allocation, no
+        // formatting, no logging.
+        if args.mode == ProbeMode::Touch {
+            touch_pages_write(&mut working_set);
+            if let Some(mapping) = &file_mapping {
+                touch_pages_read(mapping.as_slice());
+            }
         }
 
         let actual_elapsed = start.elapsed();
@@ -154,8 +338,18 @@ fn main() {
     let out_file = File::create(&args.out).expect("create --out file");
     let mut writer = BufWriter::new(out_file);
 
-    // Write header/summary line with failure counts.
+    // Header line (line 1 of --out): one object carrying both this task's
+    // probe-identity fields and Task 1's parse-failure counters. Every
+    // subsequent line is a `Tick` — downstream tooling parses against
+    // that "line 1 is the header" contract, so there is exactly one
+    // header line, never two.
     let header = serde_json::json!({
+        "label": args.label,
+        "mode": args.mode,
+        "interval_ms": args.interval_ms,
+        "working_set_mb": args.working_set_mb,
+        "mlock_ok": mlock_ok,
+        "slice": args.slice_label,
         "schedstat_failures": schedstat_failures,
         "majflt_failures": majflt_failures,
     });
