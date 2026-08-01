@@ -38,3 +38,4 @@ Task 7: minor (deferred): comm_of duplicates Name: parsing from parse_proc_statu
 Task 7: spec errata (mine): task-1/7 brief text "every process in the candidate cgroup" should read "in the candidate cgroup's SUBTREE" — freeze is hierarchical
 Task 7: fix round 1/5 (2 addressed, 0 open — cgfs::pids_under recursive scan + Option rlm_base fail-closed; commits be16f2c..47915cc; re-reviewer live-ran nested-cgroup test independently)
 Task 7: complete (commits afd6a76..47915cc, review clean after 1 fix round)
+Task 8: implemented de2bcef; review round 1 — Critical: CLI Journal::open mutates cross-process (TOCTOU recover_tail can drop live daemon entry); Minor: false "read-only" comment. Fix dispatched (Journal::read_entries).
