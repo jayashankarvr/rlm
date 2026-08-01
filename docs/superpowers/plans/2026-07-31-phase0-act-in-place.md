@@ -334,7 +334,7 @@ pub fn should_restore(e: &JournalEntry, current_inode: Option<u64>, current_high
 
 File format: line 1 `{"boot_id":"<id>"}`, then one `JournalEntry` JSON per line.
 
-- [ ] **Step 1: Write failing tests** (use `tempfile::tempdir()`):
+- [x] **Step 1: Write failing tests** (use `tempfile::tempdir()`):
 
 ```rust
 fn entry(cg: &str) -> JournalEntry {
@@ -409,8 +409,8 @@ fn should_restore_guards() {
 }
 ```
 
-- [ ] **Step 2: Run — compile failure.**
-- [ ] **Step 3: Implement.** `append`: `OpenOptions::new().append(true)`, `serde_json::to_string`, `writeln!`, then `f.sync_data()?` before `Ok(())`. `open`: read first line, compare boot_id, on mismatch/absence write fresh header + `sync_data`. `remove`/`clear`: write temp file in same dir, `sync_data`, `fs::rename`, fsync parent dir best-effort. `should_restore`:
+- [x] **Step 2: Run — compile failure.**
+- [x] **Step 3: Implement.** `append`: `OpenOptions::new().append(true)`, `serde_json::to_string`, `writeln!`, then `f.sync_data()?` before `Ok(())`. `open`: read first line, compare boot_id, on mismatch/absence write fresh header + `sync_data`. `remove`/`clear`: write temp file in same dir, `sync_data`, `fs::rename`, fsync parent dir best-effort. `should_restore`:
 
 ```rust
 pub fn should_restore(e: &JournalEntry, current_inode: Option<u64>, current_high: Option<&str>) -> bool {
@@ -422,8 +422,8 @@ pub fn should_restore(e: &JournalEntry, current_inode: Option<u64>, current_high
 }
 ```
 
-- [ ] **Step 4: `cargo test -p rlm-core journal` — pass. fmt+clippy.**
-- [ ] **Step 5: Commit** `feat(guard): write-ahead restore journal with boot-id, inode, and value guards`
+- [x] **Step 4: `cargo test -p rlm-core journal` — pass. fmt+clippy.**
+- [x] **Step 5: Commit** `feat(guard): write-ahead restore journal with boot-id, inode, and value guards`
 
 ---
 
