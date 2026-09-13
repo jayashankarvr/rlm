@@ -152,6 +152,20 @@ auto-thaw), then soft-cap it (`memory.high`, never an OOM-kill), then lift
 everything once memory is calm again. It only ever acts on your own processes
 and protects your desktop session, shells, and audio (configurable).
 
+The guard acts **in place**: it freezes or caps the cgroup an application
+already lives in — its systemd scope, so the whole process tree is covered, not
+just one PID — and never moves processes between cgroups. Where a scope also
+holds something protected (a shell sharing a terminal's scope, say), it caps
+instead of freezing rather than pausing your terminal. Interventions go through
+systemd over D-Bus where possible, with a direct cgroup write as fallback.
+
+Every intervention is recorded in a write-ahead journal
+(`~/.local/state/rlm/guard-journal.jsonl`) *before* it is applied, so a crash or
+`kill -9` can't leave an application frozen or throttled: the daemon replays the
+journal on startup and restores the original state. The record is keyed to the
+boot and to the cgroup's identity, so it never restores into a cgroup that has
+since been recreated for something else.
+
 ```bash
 rlm guard enable    # enable + start the user service (systemctl --user)
 rlm guard status    # current pressure + active interventions

@@ -81,7 +81,7 @@ Semantics (from the spec, verbatim):
 - Under rlm_base: the target is `rlm_base/<first child component>`; `unit = None`, `Mechanism::Raw`.
 - `finalize`: any member exe in `protect` → `Verdict::CapOnly` + `Coverage::Partial` (safety over coverage; never freeze a protected process's cgroup). Otherwise `Freeze` + `Full`.
 
-- [ ] **Step 1: Write failing tests** in `resolve.rs` `#[cfg(test)]`:
+- [x] **Step 1: Write failing tests** in `resolve.rs` `#[cfg(test)]`:
 
 ```rust
 const RLM: &str = "/user.slice/user-1000.slice/user@1000.service/rlm";
@@ -180,8 +180,8 @@ fn finalize_protected_member_degrades_to_caponly_partial() {
 }
 ```
 
-- [ ] **Step 2: Run `cargo test -p rlm-core resolve` — expect compile failure (module missing).**
-- [ ] **Step 3: Implement:**
+- [x] **Step 2: Run `cargo test -p rlm-core resolve` — expect compile failure (module missing).**
+- [x] **Step 3: Implement:**
 
 ```rust
 pub fn candidate_target(victim_cgroup: &str, uid: u32, rlm_base: &str) -> Option<Candidate> {
@@ -217,8 +217,8 @@ pub fn finalize(c: Candidate, member_exes: &[String], protect: &HashSet<String>)
 }
 ```
 
-- [ ] **Step 4: `cargo test -p rlm-core resolve` — all pass. `cargo fmt && cargo clippy`.**
-- [ ] **Step 5: Commit** `feat(guard): pure resolve_target — permitted roots, verdict, coverage, mechanism`
+- [x] **Step 4: `cargo test -p rlm-core resolve` — all pass. `cargo fmt && cargo clippy`.**
+- [x] **Step 5: Commit** `feat(guard): pure resolve_target — permitted roots, verdict, coverage, mechanism`
 
 ---
 
@@ -248,7 +248,7 @@ pub fn parse_frozen(events: &str) -> Option<bool>;
 pub fn parse_anon(stat: &str) -> Option<u64>;
 ```
 
-- [ ] **Step 1: Write failing tests for the pure parsers:**
+- [x] **Step 1: Write failing tests for the pure parsers:**
 
 ```rust
 #[test]
@@ -266,8 +266,8 @@ fn parse_anon_reads_memory_stat() {
 }
 ```
 
-- [ ] **Step 2: Run — compile failure.**
-- [ ] **Step 3: Implement.** IO functions are thin wrappers (`fs::read_to_string(abs(cg).join("cgroup.events"))` etc.); `anon_swap_bytes` = `parse_anon(memory.stat)? + memory.swap.current.trim().parse().unwrap_or(0)`; `write_*` map io errors through the crate's existing error type (see `cgroup.rs` for the pattern — `RlmError::CgroupWrite` or nearest equivalent); `dir_inode` uses `fs::metadata(abs(cg)).ok()?.ino()` (`use std::os::unix::fs::MetadataExt`).
+- [x] **Step 2: Run — compile failure.**
+- [x] **Step 3: Implement.** IO functions are thin wrappers (`fs::read_to_string(abs(cg).join("cgroup.events"))` etc.); `anon_swap_bytes` = `parse_anon(memory.stat)? + memory.swap.current.trim().parse().unwrap_or(0)`; `write_*` map io errors through the crate's existing error type (see `cgroup.rs` for the pattern — `RlmError::CgroupWrite` or nearest equivalent); `dir_inode` uses `fs::metadata(abs(cg)).ok()?.ino()` (`use std::os::unix::fs::MetadataExt`).
 
 ```rust
 pub fn parse_frozen(events: &str) -> Option<bool> {
@@ -282,8 +282,8 @@ pub fn parse_anon(stat: &str) -> Option<u64> {
 }
 ```
 
-- [ ] **Step 4: `cargo test -p rlm-core cgfs` — pass. fmt+clippy.**
-- [ ] **Step 5: Commit** `feat(guard): cgroupfs helpers — frozen state, memory.high, anon+swap, inode, boot id`
+- [x] **Step 4: `cargo test -p rlm-core cgfs` — pass. fmt+clippy.**
+- [x] **Step 5: Commit** `feat(guard): cgroupfs helpers — frozen state, memory.high, anon+swap, inode, boot id`
 
 ---
 
@@ -334,7 +334,7 @@ pub fn should_restore(e: &JournalEntry, current_inode: Option<u64>, current_high
 
 File format: line 1 `{"boot_id":"<id>"}`, then one `JournalEntry` JSON per line.
 
-- [ ] **Step 1: Write failing tests** (use `tempfile::tempdir()`):
+- [x] **Step 1: Write failing tests** (use `tempfile::tempdir()`):
 
 ```rust
 fn entry(cg: &str) -> JournalEntry {
@@ -409,8 +409,8 @@ fn should_restore_guards() {
 }
 ```
 
-- [ ] **Step 2: Run — compile failure.**
-- [ ] **Step 3: Implement.** `append`: `OpenOptions::new().append(true)`, `serde_json::to_string`, `writeln!`, then `f.sync_data()?` before `Ok(())`. `open`: read first line, compare boot_id, on mismatch/absence write fresh header + `sync_data`. `remove`/`clear`: write temp file in same dir, `sync_data`, `fs::rename`, fsync parent dir best-effort. `should_restore`:
+- [x] **Step 2: Run — compile failure.**
+- [x] **Step 3: Implement.** `append`: `OpenOptions::new().append(true)`, `serde_json::to_string`, `writeln!`, then `f.sync_data()?` before `Ok(())`. `open`: read first line, compare boot_id, on mismatch/absence write fresh header + `sync_data`. `remove`/`clear`: write temp file in same dir, `sync_data`, `fs::rename`, fsync parent dir best-effort. `should_restore`:
 
 ```rust
 pub fn should_restore(e: &JournalEntry, current_inode: Option<u64>, current_high: Option<&str>) -> bool {
@@ -422,8 +422,8 @@ pub fn should_restore(e: &JournalEntry, current_inode: Option<u64>, current_high
 }
 ```
 
-- [ ] **Step 4: `cargo test -p rlm-core journal` — pass. fmt+clippy.**
-- [ ] **Step 5: Commit** `feat(guard): write-ahead restore journal with boot-id, inode, and value guards`
+- [x] **Step 4: `cargo test -p rlm-core journal` — pass. fmt+clippy.**
+- [x] **Step 5: Commit** `feat(guard): write-ahead restore journal with boot-id, inode, and value guards`
 
 ---
 
@@ -458,7 +458,7 @@ Implementation notes for the engineer:
 - The connection is created once in `connect()` (pre-storm) and reused. `Connection::session()` blocking variant.
 - `set_memory_high` body: `conn.call_method(Some("org.freedesktop.systemd1"), "/org/freedesktop/systemd1", Some("org.freedesktop.systemd1.Manager"), "SetUnitProperties", &(unit, true, vec![("MemoryHigh", zbus::zvariant::Value::from(bytes))]))` — exact zvariant signature is `(sba(sv))`; the implementer should confirm against zbus docs/compile errors.
 
-- [ ] **Step 1: Write the one pure test** (timeout wrapper) plus an `#[ignore]` live test:
+- [x] **Step 1: Write the one pure test** (timeout wrapper) plus an `#[ignore]` live test:
 
 ```rust
 #[test]
@@ -471,9 +471,9 @@ fn freeze_thaw_transient_unit_roundtrip() {
 }
 ```
 
-- [ ] **Step 2: Implement `SystemdUser` as specified. `cargo build -p rlm-core` clean.**
-- [ ] **Step 3: Manual verification (once, by the reviewer):** `systemd-run --user --unit=rlm-dbus-test sleep 30`, then `cargo test -p rlm-core --ignored freeze_thaw_transient_unit_roundtrip`. Confirm via `systemctl --user status rlm-dbus-test` that the unit froze/thawed.
-- [ ] **Step 4: fmt+clippy. Commit** `feat(guard): blocking systemd user-bus client with hard call timeouts`
+- [x] **Step 2: Implement `SystemdUser` as specified. `cargo build -p rlm-core` clean.**
+- [x] **Step 3: Manual verification (once, by the reviewer):** `systemd-run --user --unit=rlm-dbus-test sleep 30`, then `cargo test -p rlm-core --ignored freeze_thaw_transient_unit_roundtrip`. Confirm via `systemctl --user status rlm-dbus-test` that the unit froze/thawed.
+- [x] **Step 4: fmt+clippy. Commit** `feat(guard): blocking systemd user-bus client with hard call timeouts`
 
 ---
 
@@ -514,7 +514,7 @@ Engine changes (policy.rs):
 - `Verdict::CapOnly` → emit `Cap`, never `Freeze`, regardless of cooldown state.
 - **Partial-coverage gate shortening (spec):** add field `last_action_partial: bool`. The escalation gate uses `gate_ms = if self.last_action_partial { 0 } else { freeze_hold_ms }` — after acting with `Coverage::Partial`, the gate is open again on the next tick.
 
-- [ ] **Step 1: Update existing policy tests to build `ProcInfo` with resolutions** (test helper below) and add the two new behaviors:
+- [x] **Step 1: Update existing policy tests to build `ProcInfo` with resolutions** (test helper below) and add the two new behaviors:
 
 ```rust
 fn res(cg: &str) -> Resolution {
@@ -573,9 +573,9 @@ fn two_pids_same_scope_yield_one_intervention() {
 
 (Helpers `freeze_targets`/`has_cap_target`/`has_freeze_target` mirror the old pid-based ones but match on `res.cgroup`.)
 
-- [ ] **Step 2: Run — compile failures across policy tests. Mechanically migrate every existing test** (each `proc(pid, name, rss)` becomes `proc_at(pid, name, rss, "/app.slice/app-<name>-<pid>.scope")` so distinct pids keep distinct targets and every existing behavioral assertion — hysteresis, cooldown-cap, calm-hold lift, gate, dead-prune, notify — is preserved against cgroup-keyed state).
-- [ ] **Step 3: Implement the engine changes. All policy tests pass.**
-- [ ] **Step 4: fmt+clippy. Commit** `feat(guard): policy engine acts on resolved cgroups — CapOnly verdicts, Partial gate shortening`
+- [x] **Step 2: Run — compile failures across policy tests. Mechanically migrate every existing test** (each `proc(pid, name, rss)` becomes `proc_at(pid, name, rss, "/app.slice/app-<name>-<pid>.scope")` so distinct pids keep distinct targets and every existing behavioral assertion — hysteresis, cooldown-cap, calm-hold lift, gate, dead-prune, notify — is preserved against cgroup-keyed state).
+- [x] **Step 3: Implement the engine changes. All policy tests pass.**
+- [x] **Step 4: fmt+clippy. Commit** `feat(guard): policy engine acts on resolved cgroups — CapOnly verdicts, Partial gate shortening`
 
 ---
 
@@ -613,7 +613,7 @@ Behavior (each point is spec, verbatim):
 - `undo_all`: identical replay over live entries (without the legacy sweep), then `clear`.
 - `Notify`: unchanged (`notify-send`, best-effort — replacement is Phase 4).
 
-- [ ] **Step 1: Extract the journal-replay decision into a pure function and test it:**
+- [x] **Step 1: Extract the journal-replay decision into a pure function and test it:**
 
 ```rust
 /// Pure: what to do for one journal entry at restore time.
@@ -634,8 +634,8 @@ fn restore_step_matrix() {
 }
 ```
 
-- [ ] **Step 2: Run — fail. Implement `restore_step` (delegating to `should_restore`) — pass.**
-- [ ] **Step 3: Rewrite `apply`/`sweep_leftovers`/`undo_all` per the behavior list.** Keep `cap_target_bytes`-style pure sizing helper but source it from `anon_swap_bytes`:
+- [x] **Step 2: Run — fail. Implement `restore_step` (delegating to `should_restore`) — pass.**
+- [x] **Step 3: Rewrite `apply`/`sweep_leftovers`/`undo_all` per the behavior list.** Keep `cap_target_bytes`-style pure sizing helper but source it from `anon_swap_bytes`:
 
 ```rust
 pub fn cap_from_anon(anon_swap: Option<u64>) -> u64 {
@@ -650,8 +650,8 @@ fn cap_from_anon_sizes_and_floors() {
 ```
 
   Delete `cap_target_bytes_from_status` and its tests (RSS-of-one-process is the wrong denominator now — spec). Replace the old `#[ignore]` integration test with an act-in-place one: `systemd-run --user --scope --unit=rlm-e2e-<rand> sleep 30`, resolve its cgroup, `apply(Freeze)`, assert `cgfs::read_frozen == Some(true)` and the journal has one entry, `apply(Thaw)`, assert thawed + journal empty.
-- [ ] **Step 4: `cargo test -p rlm-core` — all pass. fmt+clippy.**
-- [ ] **Step 5: Commit** `feat(guard): act-in-place effector — write-ahead journal, D-Bus freeze with raw fallback, mechanism-independent restore`
+- [x] **Step 4: `cargo test -p rlm-core` — all pass. fmt+clippy.**
+- [x] **Step 5: Commit** `feat(guard): act-in-place effector — write-ahead journal, D-Bus freeze with raw fallback, mechanism-independent restore`
 
 ---
 
@@ -682,10 +682,10 @@ fn cgroup_path_parses_v2_line() {
 }
 ```
 
-- [ ] **Step 1: Write `parse_cgroup_path` tests — fail — implement — pass.**
-- [ ] **Step 2: Implement protect-by-exe + resolution assembly.** Update `Sampler::new` callers (`guard/src/main.rs`, `cli` guard test path if it constructs one — grep `Sampler::new`).
-- [ ] **Step 3: `cargo test --workspace` — pass. fmt+clippy.**
-- [ ] **Step 4: Commit** `feat(guard): sampler resolves targets and matches protect-list on exe basename`
+- [x] **Step 1: Write `parse_cgroup_path` tests — fail — implement — pass.**
+- [x] **Step 2: Implement protect-by-exe + resolution assembly.** Update `Sampler::new` callers (`guard/src/main.rs`, `cli` guard test path if it constructs one — grep `Sampler::new`).
+- [x] **Step 3: `cargo test --workspace` — pass. fmt+clippy.**
+- [x] **Step 4: Commit** `feat(guard): sampler resolves targets and matches protect-list on exe basename`
 
 ---
 
@@ -710,9 +710,9 @@ pub fn journal_path() -> std::path::PathBuf {
 }
 ```
 
-- [ ] **Step 1: Make the deletions and let the compiler drive the migration; update `rules.rs` tests (drop `guard_held` args).**
-- [ ] **Step 2: `cargo test --workspace` — pass; `cargo build --release` — clean. fmt+clippy.**
-- [ ] **Step 3: Commit** `refactor(guard)!: delete guard-<pid> migration machinery; rules read kernel frozen state; status reads journal`
+- [x] **Step 1: Make the deletions and let the compiler drive the migration; update `rules.rs` tests (drop `guard_held` args).**
+- [x] **Step 2: `cargo test --workspace` — pass; `cargo build --release` — clean. fmt+clippy.**
+- [x] **Step 3: Commit** `refactor(guard)!: delete guard-<pid> migration machinery; rules read kernel frozen state; status reads journal`
 
 ---
 
@@ -728,7 +728,7 @@ pub fn journal_path() -> std::path::PathBuf {
 - [ ] **Step 3:** Observe via `journalctl --user -u rlm-guard -f`: freeze targets the **scope**, not a `guard-<pid>`. `systemd-cgls --user-unit app.slice` confirms the hog never left `rlm-gate-hog.scope`.
 - [ ] **Step 4:** After thaw: `cat .../rlm-gate-hog.scope/memory.high` == original value (`max` unless capped and lifted). Journal file empty of live entries.
 - [ ] **Step 5:** Repeat, and mid-freeze `kill -9 $(pgrep rlm-guard)`; restart the daemon; confirm the sweep thaws the scope and restores `memory.high`. **This is the gate criterion — paste the journalctl excerpt into the commit message.**
-- [ ] **Step 6:** Docs edits; `cargo fmt && cargo clippy && cargo test --workspace` final. Commit `docs(guard): act-in-place notes; Phase 0 gate transcript`
+- [x] **Step 6:** Docs edits; `cargo fmt && cargo clippy && cargo test --workspace` final. Commit `docs(guard): act-in-place notes; Phase 0 gate transcript`
 
 ---
 

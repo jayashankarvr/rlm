@@ -2,9 +2,12 @@
 //! `/proc`; no decisions. The parsing is factored into small pure free
 //! functions so it can be unit-tested without touching the filesystem.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::path::Path;
 
+use super::cgfs;
+use super::resolve::{candidate_target, finalize, Resolution};
 use super::types::{ProcInfo, Sample};
 use common::{GuardConfig, BUILTIN_PROTECT};
 
@@ -17,12 +20,40 @@ pub struct Sampler {
     uid: u32,
     /// Precomputed protect-set: builtin names ∪ config additions.
     protect: HashSet<String>,
+    /// `CgroupManager::base_path()` minus the leading `/sys/fs/cgroup`, e.g.
+    /// "/user.slice/user-1000.slice/user@1000.service/rlm". Used to resolve
+    /// raw (non-systemd-unit) rlm cgroups as targets. `None` means the strip
+    /// failed (see [`strip_cgroup_root`]) — resolution assembly is disabled
+    /// entirely rather than risk a bogus permissive match (see [`Sampler::resolve`]).
+    rlm_base: Option<String>,
+}
+
+/// Strip the `/sys/fs/cgroup` prefix from a `CgroupManager::base_path()` so
+/// the result matches the convention `resolve::candidate_target` expects
+/// (paths relative to the cgroupfs root). Pure string manipulation.
+///
+/// Returns `None` if `base_path` isn't valid UTF-8 or doesn't start with
+/// `/sys/fs/cgroup` — that's a broken invariant (base_path always comes from
+/// `CgroupManager`, which is hardcoded to build under `/sys/fs/cgroup`), and
+/// callers must fail closed rather than substitute an empty string: an empty
+/// `rlm_base` makes `candidate_target`'s raw-cgroup prefix check `""` (i.e.
+/// "/"), which matches almost every absolute cgroup path as a bogus Raw
+/// candidate — the dangerous direction for a freeze decision.
+pub fn strip_cgroup_root(base_path: &Path) -> Option<String> {
+    base_path
+        .to_str()?
+        .strip_prefix("/sys/fs/cgroup")
+        .map(str::to_string)
 }
 
 impl Sampler {
     /// `self_pid` is the guard's own PID (always excluded). `uid` is the user
-    /// whose processes are eligible.
-    pub fn new(cfg: GuardConfig, self_pid: u32, uid: u32) -> Self {
+    /// whose processes are eligible. `rlm_base` is
+    /// `CgroupManager::base_path()` with the `/sys/fs/cgroup` prefix
+    /// stripped (see [`strip_cgroup_root`]); `None` disables resolution
+    /// assembly entirely (fail closed — every process reports `resolution:
+    /// None`, so the policy engine can never select an escalation victim).
+    pub fn new(cfg: GuardConfig, self_pid: u32, uid: u32, rlm_base: Option<String>) -> Self {
         // Merge the baked-in protect-list with the user's additions once, up
         // front, so the per-process scan is a cheap hash lookup.
         let mut protect: HashSet<String> =
@@ -34,6 +65,7 @@ impl Sampler {
             self_pid,
             uid,
             protect,
+            rlm_base,
         }
     }
 
@@ -62,6 +94,11 @@ impl Sampler {
     /// config protect-list), `rss_kb >= min_rss_mb * 1024`, excluding the guard
     /// itself. Sorted by `rss_kb` descending. Robust to processes vanishing
     /// mid-scan — any unreadable entry is simply skipped.
+    ///
+    /// Also resolves each surviving process to its freeze/cap target (see
+    /// [`ProcInfo::resolution`]). Resolutions are cached per candidate cgroup
+    /// for the duration of this call, so N processes sharing one cgroup (e.g.
+    /// N Firefox content processes) cost a single member scan.
     pub fn eligible(&self) -> Vec<ProcInfo> {
         let min_rss_kb = self.cfg.selection.min_rss_mb.saturating_mul(1024);
 
@@ -70,6 +107,7 @@ impl Sampler {
             Err(_) => return Vec::new(),
         };
 
+        let mut resolved: HashMap<String, Resolution> = HashMap::new();
         let mut out = Vec::new();
         for entry in entries.flatten() {
             // `/proc/<pid>` directories are named by their numeric PID; skip
@@ -108,15 +146,25 @@ impl Sampler {
             if rss_kb < min_rss_kb {
                 continue;
             }
-            // Protected by builtin defaults or user config (exact, case-sensitive).
-            if self.protect.contains(&pname) {
+            // Protected by builtin defaults or user config. The exe basename
+            // (realpath, full name) is authoritative — it's what avoids the
+            // kernel's 15-char `comm` truncation silently missing
+            // user-configured names like "gnome-control-center". Comm is
+            // kept as a fallback for processes whose /proc/<pid>/exe isn't
+            // readable (e.g. already exited, or a kernel thread).
+            let protected_by_exe =
+                cgfs::exe_basename(pid).is_some_and(|exe| self.protect.contains(&exe));
+            if protected_by_exe || self.protect.contains(&pname) {
                 continue;
             }
+
+            let resolution = self.resolve(pid, &mut resolved);
 
             out.push(ProcInfo {
                 pid,
                 name: pname,
                 rss_kb,
+                resolution,
             });
         }
 
@@ -124,6 +172,119 @@ impl Sampler {
         out.sort_by_key(|p| std::cmp::Reverse(p.rss_kb));
         out
     }
+
+    /// Every cgroup currently resolved for one of the user's own, live
+    /// processes — deliberately with **no** min-RSS or protect filtering
+    /// applied (unlike [`Sampler::eligible`]). This is a liveness signal,
+    /// not an escalation candidate list: `PolicyEngine::tick` prunes its
+    /// interventions against this set rather than against `eligible()`'s
+    /// filtered output, because a successful `Cap` sizes off anon+swap while
+    /// `memory.high` also bounds file-backed pages — capping a
+    /// mapped-file-heavy process can push its `rss_kb` below the min-RSS
+    /// floor on the very next tick even though the cgroup, and the process
+    /// in it, are both still very much alive (D2 fix).
+    ///
+    /// Deliberately calls [`candidate_target`] directly rather than
+    /// `Self::resolve`: `resolve` (via `finalize`) additionally runs a
+    /// recursive `cgfs::pids_under` tree walk plus a `readlink
+    /// /proc/<pid>/exe` per member to compute `verdict`/`coverage`, neither
+    /// of which this function uses — only `candidate.cgroup` (`finalize`
+    /// passes `candidate.cgroup` through unchanged into `Resolution::cgroup`,
+    /// so the output is identical). Because this function has no min-RSS
+    /// filter (that's the D2 fix above), it runs for every one of the user's
+    /// processes on every tick, not just the heavy ones, so the member-scan
+    /// work `resolve` does is pure waste here (NEW-3 fix).
+    pub fn live_cgroups(&self) -> HashSet<String> {
+        let mut live = HashSet::new();
+
+        let Some(rlm_base) = self.rlm_base.as_deref() else {
+            return live;
+        };
+
+        let Ok(entries) = fs::read_dir("/proc") else {
+            return live;
+        };
+        for entry in entries.flatten() {
+            let file_name = entry.file_name();
+            let Some(name) = file_name.to_str() else {
+                continue;
+            };
+            let Ok(pid) = name.parse::<u32>() else {
+                continue;
+            };
+            if pid == self.self_pid {
+                continue;
+            }
+
+            let Ok(status) = fs::read_to_string(format!("/proc/{pid}/status")) else {
+                continue;
+            };
+            let Some((owner_uid, _, _)) = parse_proc_status(&status) else {
+                continue;
+            };
+            if owner_uid != self.uid {
+                continue;
+            }
+
+            let Ok(cgroup_file) = fs::read_to_string(format!("/proc/{pid}/cgroup")) else {
+                continue;
+            };
+            let Some(victim_cgroup) = parse_cgroup_path(&cgroup_file) else {
+                continue;
+            };
+            if let Some(candidate) = candidate_target(&victim_cgroup, self.uid, rlm_base) {
+                live.insert(candidate.cgroup);
+            }
+        }
+        live
+    }
+
+    /// Resolve `pid` to its freeze/cap target, if any. `cache` is keyed by
+    /// candidate cgroup so callers in the same eligible-cgroup only pay for
+    /// the member scan once. Returns `None` outright if `rlm_base` failed to
+    /// compute at startup — see [`strip_cgroup_root`].
+    fn resolve(&self, pid: u32, cache: &mut HashMap<String, Resolution>) -> Option<Resolution> {
+        let rlm_base = self.rlm_base.as_deref()?;
+        let cgroup_file = fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
+        let victim_cgroup = parse_cgroup_path(&cgroup_file)?;
+        let candidate = candidate_target(&victim_cgroup, self.uid, rlm_base)?;
+
+        if let Some(cached) = cache.get(&candidate.cgroup) {
+            return Some(cached.clone());
+        }
+
+        // Recursive: a protected process nested in a child cgroup (shell in
+        // a terminal scope's descendant, nested systemd-run, app-created
+        // sub-cgroup) is still within the freeze/stop blast radius, so it
+        // must be visible to the protect check even though it isn't a
+        // direct member of the candidate cgroup itself.
+        let member_exes: Vec<String> = cgfs::pids_under(&candidate.cgroup)
+            .into_iter()
+            .filter_map(|p| cgfs::exe_basename(p).or_else(|| comm_of(p)))
+            .collect();
+
+        let key = candidate.cgroup.clone();
+        let resolution = finalize(candidate, &member_exes, &self.protect);
+        cache.insert(key, resolution.clone());
+        Some(resolution)
+    }
+}
+
+/// Parse the v2 line of /proc/<pid>/cgroup ("0::<path>"). Hybrid-mode lines
+/// for other controllers are noise and skipped.
+pub fn parse_cgroup_path(content: &str) -> Option<String> {
+    content
+        .lines()
+        .find_map(|l| l.strip_prefix("0::").map(|p| p.to_string()))
+}
+
+/// Fallback comm lookup (`Name:` in /proc/<pid>/status) for member processes
+/// whose `/proc/<pid>/exe` isn't readable.
+fn comm_of(pid: u32) -> Option<String> {
+    let status = fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    status
+        .lines()
+        .find_map(|l| l.strip_prefix("Name:").map(|r| r.trim().to_string()))
 }
 
 /// Parse `/proc/pressure/memory`, returning `(some_avg10, full_avg10)`.
@@ -215,6 +376,22 @@ fn first_kb(rest: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- parse_cgroup_path ------------------------------------------------
+
+    #[test]
+    fn cgroup_path_parses_v2_line() {
+        assert_eq!(
+            parse_cgroup_path("0::/user.slice/x.scope\n"),
+            Some("/user.slice/x.scope".into())
+        );
+        // Hybrid line noise is skipped; only the "0::" entry counts.
+        assert_eq!(
+            parse_cgroup_path("1:name=systemd:/foo\n0::/bar\n"),
+            Some("/bar".into())
+        );
+        assert_eq!(parse_cgroup_path(""), None);
+    }
 
     // ---- parse_psi -------------------------------------------------------
 

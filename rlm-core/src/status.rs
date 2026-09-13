@@ -1,3 +1,4 @@
+use crate::cgroup::UNLIMIT_CGROUP_NAME;
 use crate::CgroupManager;
 use common::Result;
 use std::fs;
@@ -39,7 +40,7 @@ pub fn get_managed_processes(manager: &CgroupManager) -> Result<Vec<ProcessStatu
         };
 
         // Skip the "unlimit" cgroup (holds released processes)
-        if cgroup_name == "unlimit" {
+        if cgroup_name == UNLIMIT_CGROUP_NAME {
             continue;
         }
 

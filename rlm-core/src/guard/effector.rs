@@ -1,63 +1,109 @@
-//! Executes [`Action`]s against real cgroups via [`CgroupManager`]. Every action
-//! is best-effort and logged; a failure must never panic or otherwise crash the
-//! daemon loop. `apply` may return `Err` so the caller can log it, but a missing
-//! `notify-send` (or any other notification failure) is never treated as an error.
+//! Executes [`Action`]s against real cgroups, acting in place on the cgroup a
+//! process already lives in (a systemd unit's scope/service, or an existing
+//! rlm rule cgroup) rather than moving it into an ephemeral `guard-<pid>`
+//! cgroup. Every action is best-effort and logged; a failure must never
+//! panic or otherwise crash the daemon loop. `apply` may return `Err` so the
+//! caller can log it, but a missing `notify-send` (or any other notification
+//! failure) is never treated as an error.
+//!
+//! # Write-ahead journal
+//! Freeze/Cap always `journal.append` (which fsyncs) *before* touching the
+//! cgroup, so a crash between the two still leaves a durable record that
+//! startup recovery (`sweep_leftovers`) can replay. `Journal` is internally
+//! mutex-serialized (see `journal.rs`), and the daemon calls into this
+//! `Effector` from a single thread (the tick loop in `rlm-guard`'s `main`),
+//! so `Effector` just holds a `&Journal` and relies on the daemon's
+//! single-threaded call discipline plus the journal's own internal locking
+//! for safety — it adds no locking of its own.
+//!
+//! # Mechanism: systemd unit vs. raw cgroupfs
+//! When a target resolved to a systemd unit (`Mechanism::Unit`), we prefer
+//! the D-Bus call (`FreezeUnit`/`ThawUnit`/`SetUnitProperties`) with a hard
+//! 2s timeout (`systemd::SystemdUser`'s own enforced deadline); on `Err` (bus
+//! unavailable, call failed, or timed out) we fall back to the raw cgroupfs
+//! primitives in `cgfs`. Raw-mechanism targets (rlm's own rule cgroups) skip
+//! the D-Bus attempt entirely. Thawing is mechanism-independent: we always
+//! attempt `ThawUnit` best-effort *and* always perform the raw
+//! `cgroup.freeze` write afterward, unconditionally — this guarantees a
+//! cgroup is never left frozen just because the D-Bus call "succeeded" on a
+//! stale unit, and tolerates a missing cgroup (the raw write simply errors
+//! and we move on).
+//!
+//! # Restoring `memory.high`
+//! The kernel truncates `memory.high` writes to page multiples, so the byte
+//! count we cap to is page-aligned *before* we journal/write it
+//! ([`page_align_down`]); as a second line of defense, [`Effector::cap`]
+//! reads `memory.high` back after writing and self-corrects the journal if
+//! reality still differs (e.g. a systemd-side reformat via the D-Bus path).
+//! Restoring on `LiftCap`/replay always clears systemd's runtime
+//! `MemoryHigh` property *before* raw-writing `prev_high` back — the other
+//! order lets systemd's own `"max"` write clobber the value we just
+//! restored. If more than one journal entry ever coexists for the same
+//! cgroup (a leak from an incomplete prior removal), every restore path
+//! treats them as one chain: liveness is judged against the chain's `Cap`
+//! entry specifically (only a `Cap` has a `memory.high` to restore — a
+//! `Freeze` entry does not, so judging against `entries.last()` when it
+//! happens to be a newer `Freeze` would wrongly look like "nothing to
+//! restore" and strand `memory.high` at the guard's value forever), and the
+//! value restored is always the *oldest* `Cap` entry's `prev_high` — the
+//! true pre-intervention value, not an intermediate entry's `prev_high`
+//! (which is just our own previous `our_high`). See [`restore_target`].
+//! Liveness, however, is judged against the *newest* `Cap` entry, not the
+//! oldest: entries are strictly appended, so a later Cap's write always
+//! supersedes an earlier one's on disk, and `should_restore`'s string
+//! comparison must match what's actually there. See [`restore_decision`].
 
+use super::cgfs;
+use super::journal::{should_restore, Journal, JournalAction, JournalEntry};
+use super::resolve::{Mechanism, Resolution};
+use super::systemd::SystemdUser;
 use super::types::Action;
 use crate::CgroupManager;
 use common::Result;
 use std::process::Command;
+use std::time::Duration;
 
-/// Fallback soft-cap when a process's RSS can't be read or is implausibly small.
-/// 64 MiB is low enough to apply real pressure yet high enough to avoid pinning
-/// a process into a thrash loop.
+/// Fallback/floor soft-cap when a cgroup's anon+swap usage can't be read or
+/// is implausibly small. 64 MiB is low enough to apply real pressure yet
+/// high enough to avoid pinning a process into a thrash loop.
 const MIN_CAP_BYTES: u64 = 64 * 1024 * 1024;
 
-/// Fraction of current RSS we cap a process to via `memory.high`. Capping just
-/// below the working set forces reclaim/throttle without an OOM-kill.
-const CAP_FRACTION_NUM: u64 = 9;
-const CAP_FRACTION_DEN: u64 = 10;
+/// Hard deadline for every D-Bus call on the freeze-guard's storm path. On
+/// `Err` (including a timeout) callers fall back to raw cgroupfs writes.
+const DBUS_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Applies guard actions using the hardened cgroup primitives on
-/// [`CgroupManager`] (`freeze_pid`, `thaw_pid`, `soft_cap_pid`, `lift_cap_pid`,
-/// `cleanup_guard`, `list_guard_pids`, `sweep_guard_leftovers`).
+/// Applies guard [`Action`]s in place on the resolved target cgroup, via the
+/// systemd-unit D-Bus path (with raw-cgroup fallback) and a write-ahead
+/// [`Journal`] for crash-safe restore.
 pub struct Effector<'a> {
+    /// Kept only for the legacy `guard-<pid>` sweep during the upgrade path
+    /// (see [`Effector::sweep_leftovers`]); acting in place no longer uses it.
     manager: &'a CgroupManager,
+    journal: &'a Journal,
+    systemd: Option<&'a SystemdUser>,
 }
 
 impl<'a> Effector<'a> {
-    pub fn new(manager: &'a CgroupManager) -> Self {
-        Self { manager }
+    pub fn new(
+        manager: &'a CgroupManager,
+        journal: &'a Journal,
+        systemd: Option<&'a SystemdUser>,
+    ) -> Self {
+        Self {
+            manager,
+            journal,
+            systemd,
+        }
     }
 
     /// Apply a single action. Best-effort: returns `Err` only so the caller can
     /// log it (a [`Action::Notify`] always returns `Ok`).
     pub fn apply(&self, action: &Action) -> Result<()> {
         match action {
-            Action::Freeze { pid, name } => {
-                tracing::info!(pid, name = %name, "freezing process");
-                self.manager.freeze_pid(*pid)
-            }
-            Action::Thaw { pid } => {
-                tracing::info!(pid, "thawing process");
-                self.manager.thaw_pid(*pid)
-            }
-            Action::Cap { pid, name } => {
-                let high_bytes = cap_target_bytes(*pid);
-                tracing::info!(pid, name = %name, high_bytes, "soft-capping process");
-                self.manager.soft_cap_pid(*pid, high_bytes)
-            }
-            Action::LiftCap { pid } => {
-                tracing::info!(pid, "lifting cap and tearing down guard cgroup");
-                // LiftCap doubles as full teardown: lift the cap, then clean up
-                // the `guard-<pid>` cgroup. A cleanup failure is non-fatal (the
-                // startup sweep will mop up any leftover), so it's only logged.
-                let res = self.manager.lift_cap_pid(*pid);
-                if let Err(e) = self.manager.cleanup_guard(*pid) {
-                    tracing::warn!(pid, error = %e, "guard cleanup after lift_cap failed");
-                }
-                res
-            }
+            Action::Freeze { res, name } => self.freeze(res, name),
+            Action::Thaw { res } => self.thaw(res),
+            Action::Cap { res, name } => self.cap(res, name),
+            Action::LiftCap { res } => self.lift_cap(res),
             Action::Notify { message } => {
                 notify(message);
                 // Notification is always best-effort and never fails the caller.
@@ -66,69 +112,497 @@ impl<'a> Effector<'a> {
         }
     }
 
-    /// Startup recovery: thaw + clean any leftover `guard-*` cgroups from a
-    /// prior crash so no process is left frozen.
-    pub fn sweep_leftovers(&self) -> Result<()> {
-        self.manager.sweep_guard_leftovers()
-    }
+    fn freeze(&self, res: &Resolution, name: &str) -> Result<()> {
+        // The inode is the guard that lets a later restore tell "this is
+        // still the same cgroup" from "this cgroup was torn down and
+        // recreated" (`should_restore`). `unwrap_or(0)` used to substitute a
+        // poison sentinel here: 0 is never a real inode, so the guard could
+        // never match again and the entry became permanently unrestorable —
+        // yet it was still journaled-and-acted-on, then later cleared and
+        // logged as if it were an intentional skip (Promoted Minor A). Fail
+        // closed instead: refuse to freeze at all rather than act with a
+        // record we can never safely restore from.
+        let Some(inode) = cgfs::dir_inode(&res.cgroup) else {
+            tracing::warn!(
+                cgroup = %res.cgroup, name,
+                "cannot read cgroup inode; refusing to freeze (would be unrestorable)"
+            );
+            return Err(common::Error::Cgroup(format!(
+                "cannot read inode for {}; refusing to freeze",
+                res.cgroup
+            )));
+        };
+        let entry = JournalEntry {
+            cgroup: res.cgroup.clone(),
+            inode,
+            unit: res.unit.clone(),
+            action: JournalAction::Freeze,
+            prev_high: None,
+            our_high: None,
+        };
+        // Write-ahead: the entry must be durable (journal.append fsyncs)
+        // before we ever touch the cgroup, so a crash between the two still
+        // leaves a record startup recovery can act on.
+        self.journal.append(&entry)?;
 
-    /// Graceful shutdown: thaw everything and lift all caps. Each step is
-    /// best-effort and logged; one failing pid never aborts the rest.
-    pub fn undo_all(&self) -> Result<()> {
-        for pid in self.manager.list_guard_pids() {
-            if let Err(e) = self.manager.thaw_pid(pid) {
-                tracing::warn!(pid, error = %e, "undo_all: thaw failed");
-            }
-            if let Err(e) = self.manager.lift_cap_pid(pid) {
-                tracing::warn!(pid, error = %e, "undo_all: lift_cap failed");
-            }
-            if let Err(e) = self.manager.cleanup_guard(pid) {
-                tracing::warn!(pid, error = %e, "undo_all: cleanup failed");
+        tracing::info!(cgroup = %res.cgroup, name, "freezing cgroup");
+        if res.mechanism == Mechanism::Unit {
+            if let (Some(unit), Some(systemd)) = (&res.unit, self.systemd) {
+                match systemd.freeze_unit(unit, DBUS_TIMEOUT) {
+                    Ok(()) => return Ok(()),
+                    Err(e) => tracing::warn!(
+                        cgroup = %res.cgroup, unit, error = %e,
+                        "FreezeUnit failed; falling back to raw cgroup.freeze"
+                    ),
+                }
             }
         }
-        // Loudly surface any residue: a guard cgroup still present here means a
-        // process may remain throttled/frozen until the next startup sweep.
-        let remaining = self.manager.list_guard_pids();
-        if !remaining.is_empty() {
-            tracing::error!(
-                ?remaining,
-                "undo_all: guard cgroups could not be fully cleaned; \
-                 affected processes may stay constrained until rlm-guard restarts"
+        cgfs::write_freeze(&res.cgroup, true)
+    }
+
+    fn thaw(&self, res: &Resolution) -> Result<()> {
+        tracing::info!(cgroup = %res.cgroup, "thawing cgroup");
+        // Gather any coexisting entries for this cgroup first: a `Thaw`
+        // action reverses a Frozen intervention, but if a Cap entry ever
+        // leaked alongside it (Important #3, Task 6 review) we must still
+        // restore its memory.high before wiping the journal record below,
+        // not just drop it silently.
+        let entries = self.entries_for(&res.cgroup);
+        let result = self.thaw_raw(&res.cgroup, res.unit.as_deref());
+        if let Err(e) = &result {
+            tracing::debug!(cgroup = %res.cgroup, error = %e, "raw thaw failed (cgroup may already be gone)");
+        }
+        self.restore_high_if_any(&res.cgroup, &entries);
+        self.journal.remove(&res.cgroup)?;
+        result
+    }
+
+    fn cap(&self, res: &Resolution, name: &str) -> Result<()> {
+        // See `freeze`'s matching comment (Promoted Minor A): a `0` inode
+        // sentinel here would make this Cap permanently unrestorable while
+        // looking like a real guard, so fail closed instead of
+        // journal-and-act with an unrestorable record.
+        let Some(inode) = cgfs::dir_inode(&res.cgroup) else {
+            tracing::warn!(
+                cgroup = %res.cgroup, name,
+                "cannot read cgroup inode; refusing to cap (would be unrestorable)"
+            );
+            return Err(common::Error::Cgroup(format!(
+                "cannot read inode for {}; refusing to cap",
+                res.cgroup
+            )));
+        };
+        let prev_high = cgfs::read_high(&res.cgroup);
+        // rlm sets memory.swap.max=0 on every cgroup it creates (see
+        // cgroup.rs's set_memory_limit), which makes anon unreclaimable
+        // there: an anon-derived memory.high target can demand a reduction
+        // the kernel cannot satisfy, degrading the soft cap into an
+        // unbounded allocator stall (memory.high never OOM-kills). Detect
+        // that up front so `cap_target` can floor the demand to what file
+        // reclaim alone can satisfy.
+        let can_swap = cgfs::can_reclaim_anon(&res.cgroup);
+        if !can_swap {
+            tracing::warn!(
+                cgroup = %res.cgroup, name,
+                "memory.swap.max=0 on this cgroup; anon is unreclaimable, \
+                 flooring the soft cap to what file-page reclaim can satisfy"
             );
         }
-        Ok(())
-    }
-}
+        // The kernel truncates `memory.high` writes to page multiples, so we
+        // must journal/write the value it will actually store — not the raw
+        // target — or `should_restore`'s string-equality check can never
+        // pass again and the cap becomes permanent (Task 6 review,
+        // Critical #1).
+        let our_bytes = page_align_down(
+            cap_target(
+                cgfs::anon_swap_bytes(&res.cgroup),
+                cgfs::current_bytes(&res.cgroup),
+                cgfs::file_bytes(&res.cgroup),
+                can_swap,
+            ),
+            page_size(),
+        );
+        // Plain decimal bytes, no separators/whitespace: this must be
+        // exactly what a later `cgfs::read_high` (which only trims
+        // whitespace off the raw file contents) returns. `u64::to_string()`
+        // never inserts separators, so the round trip through `write_high`
+        // (writes verbatim) -> `read_high` (trims) is exact once the value
+        // is page-aligned. See `our_high_string_is_plain_decimal_no_separators`
+        // below, and `reconcile_our_high` for the belt-and-braces check.
+        let our_high = our_bytes.to_string();
 
-/// Read the current RSS of `pid` from `/proc/<pid>/status` and derive the
-/// `memory.high` soft-cap target. On any read failure we fall back to the
-/// minimum cap so the action still applies pressure.
-fn cap_target_bytes(pid: u32) -> u64 {
-    match std::fs::read_to_string(format!("/proc/{pid}/status")) {
-        Ok(status) => cap_target_bytes_from_status(&status),
-        Err(e) => {
-            tracing::warn!(pid, error = %e, "could not read /proc/<pid>/status; using min cap");
-            MIN_CAP_BYTES
+        let entry = JournalEntry {
+            cgroup: res.cgroup.clone(),
+            inode,
+            unit: res.unit.clone(),
+            action: JournalAction::Cap,
+            prev_high,
+            our_high: Some(our_high.clone()),
+        };
+        self.journal.append(&entry)?;
+
+        tracing::info!(cgroup = %res.cgroup, name, our_high = %our_high, "soft-capping cgroup");
+        let result = if res.mechanism == Mechanism::Unit {
+            match (&res.unit, self.systemd) {
+                (Some(unit), Some(systemd)) => {
+                    match systemd.set_memory_high(unit, our_bytes, DBUS_TIMEOUT) {
+                        Ok(()) => Ok(()),
+                        Err(e) => {
+                            tracing::warn!(
+                                cgroup = %res.cgroup, unit, error = %e,
+                                "SetUnitProperties(MemoryHigh) failed; falling back to raw memory.high write"
+                            );
+                            cgfs::write_high(&res.cgroup, &our_high)
+                        }
+                    }
+                }
+                _ => cgfs::write_high(&res.cgroup, &our_high),
+            }
+        } else {
+            cgfs::write_high(&res.cgroup, &our_high)
+        };
+
+        if result.is_ok() {
+            self.reconcile_our_high(&entry);
+        }
+        result
+    }
+
+    /// After a successful `Cap` write, read `memory.high` back; if what's
+    /// actually on disk differs from what we journaled (page truncation we
+    /// didn't fully pre-empt, or a systemd-side reformat via the D-Bus
+    /// path), correct the journal to match reality — otherwise
+    /// `should_restore`'s string-equality check can never pass again and
+    /// the cap becomes permanent (Task 6 review, Critical #1). Rebuilds
+    /// only this cgroup's entries, preserving any others that might coexist
+    /// (Important #3), with `written`'s `our_high` corrected to the
+    /// read-back value. Uses `Journal::replace` (a single atomic rewrite),
+    /// not a separate `remove` then `append`: the latter has a window where
+    /// the cgroup has no journal record at all, so a crash/SIGKILL/append
+    /// failure right there would leave a permanent, unrecoverable cap —
+    /// exactly the invariant the journal exists to prevent (Task 6 review,
+    /// fix round 2).
+    fn reconcile_our_high(&self, written: &JournalEntry) {
+        let cgroup: &str = &written.cgroup;
+        let Some(actual) = cgfs::read_high(cgroup) else {
+            return;
+        };
+        if written.our_high.as_deref() == Some(actual.as_str()) {
+            return;
+        }
+        tracing::warn!(
+            cgroup = %cgroup, journaled = ?written.our_high, actual = %actual,
+            "memory.high on disk differs from what we journaled; correcting journal entry"
+        );
+        let mut entries = self.entries_for(cgroup);
+        let Some(pos) = entries.iter().rposition(|e| e == written) else {
+            // Already removed/replaced by something else (e.g. a concurrent
+            // Thaw/LiftCap) — nothing left to correct.
+            return;
+        };
+        entries[pos].our_high = Some(actual);
+        if let Err(e) = self.journal.replace(cgroup, &entries) {
+            tracing::warn!(cgroup = %cgroup, error = %e, "failed to correct journal entry (atomic replace)");
         }
     }
+
+    fn lift_cap(&self, res: &Resolution) -> Result<()> {
+        tracing::info!(cgroup = %res.cgroup, "lifting cap");
+        let entries = self.entries_for(&res.cgroup);
+        // Mechanism-independent thaw always runs, regardless of whether any
+        // journal record exists — a dead-cgroup prune (carry-forward
+        // finding, Task 5 review) must never leave a target frozen just
+        // because we lost the journal entry.
+        let _ = self.thaw_raw(&res.cgroup, res.unit.as_deref());
+        self.restore_high_if_any(&res.cgroup, &entries);
+        self.journal.remove(&res.cgroup)
+    }
+
+    /// All journal entries for one cgroup, in the order `Journal::entries()`
+    /// returns them — oldest-first, since entries are strictly appended.
+    fn entries_for(&self, cgroup: &str) -> Vec<JournalEntry> {
+        self.journal
+            .entries()
+            .into_iter()
+            .filter(|e| e.cgroup == cgroup)
+            .collect()
+    }
+
+    /// Startup recovery: legacy `guard-<pid>` sweep (kept for one release as
+    /// an upgrade path from pre-act-in-place rlm), then replay every live
+    /// journal entry.
+    pub fn sweep_leftovers(&self) -> Result<()> {
+        if let Err(e) = self.manager.sweep_guard_leftovers() {
+            tracing::warn!(error = %e, "legacy guard-<pid> sweep failed (non-fatal)");
+        }
+        self.replay_and_clear()
+    }
+
+    /// Graceful shutdown: undo every live journal entry, then clear the
+    /// journal. Same replay as `sweep_leftovers`, minus the legacy sweep.
+    pub fn undo_all(&self) -> Result<()> {
+        self.replay_and_clear()
+    }
+
+    fn replay_and_clear(&self) -> Result<()> {
+        // Group by cgroup first (entries for the same cgroup aren't
+        // necessarily contiguous in the file) so each cgroup's chain is
+        // replayed as one unit — see `restore_high_if_any` — rather than
+        // entry-by-entry, which would mis-restore whenever more than one
+        // entry coexists for a cgroup (Important #3, Task 6 review).
+        let mut by_cgroup: std::collections::HashMap<String, Vec<JournalEntry>> =
+            std::collections::HashMap::new();
+        for e in self.journal.entries() {
+            by_cgroup.entry(e.cgroup.clone()).or_default().push(e);
+        }
+        for (cgroup, entries) in &by_cgroup {
+            let unit = entries.last().and_then(|e| e.unit.clone());
+            let _ = self.thaw_raw(cgroup, unit.as_deref());
+            self.restore_high_if_any(cgroup, entries);
+        }
+        self.journal.clear()
+    }
+
+    /// Restore `memory.high` for one cgroup's journal `entries` (oldest-first),
+    /// if the chain is still live — called *after* the caller has already
+    /// performed the mechanism-independent thaw (see module docs: no path
+    /// here ever means "leave frozen"). All the decision logic is delegated
+    /// to the pure [`restore_decision`]: liveness is judged against the
+    /// *newest* `Cap` entry (whose write is what's actually on disk right
+    /// now), while the value restored is [`restore_target`]'s *oldest*-entry
+    /// `prev_high` (the true pre-intervention value). Judging liveness
+    /// against the oldest Cap instead (NEW-1 regression) leaves a stacked
+    /// `[Cap, Cap]` chain's on-disk value permanently un-restorable, since
+    /// the oldest entry's `our_high` never matches what a later Cap actually
+    /// wrote. Judging liveness against `entries.last()` has the same failure
+    /// for a `[Cap, Freeze]` chain (Promoted Minor B): the newest entry is
+    /// the `Freeze`, which has no `memory.high` of its own. Clears systemd's
+    /// runtime `MemoryHigh` property *before* raw-writing `prev_high` back —
+    /// the other order lets systemd's own `"max"` write clobber the value we
+    /// just restored (Critical #2, Task 6 review).
+    fn restore_high_if_any(&self, cgroup: &str, entries: &[JournalEntry]) {
+        let inode = cgfs::dir_inode(cgroup);
+        let high = cgfs::read_high(cgroup);
+        match restore_decision(entries, inode, high.as_deref()) {
+            RestoreStep::ThawAndRestoreHigh { to } => {
+                // Clear systemd's runtime MemoryHigh property against the
+                // NEWEST Cap's unit — that's the entry whose write is
+                // actually live on disk right now (see `restore_decision`).
+                let unit = entries
+                    .iter()
+                    .rev()
+                    .find(|e| e.action == JournalAction::Cap)
+                    .and_then(|e| e.unit.as_deref());
+                if let Some(unit) = unit {
+                    if let Some(systemd) = self.systemd {
+                        if let Err(err) = systemd.set_memory_high(unit, u64::MAX, DBUS_TIMEOUT) {
+                            tracing::debug!(
+                                cgroup, unit, error = %err,
+                                "clearing systemd MemoryHigh runtime property failed"
+                            );
+                        }
+                    }
+                }
+                if let Err(err) = cgfs::write_high(cgroup, &to) {
+                    tracing::warn!(cgroup, error = %err, "failed to restore memory.high");
+                }
+            }
+            // No Cap entry anywhere in the chain (a Freeze-only chain,
+            // possibly with leaked duplicates): there is no memory.high to
+            // restore. The unconditional thaw already ran in the caller, so
+            // there's nothing left to do here.
+            RestoreStep::ThawOnly => {}
+            RestoreStep::SkipRemove => {
+                tracing::warn!(
+                    cgroup,
+                    "not restoring memory.high (cgroup recreated or value changed since our write)"
+                );
+            }
+        }
+    }
+
+    /// Mechanism-independent thaw: best-effort `ThawUnit` first (if we have a
+    /// unit and a bus), then an *unconditional* raw `cgroup.freeze` write —
+    /// this always runs, regardless of mechanism or whether `ThawUnit`
+    /// succeeded, so a cgroup is never left frozen. Tolerates a missing
+    /// cgroup: the raw write then simply returns `Err`, which every caller
+    /// here treats as non-fatal.
+    fn thaw_raw(&self, cgroup: &str, unit: Option<&str>) -> Result<()> {
+        if let (Some(unit), Some(systemd)) = (unit, self.systemd) {
+            if let Err(e) = systemd.thaw_unit(unit, DBUS_TIMEOUT) {
+                tracing::debug!(cgroup, unit, error = %e, "ThawUnit failed; raw thaw still runs");
+            }
+        }
+        cgfs::write_freeze(cgroup, false)
+    }
 }
 
-/// Pure helper: parse the `VmRSS` line (value is in kB) from a
-/// `/proc/<pid>/status` body and return 90% of it in bytes, clamped to a
-/// [`MIN_CAP_BYTES`] floor. If `VmRSS` is absent or unparseable, return the floor.
-fn cap_target_bytes_from_status(status: &str) -> u64 {
-    let rss_bytes = status
-        .lines()
-        .find_map(|line| {
-            let rest = line.strip_prefix("VmRSS:")?;
-            // Format: "VmRSS:\t   12345 kB". Take the first numeric token.
-            let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
-            Some(kb * 1024)
-        })
-        .unwrap_or(0);
+/// What to do with one journal entry's `memory.high` at restore time. Never
+/// speaks to freeze/thaw — that is unconditional and already handled by the
+/// caller (`Effector::thaw_raw`) before `restore_step` is even consulted, so
+/// no variant here can ever mean "leave it frozen".
+#[derive(Debug, PartialEq, Eq)]
+pub enum RestoreStep {
+    /// A `Freeze` entry whose guard still holds: nothing to restore, thaw
+    /// (already done by the caller) was the whole job.
+    ThawOnly,
+    /// A `Cap` entry whose guard still holds: restore `memory.high` to `to`
+    /// (the entry's `prev_high`, "max" if it was never recorded).
+    ThawAndRestoreHigh { to: String },
+    /// The guard no longer holds (cgroup recreated, or someone else changed
+    /// `memory.high` since our write): don't touch `memory.high`, just let
+    /// the caller remove the journal entry.
+    SkipRemove,
+}
 
-    let target = rss_bytes / CAP_FRACTION_DEN * CAP_FRACTION_NUM;
-    target.max(MIN_CAP_BYTES)
+/// Pure: what to do for one journal entry at restore time, delegating the
+/// safety check to [`should_restore`].
+pub fn restore_step(e: &JournalEntry, inode: Option<u64>, high: Option<&str>) -> RestoreStep {
+    if !should_restore(e, inode, high) {
+        return RestoreStep::SkipRemove;
+    }
+    match e.action {
+        JournalAction::Freeze => RestoreStep::ThawOnly,
+        JournalAction::Cap => RestoreStep::ThawAndRestoreHigh {
+            to: e.prev_high.clone().unwrap_or_else(|| "max".into()),
+        },
+    }
+}
+
+/// Pure helper: 90% of a cgroup's anon+swap usage, clamped to a
+/// [`MIN_CAP_BYTES`] floor, falling back to the floor entirely when the
+/// usage couldn't be read. `anon+swap` is the cgroup-level equivalent of a
+/// single process's RSS+swap used by the old pid-based cap; sourcing it from
+/// the whole cgroup (not one process) is correct now that we cap in place.
+pub fn cap_from_anon(anon_swap: Option<u64>) -> u64 {
+    anon_swap
+        .map(|b| (b / 10 * 9).max(MIN_CAP_BYTES))
+        .unwrap_or(MIN_CAP_BYTES)
+}
+
+/// Size a soft cap so the reduction it demands is actually achievable.
+///
+/// With swap, anon is reclaimable and 90% of anon+swap is the right target.
+/// Without swap (rlm sets memory.swap.max=0 on cgroups it creates), ONLY file
+/// pages can be freed, so an anon-derived target can demand a reduction the
+/// kernel cannot satisfy — memory.high then throttles the allocator in the
+/// reclaim path indefinitely. memory.high never OOM-kills; it stalls. So when
+/// anon cannot be reclaimed, floor the cap so file reclaim alone can satisfy
+/// it, keeping the cap soft at the cost of applying less pressure.
+///
+/// `can_swap` selects the branch: `true` reproduces [`cap_from_anon`]'s
+/// figure exactly (the swap-capable case is unchanged). `false` raises that
+/// figure to at least `current - 80% of file` — i.e. never demands more than
+/// roughly 80% of file-backed pages be reclaimed — then still applies the
+/// [`MIN_CAP_BYTES`] floor. If `current` or `file` can't be read, this falls
+/// back to today's anon-derived behaviour and logs a warning, rather than
+/// guessing.
+pub fn cap_target(
+    anon_swap: Option<u64>,
+    current: Option<u64>,
+    file: Option<u64>,
+    can_swap: bool,
+) -> u64 {
+    let anon_target = cap_from_anon(anon_swap);
+    if can_swap {
+        return anon_target;
+    }
+    let (Some(current), Some(file)) = (current, file) else {
+        tracing::warn!(
+            "cannot read memory.current/memory.stat file for no-swap cap sizing; \
+             falling back to the anon-derived target"
+        );
+        return anon_target;
+    };
+    // Never demand more than ~80% of file pages be reclaimed.
+    let file_reclaim_floor = current.saturating_sub(file.saturating_mul(8) / 10);
+    anon_target.max(file_reclaim_floor).max(MIN_CAP_BYTES)
+}
+
+/// Pure: the full restore decision for one cgroup's journal `entries`
+/// (oldest-first), given the cgroup's current inode and on-disk
+/// `memory.high` (both already read by the caller — no IO here). Answers two
+/// orthogonal questions with two different entries on purpose:
+///
+/// - **Liveness** (is the guard we wrote still intact?) is judged against
+///   the *newest* `Cap` entry in the chain. Entries are strictly appended,
+///   so a later Cap's write always supersedes an earlier one's on disk —
+///   `should_restore`'s string-equality check must compare against the
+///   entry whose `our_high` is what's actually there right now.
+/// - **Value** (what do we restore to?) is [`restore_target`]'s *oldest*
+///   `Cap` entry's `prev_high` — the true pre-intervention value, not an
+///   intermediate entry's `prev_high` (which is just our own previous
+///   `our_high` from an earlier cap in the same chain).
+///
+/// Judging both against the oldest Cap (NEW-1 regression) makes a stacked
+/// `[Cap, Cap]` chain's liveness check compare a stale `our_high` against
+/// the newer write on disk, so it never matches and the chain is treated as
+/// dead — stranding `memory.high` at the guard's value forever. Judging
+/// liveness against `entries.last()` fails the same way for `[Cap, Freeze]`
+/// (Promoted Minor B): the newest entry is the `Freeze`, which has no
+/// `memory.high` of its own. Returns [`RestoreStep::ThawOnly`] when there's
+/// no `Cap` entry anywhere in the chain (a `Freeze`-only chain) — nothing to
+/// restore beyond the caller's unconditional thaw.
+pub fn restore_decision(
+    entries: &[JournalEntry],
+    inode: Option<u64>,
+    high: Option<&str>,
+) -> RestoreStep {
+    let Some(newest_cap) = entries
+        .iter()
+        .rev()
+        .find(|e| e.action == JournalAction::Cap)
+    else {
+        return RestoreStep::ThawOnly;
+    };
+    match restore_step(newest_cap, inode, high) {
+        RestoreStep::ThawAndRestoreHigh { .. } => match restore_target(entries) {
+            Some(to) => RestoreStep::ThawAndRestoreHigh { to },
+            // Unreachable: `newest_cap` being a Cap guarantees `restore_target`
+            // (which only needs *any* Cap entry) also finds one.
+            None => RestoreStep::ThawOnly,
+        },
+        other => other,
+    }
+}
+
+/// Pure: given all journal entries for one cgroup, oldest-first, select the
+/// `memory.high` value to restore, if the chain contains a `Cap` entry. The
+/// OLDEST `Cap` entry's `prev_high` is the true pre-intervention value — a
+/// later entry's `prev_high` is just our own previous `our_high` from an
+/// earlier cap in the same chain, not the original (Task 6 review,
+/// Important #3). Returns `None` if there's no `Cap` entry (e.g. a
+/// `Freeze`-only chain).
+pub fn restore_target(entries: &[JournalEntry]) -> Option<String> {
+    entries
+        .iter()
+        .find(|e| e.action == JournalAction::Cap)
+        .map(|e| e.prev_high.clone().unwrap_or_else(|| "max".into()))
+}
+
+/// Runtime page size in bytes, via `sysconf(_SC_PAGESIZE)`. Falls back to
+/// 4096 (by far the most common value) only if the syscall ever returns
+/// something nonsensical — a defensive fallback, not the source of truth,
+/// since the whole point is to match whatever the kernel actually enforces.
+fn page_size() -> u64 {
+    // SAFETY: sysconf(_SC_PAGESIZE) reads a static system parameter; no
+    // pointers involved, no side effects.
+    let p = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if p > 0 {
+        p as u64
+    } else {
+        4096
+    }
+}
+
+/// Pure: round `bytes` down to a multiple of `page` (a no-op if `page` is 0).
+/// The kernel truncates `memory.high` writes to page multiples (Task 6
+/// review, Critical #1), so we must journal/write the value it will
+/// actually store, not the pre-truncation target — otherwise
+/// `should_restore`'s string-equality check can never pass again and a cap
+/// becomes permanent.
+fn page_align_down(bytes: u64, page: u64) -> u64 {
+    bytes.checked_div(page).map_or(bytes, |q| q * page)
 }
 
 /// Best-effort desktop notification via `notify-send`. Silently does nothing if
@@ -154,85 +628,684 @@ fn notify(message: &str) {
 
 #[cfg(test)]
 mod tests {
+    use super::super::resolve::{Coverage, Verdict};
     use super::*;
 
     #[test]
-    fn cap_target_is_ninety_percent_of_rss() {
-        // VmRSS 1,000,000 kB = 1,024,000,000 bytes; 90% = 921,600,000.
-        let status = "Name:\tfirefox\nVmHWM:\t  2000000 kB\nVmRSS:\t  1000000 kB\nThreads:\t10\n";
-        let got = cap_target_bytes_from_status(status);
-        assert_eq!(got, 1_000_000 * 1024 / 10 * 9);
+    fn cap_from_anon_sizes_and_floors() {
+        assert_eq!(cap_from_anon(Some(1_000_000_000)), 900_000_000);
+        assert_eq!(cap_from_anon(Some(1_000_000)), MIN_CAP_BYTES);
+        assert_eq!(cap_from_anon(None), MIN_CAP_BYTES);
+    }
+
+    /// Swap-capable cgroups (the common case: systemd unit scopes) must get
+    /// exactly `cap_from_anon`'s figure — this fix must not change behaviour
+    /// when anon is actually reclaimable.
+    #[test]
+    fn cap_target_swap_capable_matches_cap_from_anon() {
+        let anon_swap = Some(1_000_000_000);
+        let current = Some(2_000_000_000);
+        let file = Some(1_000_000_000);
+        assert_eq!(
+            cap_target(anon_swap, current, file, true),
+            cap_from_anon(anon_swap)
+        );
+    }
+
+    /// No-swap (rlm-managed cgroup, memory.swap.max=0) with plenty of file
+    /// cache: the anon-derived target would demand an unreclaimable
+    /// reduction, so the cap must be raised above the anon figure to at most
+    /// what file reclaim can actually satisfy (current - 80% of file).
+    #[test]
+    fn cap_target_no_swap_with_file_raises_above_anon_target() {
+        // anon+swap = 1_000_000_000 -> anon_target = 900_000_000.
+        // current = 3_000_000_000, file = 2_000_000_000 (mostly cache).
+        // file_reclaim_floor = 3_000_000_000 - 2_000_000_000*0.8 = 1_400_000_000.
+        let anon_swap = Some(1_000_000_000);
+        let current = Some(3_000_000_000);
+        let file = Some(2_000_000_000);
+        let target = cap_target(anon_swap, current, file, false);
         assert!(
-            got > MIN_CAP_BYTES,
-            "a 1GB process should cap above the floor"
+            target > cap_from_anon(anon_swap),
+            "no-swap target ({target}) must be raised above the anon-derived figure"
+        );
+        assert_eq!(target, 1_400_000_000);
+    }
+
+    /// No-swap with almost no file cache to reclaim from (an anon-heavy
+    /// workload): the target must collapse to ~`current` (demanding no
+    /// reduction) rather than the unsatisfiable anon-derived figure — a soft
+    /// cap that can't be met just stalls the allocator forever.
+    #[test]
+    fn cap_target_no_swap_with_no_file_collapses_to_current() {
+        let current = Some(1_073_741_824);
+        let anon_swap = Some(1_073_741_824); // all anon, no file at all
+        let file = Some(0);
+        assert_eq!(cap_target(anon_swap, current, file, false), 1_073_741_824);
+    }
+
+    /// Unreadable `current`/`file` must fall back to today's anon-derived
+    /// behaviour rather than panicking or guessing.
+    #[test]
+    fn cap_target_falls_back_when_current_or_file_unreadable() {
+        let anon_swap = Some(1_000_000_000);
+        assert_eq!(
+            cap_target(anon_swap, None, Some(1_000_000_000), false),
+            cap_from_anon(anon_swap)
+        );
+        assert_eq!(
+            cap_target(anon_swap, Some(1_000_000_000), None, false),
+            cap_from_anon(anon_swap)
+        );
+        assert_eq!(
+            cap_target(anon_swap, None, None, false),
+            cap_from_anon(anon_swap)
+        );
+    }
+
+    /// The MIN_CAP_BYTES floor still applies in the no-swap branch even when
+    /// both the anon-derived figure and the file-reclaim floor are tiny.
+    #[test]
+    fn cap_target_no_swap_still_respects_min_cap_floor() {
+        let target = cap_target(Some(1_000), Some(2_000), Some(1_000), false);
+        assert_eq!(target, MIN_CAP_BYTES);
+    }
+
+    /// Carry-forward (Task 3 review): `our_high` must be a plain decimal
+    /// string with no grouping/whitespace, since `should_restore` compares
+    /// it by string equality against `cgfs::read_high` (which only trims).
+    #[test]
+    fn our_high_string_is_plain_decimal_no_separators() {
+        let bytes = cap_from_anon(Some(12_345_678_900));
+        let s = bytes.to_string();
+        assert!(
+            s.chars().all(|c| c.is_ascii_digit()),
+            "our_high must be plain digits, got {s:?}"
+        );
+        assert_eq!(s, format!("{bytes}"), "no formatting beyond plain decimal");
+    }
+
+    /// Task 6 review, Critical #1: the kernel truncates `memory.high`
+    /// writes to page multiples (the reviewer's own observed example:
+    /// writing 900_000_000 with a 4096-byte page reads back 899_997_696).
+    #[test]
+    fn page_align_down_rounds_to_page_multiple() {
+        assert_eq!(page_align_down(900_000_000, 4096), 899_997_696);
+        assert_eq!(
+            page_align_down(4096, 4096),
+            4096,
+            "already-aligned is a no-op"
+        );
+        assert_eq!(page_align_down(100, 0), 100, "page=0 guard is a no-op");
+    }
+
+    /// Task 6 review, Important #3: when duplicate/stacked `Cap` entries end
+    /// up coexisting for one cgroup (a leak from an incomplete prior
+    /// removal), the restore target must be the OLDEST entry's `prev_high`
+    /// — the true pre-intervention value. The newer entry's `prev_high` is
+    /// deliberately a different-looking value here to prove we don't
+    /// chain-follow it.
+    #[test]
+    fn restore_target_uses_oldest_caps_prev_high() {
+        let oldest = entry_cap("/x", 42, "max", "A");
+        let newest = entry_cap("/x", 42, "A-prime", "B");
+        assert_eq!(
+            restore_target(&[oldest, newest]),
+            Some("max".into()),
+            "must use the oldest entry's prev_high, not the newest's"
         );
     }
 
     #[test]
-    fn missing_vmrss_falls_back_to_min() {
-        let status = "Name:\tsomeproc\nState:\tR (running)\nThreads:\t1\n";
-        assert_eq!(cap_target_bytes_from_status(status), MIN_CAP_BYTES);
+    fn restore_target_none_for_freeze_only_chain() {
+        assert_eq!(restore_target(&[entry_freeze("/x", 42)]), None);
+    }
+
+    /// Regression test for NEW-1: `restore_decision`'s liveness check must be
+    /// judged against the NEWEST `Cap` entry (whose `our_high` is what's
+    /// actually on disk), while the value restored stays the OLDEST `Cap`
+    /// entry's `prev_high`. A stacked `[Cap(prev="max", our="A"),
+    /// Cap(prev="A", our="B")]` chain with disk `memory.high == "B"` must
+    /// restore to `"max"` — not `SkipRemove`, which the old
+    /// `entries.iter().find()` (oldest-Cap-for-everything) produced: it
+    /// compared the oldest entry's `our_high` ("A") against disk ("B"),
+    /// never matched, and permanently stranded `memory.high`. Also covers
+    /// `[Cap, Freeze]` (Promoted Minor B's shape) and a bare `[Cap]` chain in
+    /// the same test so a future re-swap of either selection can't slip by.
+    #[test]
+    fn restore_decision_liveness_uses_newest_cap_value_uses_oldest() {
+        // [Cap, Cap]: disk holds the NEWEST Cap's our_high ("B"). Liveness
+        // must be checked against "B", not the oldest entry's "A".
+        let oldest = entry_cap("/x", 42, "max", "A");
+        let newest = entry_cap("/x", 42, "A", "B");
+        assert_eq!(
+            restore_decision(&[oldest.clone(), newest.clone()], Some(42), Some("B")),
+            RestoreStep::ThawAndRestoreHigh { to: "max".into() },
+            "must judge liveness against the newest Cap's our_high (matches disk \"B\"), \
+             but restore the oldest Cap's prev_high (\"max\")"
+        );
+        // Sanity: the stale intermediate value "A" is no longer live on disk,
+        // so checking against it (the old bug) would report SkipRemove.
+        assert_eq!(
+            restore_step(&oldest, Some(42), Some("B")),
+            RestoreStep::SkipRemove,
+            "confirms the bug this guards against: judging liveness against the oldest \
+             entry's our_high against the newer on-disk value mismatches"
+        );
+
+        // [Cap, Freeze]: newest entry has no memory.high of its own; must
+        // still fall through to the Cap for both liveness and value.
+        let cap = entry_cap("/x", 42, "max", "1000");
+        let frz = entry_freeze("/x", 42);
+        assert_eq!(
+            restore_decision(&[cap, frz], Some(42), Some("1000")),
+            RestoreStep::ThawAndRestoreHigh { to: "max".into() }
+        );
+
+        // [Cap] alone: baseline single-entry behavior is unchanged.
+        let cap_only = entry_cap("/x", 42, "max", "1000");
+        assert_eq!(
+            restore_decision(&[cap_only], Some(42), Some("1000")),
+            RestoreStep::ThawAndRestoreHigh { to: "max".into() }
+        );
+
+        // Freeze-only chain: nothing to restore.
+        assert_eq!(
+            restore_decision(&[entry_freeze("/x", 42)], Some(42), None),
+            RestoreStep::ThawOnly
+        );
+    }
+
+    fn entry_cap(cg: &str, inode: u64, prev: &str, our: &str) -> JournalEntry {
+        JournalEntry {
+            cgroup: cg.into(),
+            inode,
+            unit: None,
+            action: JournalAction::Cap,
+            prev_high: Some(prev.into()),
+            our_high: Some(our.into()),
+        }
+    }
+
+    fn entry_freeze(cg: &str, inode: u64) -> JournalEntry {
+        JournalEntry {
+            cgroup: cg.into(),
+            inode,
+            unit: None,
+            action: JournalAction::Freeze,
+            prev_high: None,
+            our_high: None,
+        }
     }
 
     #[test]
-    fn tiny_rss_clamps_to_min() {
-        // 1 MB RSS → 90% = ~0.9 MB, below the 64 MiB floor → clamped.
-        let status = "VmRSS:\t     1024 kB\n";
-        assert_eq!(cap_target_bytes_from_status(status), MIN_CAP_BYTES);
+    fn restore_step_matrix() {
+        let cap = entry_cap("/x", 42, "max", "1000");
+        assert_eq!(
+            restore_step(&cap, Some(42), Some("1000")),
+            RestoreStep::ThawAndRestoreHigh { to: "max".into() }
+        );
+        assert_eq!(
+            restore_step(&cap, Some(43), Some("1000")),
+            RestoreStep::SkipRemove
+        );
+        assert_eq!(
+            restore_step(&cap, Some(42), Some("777")),
+            RestoreStep::SkipRemove
+        );
+        let frz = entry_freeze("/x", 42);
+        assert_eq!(
+            restore_step(&frz, Some(42), None),
+            RestoreStep::ThawOnly,
+            "alive freeze entry: nothing to restore beyond the unconditional thaw"
+        );
+        assert_eq!(
+            restore_step(&frz, None, None),
+            RestoreStep::SkipRemove,
+            "dead cgroup: restore_step only decides memory.high, never freeze — the \
+             unconditional thaw in Effector::thaw_raw already ran before this is consulted, \
+             so a still-frozen dead cgroup is never left behind (carry-forward: Task 5 review)"
+        );
     }
 
-    #[test]
-    fn unparseable_vmrss_falls_back_to_min() {
-        let status = "VmRSS:\t   notanumber kB\n";
-        assert_eq!(cap_target_bytes_from_status(status), MIN_CAP_BYTES);
+    /// Poll `cgfs::read_frozen` until it matches `want` or `timeout` elapses.
+    /// Writing `cgroup.freeze` only *requests* a state change; `cgroup.events`'s
+    /// `frozen` field (what `read_frozen` reads) only flips once the kernel has
+    /// actually quiesced every task in the cgroup, which can lag the write by a
+    /// few milliseconds under load — so a bare immediate read is flaky.
+    fn wait_for_frozen(cgroup: &str, want: bool, timeout: Duration) -> Option<bool> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let got = cgfs::read_frozen(cgroup);
+            if got == Some(want) || std::time::Instant::now() >= deadline {
+                return got;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
-    #[test]
-    fn vmrss_exactly_at_floor_boundary() {
-        // Choose an RSS whose 90% lands just above the floor to exercise max().
-        // floor = 64 MiB = 67,108,864 bytes. Need rss*0.9 just above it.
-        // rss_kb such that (rss_kb*1024)/10*9 > floor → rss_kb ~ 72843.
-        let status = "VmRSS:\t    80000 kB\n";
-        let expected = 80_000u64 * 1024 / 10 * 9;
-        assert_eq!(cap_target_bytes_from_status(status), expected);
-        assert!(expected > MIN_CAP_BYTES);
+    fn test_resolution(cgroup: String) -> Resolution {
+        Resolution {
+            cgroup,
+            unit: None,
+            verdict: Verdict::Freeze,
+            coverage: Coverage::Full,
+            mechanism: Mechanism::Raw,
+        }
     }
 
-    /// Integration smoke test: freeze a real `sleep`, confirm it's paused via the
-    /// `guard-<pid>` `cgroup.freeze` state, then thaw and tear down. Only works
-    /// under cgroup v2 delegation, so it's `#[ignore]`d by default.
+    /// Integration smoke test: freeze a real `sleep` via its (raw, rlm-created)
+    /// cgroup through the journal-backed Effector, confirm it's paused via
+    /// `cgroup.freeze` and journaled, then thaw and confirm the journal entry
+    /// is gone. Only works under cgroup v2 delegation, so it's `#[ignore]`d.
     #[test]
     #[ignore = "requires cgroup v2 delegation; run manually"]
-    fn freeze_thaw_real_process() {
+    fn freeze_thaw_real_process_raw_cgroup() {
+        use common::Limit;
         use std::process::Command;
 
         let manager = CgroupManager::new().expect("create CgroupManager");
-        let effector = Effector::new(&manager);
+        let journal_dir = tempfile::tempdir().unwrap();
+        let journal =
+            Journal::open(journal_dir.path().join("j.jsonl"), "test-boot".into()).unwrap();
+        let effector = Effector::new(&manager, &journal, None);
+
+        let abs_path = manager
+            .prepare_cgroup("test-freeze-thaw", &Limit::default())
+            .expect("create test cgroup");
+        let cgroup = format!(
+            "/{}",
+            abs_path
+                .strip_prefix("/sys/fs/cgroup")
+                .expect("cgroup under /sys/fs/cgroup")
+                .display()
+        );
 
         let mut child = Command::new("sleep")
             .arg("30")
             .spawn()
             .expect("spawn sleep");
         let pid = child.id();
+        manager
+            .add_to_cgroup(&abs_path, pid)
+            .expect("add sleep to test cgroup");
+
+        let res = test_resolution(cgroup.clone());
 
         effector
             .apply(&Action::Freeze {
-                pid,
+                res: res.clone(),
                 name: "sleep".into(),
             })
             .expect("freeze");
 
-        // The freezer reports state via `guard-<pid>/cgroup.freeze` ("1" frozen).
-        let freeze_path = format!("/sys/fs/cgroup/rlm/guard-{pid}/cgroup.freeze");
-        let frozen = std::fs::read_to_string(&freeze_path).unwrap_or_default();
-        assert_eq!(frozen.trim(), "1", "process should be frozen");
+        assert_eq!(
+            wait_for_frozen(&cgroup, true, Duration::from_secs(2)),
+            Some(true),
+            "cgroup should be frozen"
+        );
+        assert_eq!(journal.entries().len(), 1, "freeze should be journaled");
 
-        effector.apply(&Action::Thaw { pid }).expect("thaw");
         effector
-            .apply(&Action::LiftCap { pid })
-            .expect("lift+cleanup");
+            .apply(&Action::Thaw { res: res.clone() })
+            .expect("thaw");
+
+        assert_eq!(
+            wait_for_frozen(&cgroup, false, Duration::from_secs(2)),
+            Some(false),
+            "cgroup should be thawed"
+        );
+        assert!(
+            journal.entries().is_empty(),
+            "journal entry should be removed after thaw"
+        );
 
         let _ = child.kill();
         let _ = child.wait();
+        let _ = manager.cleanup_cgroup("test-freeze-thaw");
+    }
+
+    /// Act-in-place integration test: freeze/thaw a real transient systemd
+    /// `--user --scope` unit through the Unit mechanism (D-Bus, with raw
+    /// fallback), confirming the journal-backed round trip end to end.
+    /// Requires a session bus and cgroup v2 delegation, so it's `#[ignore]`d.
+    #[test]
+    #[ignore = "requires a session bus and cgroup v2 delegation; run manually"]
+    fn freeze_thaw_real_transient_scope() {
+        use std::process::Command;
+
+        let uid_out = Command::new("id").arg("-u").output().expect("id -u");
+        let uid: u32 = String::from_utf8_lossy(&uid_out.stdout)
+            .trim()
+            .parse()
+            .expect("parse uid");
+
+        let unit_base = format!("rlm-e2e-{}", std::process::id());
+        let unit = format!("{unit_base}.scope");
+        let cgroup = format!("/user.slice/user-{uid}.slice/user@{uid}.service/app.slice/{unit}");
+
+        let mut child = Command::new("systemd-run")
+            .args([
+                "--user",
+                "--scope",
+                "--slice=app.slice",
+                &format!("--unit={unit_base}"),
+                "--",
+                "sleep",
+                "30",
+            ])
+            .spawn()
+            .expect("spawn systemd-run --scope");
+
+        // Give systemd a moment to register the transient scope's cgroup.
+        std::thread::sleep(Duration::from_millis(300));
+
+        let manager = CgroupManager::new().expect("create CgroupManager");
+        let journal_dir = tempfile::tempdir().unwrap();
+        let journal =
+            Journal::open(journal_dir.path().join("j.jsonl"), "test-boot".into()).unwrap();
+        let systemd = SystemdUser::connect();
+        let effector = Effector::new(&manager, &journal, systemd.as_ref());
+
+        let res = Resolution {
+            cgroup: cgroup.clone(),
+            unit: Some(unit),
+            verdict: Verdict::Freeze,
+            coverage: Coverage::Full,
+            mechanism: Mechanism::Unit,
+        };
+
+        effector
+            .apply(&Action::Freeze {
+                res: res.clone(),
+                name: "sleep".into(),
+            })
+            .expect("freeze");
+        assert_eq!(
+            wait_for_frozen(&cgroup, true, Duration::from_secs(2)),
+            Some(true),
+            "scope cgroup should be frozen"
+        );
+        assert_eq!(journal.entries().len(), 1, "freeze should be journaled");
+
+        effector.apply(&Action::Thaw { res }).expect("thaw");
+        assert_eq!(
+            wait_for_frozen(&cgroup, false, Duration::from_secs(2)),
+            Some(false),
+            "scope cgroup should be thawed"
+        );
+        assert!(
+            journal.entries().is_empty(),
+            "journal entry should be removed after thaw"
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = Command::new("systemctl")
+            .args(["--user", "stop", &format!("{unit_base}.scope")])
+            .status();
+    }
+
+    /// Regression test for Task 6 review Critical #1: cap a real cgroup and
+    /// assert `cgfs::read_high` matches the journaled `our_high` exactly —
+    /// i.e. the value we wrote never got silently page-truncated out from
+    /// under the journal. The target process holds a chunk of random anon
+    /// memory so 90% of its usage is very unlikely to already sit on a page
+    /// boundary (MIN_CAP_BYTES, a round power of two, would pass even
+    /// without the fix, which would prove nothing). Requires cgroup v2
+    /// delegation, so it's `#[ignore]`d.
+    #[test]
+    #[ignore = "requires cgroup v2 delegation; run manually"]
+    fn cap_page_aligns_and_journal_matches_on_disk_value() {
+        use common::Limit;
+        use std::process::Command;
+
+        let manager = CgroupManager::new().expect("create CgroupManager");
+        let journal_dir = tempfile::tempdir().unwrap();
+        let journal =
+            Journal::open(journal_dir.path().join("j.jsonl"), "test-boot".into()).unwrap();
+        let effector = Effector::new(&manager, &journal, None);
+
+        let abs_path = manager
+            .prepare_cgroup("test-cap-align", &Limit::default())
+            .expect("create test cgroup");
+        let cgroup = format!(
+            "/{}",
+            abs_path
+                .strip_prefix("/sys/fs/cgroup")
+                .expect("cgroup under /sys/fs/cgroup")
+                .display()
+        );
+
+        // Hold ~150MB of anon memory whose 90% is very unlikely to land on
+        // a page boundary, then sleep.
+        let mut child = Command::new("bash")
+            .arg("-c")
+            .arg("a=$(head -c 150000000 /dev/urandom | base64 -w0); sleep 30")
+            .spawn()
+            .expect("spawn memory-holding process");
+        let pid = child.id();
+        manager
+            .add_to_cgroup(&abs_path, pid)
+            .expect("add process to test cgroup");
+        // Give the shell time to actually build up the anon allocation.
+        std::thread::sleep(Duration::from_millis(800));
+
+        let res = test_resolution(cgroup.clone());
+        effector
+            .apply(&Action::Cap {
+                res: res.clone(),
+                name: "mem-hog".into(),
+            })
+            .expect("cap");
+
+        let entries = journal.entries();
+        assert_eq!(entries.len(), 1, "cap should be journaled");
+        let journaled = entries[0].our_high.clone().expect("our_high recorded");
+
+        let on_disk = cgfs::read_high(&cgroup).expect("read memory.high");
+        assert_eq!(
+            on_disk, journaled,
+            "on-disk memory.high must match the journaled our_high exactly"
+        );
+
+        let bytes: u64 = journaled.parse().expect("our_high is a plain decimal");
+        assert_eq!(bytes % page_size(), 0, "written value must be page-aligned");
+
+        effector.apply(&Action::LiftCap { res }).expect("lift cap");
+        assert!(
+            journal.entries().is_empty(),
+            "journal entry removed after lift"
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = manager.cleanup_cgroup("test-cap-align");
+    }
+
+    /// Regression test for Task 6 review Critical #2: a real systemd unit
+    /// with a genuine prior `MemoryHigh` (so `prev_high` isn't already
+    /// `"max"`, which would pass either ordering) is capped then
+    /// lift-capped through the `Unit` mechanism. Before the fix,
+    /// `set_memory_high(unit, u64::MAX)` ran *after* the raw restore write
+    /// and clobbered it back to `"max"`; after the fix (clear the systemd
+    /// property first, restore second) the original value survives.
+    /// Requires a session bus and cgroup v2 delegation, so it's `#[ignore]`d.
+    #[test]
+    #[ignore = "requires a session bus and cgroup v2 delegation; run manually"]
+    fn lift_cap_restores_prev_high_not_clobbered_by_systemd_max() {
+        use std::process::Command;
+
+        let uid_out = Command::new("id").arg("-u").output().expect("id -u");
+        let uid: u32 = String::from_utf8_lossy(&uid_out.stdout)
+            .trim()
+            .parse()
+            .expect("parse uid");
+
+        let unit_base = format!("rlm-e2e-cap-{}", std::process::id());
+        let unit = format!("{unit_base}.scope");
+        let cgroup = format!("/user.slice/user-{uid}.slice/user@{uid}.service/app.slice/{unit}");
+
+        let mut child = Command::new("systemd-run")
+            .args([
+                "--user",
+                "--scope",
+                "--slice=app.slice",
+                &format!("--unit={unit_base}"),
+                // A genuine prior MemoryHigh, distinct from both "max" and
+                // whatever Cap computes, so the restored value is
+                // unambiguous.
+                "--property=MemoryHigh=1500M",
+                "--",
+                "sleep",
+                "30",
+            ])
+            .spawn()
+            .expect("spawn systemd-run --scope with MemoryHigh set");
+
+        std::thread::sleep(Duration::from_millis(300));
+
+        let manager = CgroupManager::new().expect("create CgroupManager");
+        let journal_dir = tempfile::tempdir().unwrap();
+        let journal =
+            Journal::open(journal_dir.path().join("j.jsonl"), "test-boot".into()).unwrap();
+        let systemd = SystemdUser::connect();
+        let effector = Effector::new(&manager, &journal, systemd.as_ref());
+
+        let original_high =
+            cgfs::read_high(&cgroup).expect("systemd-run set an initial memory.high");
+        assert_ne!(
+            original_high, "max",
+            "test needs a concrete prior MemoryHigh to distinguish from systemd's clear-to-max"
+        );
+
+        let res = Resolution {
+            cgroup: cgroup.clone(),
+            unit: Some(unit.clone()),
+            verdict: Verdict::CapOnly,
+            coverage: Coverage::Full,
+            mechanism: Mechanism::Unit,
+        };
+
+        effector
+            .apply(&Action::Cap {
+                res: res.clone(),
+                name: "sleep".into(),
+            })
+            .expect("cap");
+        assert_ne!(
+            cgfs::read_high(&cgroup),
+            Some(original_high.clone()),
+            "cap should have changed memory.high"
+        );
+
+        effector.apply(&Action::LiftCap { res }).expect("lift cap");
+        assert_eq!(
+            cgfs::read_high(&cgroup),
+            Some(original_high),
+            "lift must restore the true prior value, not be clobbered back to \"max\" \
+             by a systemd MemoryHigh clear that ran after the raw restore write"
+        );
+        assert!(
+            journal.entries().is_empty(),
+            "journal entry removed after lift"
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = Command::new("systemctl")
+            .args(["--user", "stop", &unit])
+            .status();
+    }
+
+    /// Regression test for Promoted Minor B: a leaked `[Cap, Freeze]` chain
+    /// (Cap journaled first, then the same cgroup frozen later without the
+    /// Cap entry ever being cleared) must still restore the Cap's
+    /// `prev_high` on thaw. Before the fix, liveness was judged against
+    /// `entries.last()` — the Freeze entry, which has no `memory.high` of
+    /// its own — so `restore_step` reported "nothing to restore" and
+    /// `memory.high` stayed pinned at the guard's Cap value forever once the
+    /// whole chain was cleared. Requires cgroup v2 delegation, so it's
+    /// `#[ignore]`d.
+    #[test]
+    #[ignore = "requires cgroup v2 delegation; run manually"]
+    fn chain_restores_cap_value_when_newest_entry_is_freeze() {
+        use common::Limit;
+        use std::process::Command;
+
+        let manager = CgroupManager::new().expect("create CgroupManager");
+        let journal_dir = tempfile::tempdir().unwrap();
+        let journal =
+            Journal::open(journal_dir.path().join("j.jsonl"), "test-boot".into()).unwrap();
+        let effector = Effector::new(&manager, &journal, None);
+
+        let abs_path = manager
+            .prepare_cgroup("test-chain-restore", &Limit::default())
+            .expect("create test cgroup");
+        let cgroup = format!(
+            "/{}",
+            abs_path
+                .strip_prefix("/sys/fs/cgroup")
+                .expect("cgroup under /sys/fs/cgroup")
+                .display()
+        );
+
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id();
+        manager
+            .add_to_cgroup(&abs_path, pid)
+            .expect("add sleep to test cgroup");
+
+        let original_high = cgfs::read_high(&cgroup).expect("read initial memory.high");
+        let res = test_resolution(cgroup.clone());
+
+        // Cap first (oldest entry)...
+        effector
+            .apply(&Action::Cap {
+                res: res.clone(),
+                name: "sleep".into(),
+            })
+            .expect("cap");
+        assert_ne!(
+            cgfs::read_high(&cgroup),
+            Some(original_high.clone()),
+            "cap should have changed memory.high"
+        );
+
+        // ...then freeze the same cgroup without ever clearing the Cap
+        // entry — this is the leaked-chain scenario: two coexisting entries,
+        // Freeze newest.
+        effector
+            .apply(&Action::Freeze {
+                res: res.clone(),
+                name: "sleep".into(),
+            })
+            .expect("freeze");
+
+        let entries = journal.entries();
+        assert_eq!(entries.len(), 2, "both Cap and Freeze entries coexist");
+        assert_eq!(entries[0].action, JournalAction::Cap, "Cap is oldest");
+        assert_eq!(entries[1].action, JournalAction::Freeze, "Freeze is newest");
+
+        // Thaw (the action that would naturally follow a Freeze) must still
+        // restore the Cap's prev_high, not skip restoration just because the
+        // newest entry is a Freeze with no memory.high of its own.
+        effector.apply(&Action::Thaw { res }).expect("thaw");
+        assert_eq!(
+            cgfs::read_high(&cgroup),
+            Some(original_high),
+            "thaw must restore the chain's Cap value even though Freeze is the newest entry"
+        );
+        assert!(
+            journal.entries().is_empty(),
+            "both chain entries removed after thaw"
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = manager.cleanup_cgroup("test-chain-restore");
     }
 }

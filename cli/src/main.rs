@@ -681,7 +681,7 @@ fn run_guard(manager: &CgroupManager, action: GuardAction) -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         GuardAction::Test => {
-            guard_test();
+            guard_test(manager);
             Ok(ExitCode::SUCCESS)
         }
     }
@@ -708,7 +708,15 @@ fn current_uid() -> u32 {
 
 fn guard_status(manager: &CgroupManager) {
     let cfg = Config::load().unwrap_or_default();
-    let sampler = rlm_core::guard::Sampler::new(cfg.guard, std::process::id(), current_uid());
+    let rlm_base = rlm_core::guard::sampler::strip_cgroup_root(manager.base_path());
+    if rlm_base.is_none() {
+        tracing::error!(
+            "base_path {:?} isn't under /sys/fs/cgroup; escalation target resolution disabled",
+            manager.base_path()
+        );
+    }
+    let sampler =
+        rlm_core::guard::Sampler::new(cfg.guard, std::process::id(), current_uid(), rlm_base);
 
     match sampler.sample() {
         Some(s) => println!(
@@ -718,48 +726,56 @@ fn guard_status(manager: &CgroupManager) {
         None => println!("Memory pressure: PSI unavailable (/proc/pressure/memory)"),
     }
 
-    let base = manager.base_path();
-    let pids = manager.list_guard_pids();
-    if pids.is_empty() {
+    // Active interventions come from the guard's own write-ahead journal.
+    // We use `Journal::read_entries` rather than `Journal::open` here
+    // because this is the CLI, a *second* process running alongside the
+    // daemon's own live `Journal` handle: `open()` can truncate/rewrite the
+    // file (header repair) or run WAL tail recovery (`set_len` from a stale
+    // read), and with no cross-process lock a daemon `append` landing
+    // between that read and truncate would be silently dropped. Reflects
+    // what the guard itself believes it's holding; it does not re-verify
+    // against the kernel's live cgroup.freeze/memory.high, which
+    // `rlm guard status` isn't trying to be a substitute for.
+    let entries = rlm_core::guard::Journal::read_entries(
+        &rlm_core::guard::journal_path(),
+        &rlm_core::guard::cgfs::boot_id(),
+    );
+    if entries.is_empty() {
         println!("\nNo active guard interventions.");
         return;
     }
 
-    println!(
-        "\n{:<8} {:<20} {:<8} {:<14}",
-        "PID", "NAME", "STATE", "MEM.HIGH"
-    );
-    println!("{}", "-".repeat(52));
-    for pid in pids {
-        let gpath = base.join(format!("guard-{pid}"));
-        let frozen = std::fs::read_to_string(gpath.join("cgroup.freeze"))
-            .map(|s| s.trim() == "1")
-            .unwrap_or(false);
-        let high = std::fs::read_to_string(gpath.join("memory.high"))
-            .map(|s| s.trim().to_string())
-            .unwrap_or_default();
-        let name = std::fs::read_to_string(format!("/proc/{pid}/comm"))
-            .map(|s| s.trim().to_string())
-            .unwrap_or_else(|_| "?".to_string());
-        let state = if frozen {
-            "frozen"
-        } else if !high.is_empty() && high != "max" {
-            "capped"
-        } else {
-            "active"
+    println!("\nActive guard interventions:");
+    for e in &entries {
+        let state = match e.action {
+            rlm_core::guard::journal::JournalAction::Freeze => "frozen".to_string(),
+            rlm_core::guard::journal::JournalAction::Cap => {
+                format!("capped our_high={}", e.our_high.as_deref().unwrap_or("?"))
+            }
         };
-        println!("{:<8} {:<20} {:<8} {:<14}", pid, name, state, high);
+        println!("  {} [{state}]", e.cgroup);
     }
 }
 
-fn guard_test() {
+fn guard_test(manager: &CgroupManager) {
     // Single-shot preview: ticks a FRESH engine once at now_ms=0, so it shows
     // what the guard's *first* action would be right now (the escalation gate is
     // open and no prior interventions exist). It does not simulate recovery or
     // cooldown behavior, and applies nothing.
     let cfg = Config::load().unwrap_or_default();
-    let sampler =
-        rlm_core::guard::Sampler::new(cfg.guard.clone(), std::process::id(), current_uid());
+    let rlm_base = rlm_core::guard::sampler::strip_cgroup_root(manager.base_path());
+    if rlm_base.is_none() {
+        tracing::error!(
+            "base_path {:?} isn't under /sys/fs/cgroup; escalation target resolution disabled",
+            manager.base_path()
+        );
+    }
+    let sampler = rlm_core::guard::Sampler::new(
+        cfg.guard.clone(),
+        std::process::id(),
+        current_uid(),
+        rlm_base,
+    );
     let mut engine = rlm_core::guard::PolicyEngine::new(cfg.guard);
 
     let Some(sample) = sampler.sample() else {
@@ -767,6 +783,7 @@ fn guard_test() {
         return;
     };
     let procs = sampler.eligible();
+    let live = sampler.live_cgroups();
     println!(
         "Pressure: some={:.1}%  full={:.1}%  available={} MB  |  {} eligible process(es)",
         sample.some_avg10,
@@ -775,7 +792,7 @@ fn guard_test() {
         procs.len()
     );
 
-    let actions = engine.tick(0, sample, &procs);
+    let actions = engine.tick(0, sample, &procs, &live);
     if actions.is_empty() {
         println!("No action would be taken right now.");
     } else {

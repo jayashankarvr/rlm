@@ -5,6 +5,15 @@ use std::process::Command;
 
 const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 
+/// Name of the shared, controller-free leaf cgroup that every `cleanup_cgroup`
+/// (i.e. every `rlm unlimit`, `remove_limit`/`remove_application_limit`, and
+/// `RuleAction::TeardownEmpty`) moves released processes into so the cgroup
+/// being torn down can be emptied and removed. It is a grab-bag of unrelated
+/// processes the user has explicitly released from rlm's control, so nothing
+/// in rlm may treat it as an actionable target (see `status.rs` and
+/// `guard/resolve.rs`).
+pub const UNLIMIT_CGROUP_NAME: &str = "unlimit";
+
 /// Sanitize cgroup name to prevent path traversal attacks.
 /// Only allows alphanumeric characters, dashes, and underscores.
 fn sanitize_cgroup_name(name: &str) -> Result<&str> {
@@ -333,7 +342,7 @@ impl CgroupManager {
 
             if !pids.is_empty() {
                 // Create/use an "unlimit" leaf cgroup (no controllers = no limits)
-                let unlimit_path = self.base_path.join("unlimit");
+                let unlimit_path = self.base_path.join(UNLIMIT_CGROUP_NAME);
                 let _ = fs::create_dir(&unlimit_path);
                 let unlimit_procs = unlimit_path.join("cgroup.procs");
 
@@ -386,86 +395,6 @@ impl CgroupManager {
         )))
     }
 
-    // ---- Freeze-guard primitives -----------------------------------------
-    // Used by the guard Effector. A guard target lives in its own `guard-<pid>`
-    // cgroup: freeze toggles `cgroup.freeze`, soft-cap sets `memory.high`.
-
-    fn guard_path(&self, pid: u32) -> PathBuf {
-        self.base_path.join(format!("guard-{pid}"))
-    }
-
-    /// Ensure `guard-<pid>` exists and the process is in it.
-    fn ensure_guard_cgroup(&self, pid: u32) -> Result<PathBuf> {
-        let path = self.guard_path(pid);
-        self.create_cgroup(&path)?;
-        self.add_process(&path, pid)?;
-        Ok(path)
-    }
-
-    /// Move `pid` into its guard cgroup and freeze it (cgroup v2 freezer).
-    pub fn freeze_pid(&self, pid: u32) -> Result<()> {
-        let path = self.ensure_guard_cgroup(pid)?;
-        fs::write(path.join("cgroup.freeze"), "1")
-            .map_err(|e| Error::Cgroup(format!("failed to freeze {pid}: {e}")))?;
-        tracing::info!(pid, "froze process");
-        Ok(())
-    }
-
-    /// Resume a frozen process. The process stays in its guard cgroup.
-    pub fn thaw_pid(&self, pid: u32) -> Result<()> {
-        let path = self.guard_path(pid);
-        if path.exists() {
-            fs::write(path.join("cgroup.freeze"), "0")
-                .map_err(|e| Error::Cgroup(format!("failed to thaw {pid}: {e}")))?;
-            tracing::info!(pid, "thawed process");
-        }
-        Ok(())
-    }
-
-    /// Soft-cap a process via `memory.high` (throttle/reclaim, never OOM-kill).
-    pub fn soft_cap_pid(&self, pid: u32, high_bytes: u64) -> Result<()> {
-        let path = self.ensure_guard_cgroup(pid)?;
-        fs::write(path.join("memory.high"), high_bytes.to_string())
-            .map_err(|e| Error::Cgroup(format!("failed to cap {pid}: {e}")))?;
-        tracing::info!(pid, high_bytes, "soft-capped process");
-        Ok(())
-    }
-
-    /// Remove a soft cap (set `memory.high=max`).
-    pub fn lift_cap_pid(&self, pid: u32) -> Result<()> {
-        let path = self.guard_path(pid);
-        if path.exists() {
-            let _ = fs::write(path.join("memory.high"), "max");
-            tracing::info!(pid, "lifted soft cap");
-        }
-        Ok(())
-    }
-
-    /// Tear down a guard cgroup (moves the process out, removes the dir).
-    pub fn cleanup_guard(&self, pid: u32) -> Result<()> {
-        // Always thaw first: a frozen task can't be migrated out, and we must
-        // never leave a process stuck frozen even if the teardown below fails.
-        let _ = self.thaw_pid(pid);
-        self.cleanup_cgroup(&format!("guard-{pid}"))
-    }
-
-    /// List PIDs that currently have a `guard-<pid>` cgroup.
-    pub fn list_guard_pids(&self) -> Vec<u32> {
-        let mut pids = Vec::new();
-        if let Ok(entries) = fs::read_dir(&self.base_path) {
-            for entry in entries.flatten() {
-                if let Some(name) = entry.file_name().to_str() {
-                    if let Some(rest) = name.strip_prefix("guard-") {
-                        if let Ok(pid) = rest.parse::<u32>() {
-                            pids.push(pid);
-                        }
-                    }
-                }
-            }
-        }
-        pids
-    }
-
     /// Whether a child cgroup with this name currently exists.
     pub fn cgroup_exists(&self, name: &str) -> bool {
         self.base_path.join(name).is_dir()
@@ -483,12 +412,31 @@ impl CgroupManager {
         }
     }
 
-    /// Startup recovery: thaw and clean up every leftover guard cgroup so no
-    /// process is left frozen after a prior crash.
+    /// Startup recovery: thaw and clean up every leftover `guard-<pid>`
+    /// cgroup so no process is left frozen after a prior crash.
+    ///
+    /// Legacy: pre-act-in-place `rlm-guard` builds moved a target process into
+    /// its own `guard-<pid>` cgroup to freeze/cap it; the guard now acts in
+    /// place on the process's existing cgroup (journal-backed, see
+    /// `guard/effector.rs`) and never creates `guard-<pid>` cgroups itself.
+    /// This sweep only exists to clean up leftovers from an upgrade across
+    /// that change and can be removed after one release.
     pub fn sweep_guard_leftovers(&self) -> Result<()> {
-        for pid in self.list_guard_pids() {
-            let _ = self.thaw_pid(pid);
-            let _ = self.cleanup_guard(pid);
+        let Ok(entries) = fs::read_dir(&self.base_path) else {
+            return Ok(());
+        };
+        for entry in entries.flatten() {
+            let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            if !name.starts_with("guard-") {
+                continue;
+            }
+            // Always thaw first: a frozen task can't be migrated out, and we
+            // must never leave a process stuck frozen even if the teardown
+            // below fails.
+            let _ = fs::write(entry.path().join("cgroup.freeze"), "0");
+            let _ = self.cleanup_cgroup(&name);
         }
         Ok(())
     }

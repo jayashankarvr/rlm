@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["cli", "rlm-core", "common", "gtk-gui", "guard"]
+members = ["cli", "rlm-core", "common", "gtk-gui", "guard", "harness"]
 
 [workspace.package]
 version = "0.1.0"
