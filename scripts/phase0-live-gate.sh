@@ -52,8 +52,8 @@ fail() { log "FAIL  $*"; FAILURES=$((FAILURES + 1)); }
 cleanup() {
   local rc=$?
   log "--- cleanup ---"
-  systemctl --user stop "${HOG_UNIT}.scope" 2>/dev/null || true
-  systemctl --user reset-failed "${HOG_UNIT}.scope" 2>/dev/null || true
+  systemctl --user stop "${HOG_UNIT}.scope" "${HOG_UNIT}-2.scope" 2>/dev/null || true
+  systemctl --user reset-failed "${HOG_UNIT}.scope" "${HOG_UNIT}-2.scope" 2>/dev/null || true
   pkill -f 'rlm-gate-hog-payload' 2>/dev/null || true
   # Never leave anything frozen because this script died.
   local base
@@ -129,6 +129,61 @@ if [[ -t 0 && "${I_KNOW:-0}" != "1" ]]; then
 fi
 
 # ------------------------------------------------- criterion 1: in place ----
+start_hog() {  # $1 = unit name; sets HOG_PID
+  local unit="$1"
+  # Three independent bounds on the hog, because the one that matters is the
+  # one that survives this script being killed:
+  #   1. the payload's own monotonic deadline — cannot be orphaned, it IS the hog
+  #   2. RuntimeMaxSec on the scope — systemd SIGKILLs the cgroup at the deadline
+  #   3. MemoryMax on the scope — bounds magnitude, not just duration
+  #
+  # The hog RAMPS until PSI responds, then stops growing. A hog sized as a
+  # fraction of MemAvailable generates no pressure at all (MemAvailable is by
+  # definition what you can take WITHOUT reclaim — measured 0.00 PSI for 2.4GB
+  # against 4.3GB available). Overshooting is how you freeze the desktop, so it
+  # grows in small steps and stops the moment PSI clears the target.
+  systemd-run --user --scope --unit="$unit" --quiet \
+    --property="RuntimeMaxSec=${HOG_MAX_SECONDS}" \
+    --property="MemoryMax=${HOG_CEILING_MB}M" \
+    python3 -c "
+import sys, time
+sys.argv[0] = 'rlm-gate-hog-payload'
+
+def psi_some():
+    try:
+        with open('/proc/pressure/memory') as f:
+            for line in f:
+                if line.startswith('some '):
+                    for tok in line.split():
+                        if tok.startswith('avg10='):
+                            return float(tok[6:])
+    except OSError:
+        pass
+    return 0.0
+
+deadline = time.monotonic() + $HOG_MAX_SECONDS
+ceiling  = $HOG_CEILING_MB
+target   = $PSI_TARGET
+chunks, held = [], 0
+
+while time.monotonic() < deadline and held < ceiling:
+    if psi_some() >= target:
+        print('psi target reached at %dMB' % held, flush=True)
+        break
+    chunks.append(bytearray(128 * 1024 * 1024))
+    held += 128
+    time.sleep(0.25)
+else:
+    print('ramp ended without psi target (held=%dMB)' % held, flush=True)
+
+while time.monotonic() < deadline:
+    time.sleep(1)
+" &
+  HOG_SHELL_PID=$!
+  sleep 4
+  HOG_PID="$(pgrep -f rlm-gate-hog-payload | tail -1)"
+}
+
 log "--- criterion 1: freeze acts in place ---"
 # Three independent bounds on the hog, because the one that matters is the one
 # that survives this script being killed:
@@ -147,49 +202,8 @@ log "--- criterion 1: freeze acts in place ---"
 # grows in small steps and stops the moment PSI clears the target — just enough
 # pressure to trigger the guard, no more. The ceiling, the deadline and
 # MemoryMax all still bound it if PSI never responds.
-systemd-run --user --scope --unit="$HOG_UNIT" --quiet \
-  --property="RuntimeMaxSec=${HOG_MAX_SECONDS}" \
-  --property="MemoryMax=${HOG_CEILING_MB}M" \
-  python3 -c "
-import sys, time
-sys.argv[0] = 'rlm-gate-hog-payload'
+start_hog "$HOG_UNIT"
 
-def psi_some():
-    try:
-        with open('/proc/pressure/memory') as f:
-            for line in f:
-                if line.startswith('some '):
-                    for tok in line.split():
-                        if tok.startswith('avg10='):
-                            return float(tok[6:])
-    except OSError:
-        pass
-    return 0.0
-
-deadline  = time.monotonic() + $HOG_MAX_SECONDS
-ceiling   = $HOG_CEILING_MB
-target    = $PSI_TARGET
-step_mb   = 128
-chunks, held = [], 0
-
-# Ramp: add a step, let the kernel react, re-read PSI. Stop on ANY of:
-# PSI target reached, ceiling hit, or deadline.
-while time.monotonic() < deadline and held < ceiling:
-    p = psi_some()
-    if p >= target:
-        print('psi target reached: some avg10=%.2f at %dMB' % (p, held), flush=True)
-        break
-    chunks.append(bytearray(step_mb * 1024 * 1024))   # touched => resident
-    held += step_mb
-    time.sleep(0.25)
-else:
-    print('ramp ended without reaching psi target (held=%dMB)' % held, flush=True)
-
-# Hold so the guard has a stable window to act in, then release.
-while time.monotonic() < deadline:
-    time.sleep(1)
-" &
-HOG_SHELL_PID=$!
 sleep 3
 
 HOG_PID="$(pgrep -f rlm-gate-hog-payload | head -1)"
@@ -249,6 +263,14 @@ fi
 
 # --------------------------------------- criterion 2: kill -9 mid-freeze ----
 log "--- criterion 2: journal replay after kill -9 mid-freeze ---"
+# Criterion 1 released its hog to prove the cap lifts, so that scope is gone.
+# This criterion needs a LIVE subject to strand: start a fresh one.
+HOG_UNIT2="${HOG_UNIT}-2"
+start_hog "$HOG_UNIT2"
+[[ -n "$HOG_PID" ]] || { fail "second hog did not start"; HOG_PID=0; }
+SCOPE2="$(cat /proc/"$HOG_PID"/cgroup 2>/dev/null | cut -d: -f3)"
+HIGH2_BEFORE="$(cat "/sys/fs/cgroup${SCOPE2}/memory.high" 2>/dev/null || echo missing)"
+log "second hog pid $HOG_PID in $SCOPE2 (memory.high=$HIGH2_BEFORE)"
 log "waiting for a fresh intervention to kill during..."
 KILLED=0
 for _ in $(seq 60); do
@@ -263,12 +285,12 @@ if [[ "$KILLED" -eq 1 ]]; then
   sleep 8   # systemd Restart=on-failure brings it back; sweep runs at startup
   systemctl --user is-active --quiet rlm-guard.service || systemctl --user start rlm-guard.service
   sleep 4
-  FROZEN="$(cat "/sys/fs/cgroup${SCOPE_BEFORE}/cgroup.events" 2>/dev/null | awk '/^frozen/{print $2}')"
-  HIGH_REPLAY="$(cat "/sys/fs/cgroup${SCOPE_BEFORE}/memory.high" 2>/dev/null || echo missing)"
+  FROZEN="$(cat "/sys/fs/cgroup${SCOPE2}/cgroup.events" 2>/dev/null | awk '/^frozen/{print $2}')"
+  HIGH_REPLAY="$(cat "/sys/fs/cgroup${SCOPE2}/memory.high" 2>/dev/null || echo missing)"
   [[ "${FROZEN:-0}" == "0" ]] && pass "process not left frozen after daemon SIGKILL + restart" \
                               || fail "process STILL FROZEN after restart — journal replay did not thaw it"
-  [[ "$HIGH_REPLAY" == "$HIGH_BEFORE" ]] && pass "memory.high restored by journal replay ($HIGH_REPLAY)" \
-                                         || fail "memory.high not restored by replay: expected $HIGH_BEFORE, got $HIGH_REPLAY"
+  [[ "$HIGH_REPLAY" == "$HIGH2_BEFORE" ]] && pass "memory.high restored by journal replay ($HIGH_REPLAY)" \
+                                         || fail "memory.high not restored by replay: expected $HIGH2_BEFORE, got $HIGH_REPLAY"
 else
   fail "could not catch an intervention to kill during — criterion 2 unverified"
 fi
