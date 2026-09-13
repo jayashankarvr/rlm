@@ -193,13 +193,33 @@ impl<'a> Effector<'a> {
             )));
         };
         let prev_high = cgfs::read_high(&res.cgroup);
+        // rlm sets memory.swap.max=0 on every cgroup it creates (see
+        // cgroup.rs's set_memory_limit), which makes anon unreclaimable
+        // there: an anon-derived memory.high target can demand a reduction
+        // the kernel cannot satisfy, degrading the soft cap into an
+        // unbounded allocator stall (memory.high never OOM-kills). Detect
+        // that up front so `cap_target` can floor the demand to what file
+        // reclaim alone can satisfy.
+        let can_swap = cgfs::can_reclaim_anon(&res.cgroup);
+        if !can_swap {
+            tracing::warn!(
+                cgroup = %res.cgroup, name,
+                "memory.swap.max=0 on this cgroup; anon is unreclaimable, \
+                 flooring the soft cap to what file-page reclaim can satisfy"
+            );
+        }
         // The kernel truncates `memory.high` writes to page multiples, so we
         // must journal/write the value it will actually store — not the raw
-        // 90%-of-anon target — or `should_restore`'s string-equality check
-        // can never pass again and the cap becomes permanent (Task 6 review,
+        // target — or `should_restore`'s string-equality check can never
+        // pass again and the cap becomes permanent (Task 6 review,
         // Critical #1).
         let our_bytes = page_align_down(
-            cap_from_anon(cgfs::anon_swap_bytes(&res.cgroup)),
+            cap_target(
+                cgfs::anon_swap_bytes(&res.cgroup),
+                cgfs::current_bytes(&res.cgroup),
+                cgfs::file_bytes(&res.cgroup),
+                can_swap,
+            ),
             page_size(),
         );
         // Plain decimal bytes, no separators/whitespace: this must be
@@ -460,6 +480,45 @@ pub fn cap_from_anon(anon_swap: Option<u64>) -> u64 {
         .unwrap_or(MIN_CAP_BYTES)
 }
 
+/// Size a soft cap so the reduction it demands is actually achievable.
+///
+/// With swap, anon is reclaimable and 90% of anon+swap is the right target.
+/// Without swap (rlm sets memory.swap.max=0 on cgroups it creates), ONLY file
+/// pages can be freed, so an anon-derived target can demand a reduction the
+/// kernel cannot satisfy — memory.high then throttles the allocator in the
+/// reclaim path indefinitely. memory.high never OOM-kills; it stalls. So when
+/// anon cannot be reclaimed, floor the cap so file reclaim alone can satisfy
+/// it, keeping the cap soft at the cost of applying less pressure.
+///
+/// `can_swap` selects the branch: `true` reproduces [`cap_from_anon`]'s
+/// figure exactly (the swap-capable case is unchanged). `false` raises that
+/// figure to at least `current - 80% of file` — i.e. never demands more than
+/// roughly 80% of file-backed pages be reclaimed — then still applies the
+/// [`MIN_CAP_BYTES`] floor. If `current` or `file` can't be read, this falls
+/// back to today's anon-derived behaviour and logs a warning, rather than
+/// guessing.
+pub fn cap_target(
+    anon_swap: Option<u64>,
+    current: Option<u64>,
+    file: Option<u64>,
+    can_swap: bool,
+) -> u64 {
+    let anon_target = cap_from_anon(anon_swap);
+    if can_swap {
+        return anon_target;
+    }
+    let (Some(current), Some(file)) = (current, file) else {
+        tracing::warn!(
+            "cannot read memory.current/memory.stat file for no-swap cap sizing; \
+             falling back to the anon-derived target"
+        );
+        return anon_target;
+    };
+    // Never demand more than ~80% of file pages be reclaimed.
+    let file_reclaim_floor = current.saturating_sub(file.saturating_mul(8) / 10);
+    anon_target.max(file_reclaim_floor).max(MIN_CAP_BYTES)
+}
+
 /// Pure: the full restore decision for one cgroup's journal `entries`
 /// (oldest-first), given the cgroup's current inode and on-disk
 /// `memory.high` (both already read by the caller — no IO here). Answers two
@@ -577,6 +636,79 @@ mod tests {
         assert_eq!(cap_from_anon(Some(1_000_000_000)), 900_000_000);
         assert_eq!(cap_from_anon(Some(1_000_000)), MIN_CAP_BYTES);
         assert_eq!(cap_from_anon(None), MIN_CAP_BYTES);
+    }
+
+    /// Swap-capable cgroups (the common case: systemd unit scopes) must get
+    /// exactly `cap_from_anon`'s figure — this fix must not change behaviour
+    /// when anon is actually reclaimable.
+    #[test]
+    fn cap_target_swap_capable_matches_cap_from_anon() {
+        let anon_swap = Some(1_000_000_000);
+        let current = Some(2_000_000_000);
+        let file = Some(1_000_000_000);
+        assert_eq!(
+            cap_target(anon_swap, current, file, true),
+            cap_from_anon(anon_swap)
+        );
+    }
+
+    /// No-swap (rlm-managed cgroup, memory.swap.max=0) with plenty of file
+    /// cache: the anon-derived target would demand an unreclaimable
+    /// reduction, so the cap must be raised above the anon figure to at most
+    /// what file reclaim can actually satisfy (current - 80% of file).
+    #[test]
+    fn cap_target_no_swap_with_file_raises_above_anon_target() {
+        // anon+swap = 1_000_000_000 -> anon_target = 900_000_000.
+        // current = 3_000_000_000, file = 2_000_000_000 (mostly cache).
+        // file_reclaim_floor = 3_000_000_000 - 2_000_000_000*0.8 = 1_400_000_000.
+        let anon_swap = Some(1_000_000_000);
+        let current = Some(3_000_000_000);
+        let file = Some(2_000_000_000);
+        let target = cap_target(anon_swap, current, file, false);
+        assert!(
+            target > cap_from_anon(anon_swap),
+            "no-swap target ({target}) must be raised above the anon-derived figure"
+        );
+        assert_eq!(target, 1_400_000_000);
+    }
+
+    /// No-swap with almost no file cache to reclaim from (an anon-heavy
+    /// workload): the target must collapse to ~`current` (demanding no
+    /// reduction) rather than the unsatisfiable anon-derived figure — a soft
+    /// cap that can't be met just stalls the allocator forever.
+    #[test]
+    fn cap_target_no_swap_with_no_file_collapses_to_current() {
+        let current = Some(1_073_741_824);
+        let anon_swap = Some(1_073_741_824); // all anon, no file at all
+        let file = Some(0);
+        assert_eq!(cap_target(anon_swap, current, file, false), 1_073_741_824);
+    }
+
+    /// Unreadable `current`/`file` must fall back to today's anon-derived
+    /// behaviour rather than panicking or guessing.
+    #[test]
+    fn cap_target_falls_back_when_current_or_file_unreadable() {
+        let anon_swap = Some(1_000_000_000);
+        assert_eq!(
+            cap_target(anon_swap, None, Some(1_000_000_000), false),
+            cap_from_anon(anon_swap)
+        );
+        assert_eq!(
+            cap_target(anon_swap, Some(1_000_000_000), None, false),
+            cap_from_anon(anon_swap)
+        );
+        assert_eq!(
+            cap_target(anon_swap, None, None, false),
+            cap_from_anon(anon_swap)
+        );
+    }
+
+    /// The MIN_CAP_BYTES floor still applies in the no-swap branch even when
+    /// both the anon-derived figure and the file-reclaim floor are tiny.
+    #[test]
+    fn cap_target_no_swap_still_respects_min_cap_floor() {
+        let target = cap_target(Some(1_000), Some(2_000), Some(1_000), false);
+        assert_eq!(target, MIN_CAP_BYTES);
     }
 
     /// Carry-forward (Task 3 review): `our_high` must be a plain decimal

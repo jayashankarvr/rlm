@@ -68,6 +68,48 @@ fn combine_anon_swap(anon: u64, swap_content: Option<&str>) -> u64 {
     anon + swap
 }
 
+/// Read the current memory usage (memory.current), in bytes.
+pub fn current_bytes(cg: &str) -> Option<u64> {
+    fs::read_to_string(abs(cg).join("memory.current"))
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+}
+
+/// Read the raw `memory.swap.max` value (verbatim, trimmed: either "max" or a
+/// byte count). `0` means the cgroup cannot swap out anon memory at all —
+/// rlm writes this on every cgroup it creates (see `cgroup.rs`'s
+/// `set_memory_limit`) to keep a hard `memory.max` a true RAM ceiling.
+pub fn swap_max(cg: &str) -> Option<String> {
+    fs::read_to_string(abs(cg).join("memory.swap.max"))
+        .ok()
+        .map(|s| s.trim().to_string())
+}
+
+/// Get the file-backed (page cache) byte count from `memory.stat`'s `file`
+/// line — the only pool a swap-disabled cgroup can actually reclaim from.
+pub fn file_bytes(cg: &str) -> Option<u64> {
+    let stat = fs::read_to_string(abs(cg).join("memory.stat")).ok()?;
+    parse_file(&stat)
+}
+
+/// Whether this cgroup's anon memory is reclaimable via swap. Delegates the
+/// decision to the pure [`parse_can_reclaim_anon`]; unreadable is treated
+/// permissively (true) since most cgroups (systemd unit scopes) have swap
+/// enabled and a missing read shouldn't wrongly floor a soft cap.
+pub fn can_reclaim_anon(cg: &str) -> bool {
+    parse_can_reclaim_anon(swap_max(cg).as_deref())
+}
+
+/// Pure: given the raw (already-trimmed) `memory.swap.max` content, whether
+/// anon memory in the cgroup is reclaimable via swap. `Some("0")` means
+/// swap is explicitly disabled for this cgroup — anon is pinned and only
+/// file-backed pages can be freed. `"max"`, any other positive number, or an
+/// unreadable file (`None`) all mean anon can be reclaimed (or we can't tell,
+/// so assume the common case).
+pub fn parse_can_reclaim_anon(swap_max: Option<&str>) -> bool {
+    !matches!(swap_max.and_then(|s| s.parse::<u64>().ok()), Some(0))
+}
+
 /// Get the inode number of the cgroup directory.
 pub fn dir_inode(cg: &str) -> Option<u64> {
     let metadata = fs::metadata(abs(cg)).ok()?;
@@ -158,6 +200,14 @@ pub fn parse_anon(stat: &str) -> Option<u64> {
         .find_map(|l| l.strip_prefix("anon ")?.trim().parse::<u64>().ok())
 }
 
+/// Pure parser: extract the file-backed (page cache) value from memory.stat
+/// text. Looks for a "file <value>" line and returns the parsed value, or
+/// `None` if not found.
+pub fn parse_file(stat: &str) -> Option<u64> {
+    stat.lines()
+        .find_map(|l| l.strip_prefix("file ")?.trim().parse::<u64>().ok())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -174,6 +224,33 @@ mod tests {
         let stat = "anon 1073741824\nfile 536870912\nkernel 1000\n";
         assert_eq!(parse_anon(stat), Some(1_073_741_824));
         assert_eq!(parse_anon("file 5\n"), None);
+    }
+
+    #[test]
+    fn parse_file_reads_memory_stat() {
+        let stat = "anon 1073741824\nfile 536870912\nkernel 1000\n";
+        assert_eq!(parse_file(stat), Some(536_870_912));
+        assert_eq!(parse_file("anon 5\n"), None);
+    }
+
+    #[test]
+    fn parse_can_reclaim_anon_reads_swap_max() {
+        assert!(
+            !parse_can_reclaim_anon(Some("0")),
+            "swap.max=0 means anon is pinned, unreclaimable"
+        );
+        assert!(
+            parse_can_reclaim_anon(Some("max")),
+            "\"max\" means unlimited swap, anon reclaimable"
+        );
+        assert!(
+            parse_can_reclaim_anon(Some("2147483648")),
+            "a positive swap budget means anon reclaimable"
+        );
+        assert!(
+            parse_can_reclaim_anon(None),
+            "unreadable file degrades permissively (assume reclaimable)"
+        );
     }
 
     #[test]
