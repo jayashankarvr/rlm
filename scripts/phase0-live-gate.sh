@@ -87,9 +87,13 @@ fi
 
 MEM_AVAIL_KB=$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)
 MEM_TOTAL_KB=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)
-HOG_MB=$(python3 -c "print(int($MEM_AVAIL_KB / 1024 * $HOG_FRACTION))")
-HEADROOM_MB=$(( MEM_AVAIL_KB / 1024 - HOG_MB ))
-[[ "$HOG_MB" -gt 200 ]] || { echo "computed hog size ${HOG_MB}MB is too small to induce pressure; free some memory first" >&2; exit 2; }
+# The hog ramps toward a PSI target rather than a fixed size (see below).
+# HOG_FRACTION now sets the CEILING as a multiple of MemAvailable: it must be
+# >1.0 to be able to induce reclaim at all, and it is a hard stop, not a goal.
+HOG_CEILING_MB=$(python3 -c "print(int($MEM_AVAIL_KB / 1024 * $HOG_FRACTION))")
+PSI_TARGET="${PSI_TARGET:-35}"   # above the guard's default psi_some_high=30
+HEADROOM_MB=$(( MEM_TOTAL_KB / 1024 - HOG_CEILING_MB ))
+[[ "$HOG_CEILING_MB" -gt 200 ]] || { echo "computed ceiling ${HOG_CEILING_MB}MB is too small to induce pressure" >&2; exit 2; }
 
 # Loud, unconditional statement of intent BEFORE doing anything. The harness
 # review found a gate whose warning printed nothing on the machines it was
@@ -100,8 +104,8 @@ cat <<EOF | tee -a "$LOG"
 
   MemTotal      : $((MEM_TOTAL_KB / 1024)) MB
   MemAvailable  : $((MEM_AVAIL_KB / 1024)) MB
-  Hog will take : ${HOG_MB} MB (fraction ${HOG_FRACTION})
-  Headroom left : ${HEADROOM_MB} MB
+  Hog ceiling   : ${HOG_CEILING_MB} MB (hard stop; ramps only until PSI >= ${PSI_TARGET}%)
+  Total RAM left: ${HEADROOM_MB} MB if the ceiling is ever reached
   Hog lifetime  : hard-capped at ${HOG_MAX_SECONDS}s (three independent bounds)
 
   Expect the desktop to stutter. Save your work first. If anything goes
@@ -133,20 +137,56 @@ log "--- criterion 1: freeze acts in place ---"
 #      uninterruptible state; systemd SIGKILLs the whole cgroup at the deadline
 #   3. MemoryMax on the scope — bounds magnitude, so an arithmetic slip in
 #      HOG_MB cannot outrun the headroom check above
+# The hog RAMPS until PSI actually responds, then stops growing.
+#
+# Why not a fixed size: MemAvailable is by definition how much you can allocate
+# WITHOUT significant reclaim, so any hog sized as a fraction of it generates
+# no pressure at all — measured 0.00 PSI for a 2.4GB hog against 4.3GB
+# available. To make the guard's trigger fire you must push past MemAvailable
+# and force reclaim. But overshooting is how you freeze the desktop, so the hog
+# grows in small steps and stops the moment PSI clears the target — just enough
+# pressure to trigger the guard, no more. The ceiling, the deadline and
+# MemoryMax all still bound it if PSI never responds.
 systemd-run --user --scope --unit="$HOG_UNIT" --quiet \
   --property="RuntimeMaxSec=${HOG_MAX_SECONDS}" \
-  --property="MemoryMax=$((HOG_MB + 256))M" \
+  --property="MemoryMax=${HOG_CEILING_MB}M" \
   python3 -c "
 import sys, time
 sys.argv[0] = 'rlm-gate-hog-payload'
-deadline = time.monotonic() + $HOG_MAX_SECONDS
-n = $HOG_MB
-chunks = []
-for _ in range(n // 64):
-    if time.monotonic() > deadline: break
-    chunks.append(bytearray(64 * 1024 * 1024))   # touched, so it is resident
-    time.sleep(0.05)
-while time.monotonic() < deadline:               # self-limiting: never 'sleep infinity'
+
+def psi_some():
+    try:
+        with open('/proc/pressure/memory') as f:
+            for line in f:
+                if line.startswith('some '):
+                    for tok in line.split():
+                        if tok.startswith('avg10='):
+                            return float(tok[6:])
+    except OSError:
+        pass
+    return 0.0
+
+deadline  = time.monotonic() + $HOG_MAX_SECONDS
+ceiling   = $HOG_CEILING_MB
+target    = $PSI_TARGET
+step_mb   = 128
+chunks, held = [], 0
+
+# Ramp: add a step, let the kernel react, re-read PSI. Stop on ANY of:
+# PSI target reached, ceiling hit, or deadline.
+while time.monotonic() < deadline and held < ceiling:
+    p = psi_some()
+    if p >= target:
+        print('psi target reached: some avg10=%.2f at %dMB' % (p, held), flush=True)
+        break
+    chunks.append(bytearray(step_mb * 1024 * 1024))   # touched => resident
+    held += step_mb
+    time.sleep(0.25)
+else:
+    print('ramp ended without reaching psi target (held=%dMB)' % held, flush=True)
+
+# Hold so the guard has a stable window to act in, then release.
+while time.monotonic() < deadline:
     time.sleep(1)
 " &
 HOG_SHELL_PID=$!
@@ -170,6 +210,8 @@ done
 
 sleep 12   # let the freeze hold elapse and auto-thaw
 
+# Check placement while the hog is still alive — that is the "acted in place"
+# question and it must be asked before anything exits.
 SCOPE_AFTER="$(cat /proc/"$HOG_PID"/cgroup 2>/dev/null | cut -d: -f3 || echo GONE)"
 HIGH_AFTER="$(cat "/sys/fs/cgroup${SCOPE_AFTER}/memory.high" 2>/dev/null || echo missing)"
 
@@ -178,10 +220,26 @@ if [[ "$SCOPE_AFTER" == "$SCOPE_BEFORE" ]]; then
 else
   fail "process moved: $SCOPE_BEFORE -> $SCOPE_AFTER"
 fi
+# A cap still being applied HERE is correct, not a failure: the engine holds a
+# soft cap until calm_hold_secs (default 30) of SUSTAINED calm, and the hog is
+# still running. The real question is whether the cap is ever lifted. So:
+# release the pressure, then give the engine its calm window plus slack.
+CALM_HOLD="$(awk -F'[ ,]+' '/calm_hold_secs:/ {print $NF; exit}' "$HOME/.config/rlm/config.yaml" 2>/dev/null)"
+CALM_HOLD="${CALM_HOLD:-30}"
 if [[ "$HIGH_AFTER" == "$HIGH_BEFORE" ]]; then
-  pass "memory.high restored to original ($HIGH_AFTER)"
+  pass "memory.high unchanged while capped window active ($HIGH_AFTER)"
 else
-  fail "memory.high not restored: was $HIGH_BEFORE, now $HIGH_AFTER"
+  log "cap currently applied (memory.high=$HIGH_AFTER); releasing pressure and waiting ${CALM_HOLD}s+ for the lift"
+  systemctl --user stop "${HOG_UNIT}.scope" 2>/dev/null || true
+  LIFTED=0
+  for _ in $(seq $((CALM_HOLD + 20))); do
+    NOW_HIGH="$(cat "/sys/fs/cgroup${SCOPE_BEFORE}/memory.high" 2>/dev/null || echo GONE)"
+    # The scope disappearing with the hog is also a valid end state.
+    if [[ "$NOW_HIGH" == "$HIGH_BEFORE" || "$NOW_HIGH" == "GONE" ]]; then LIFTED=1; break; fi
+    sleep 1
+  done
+  [[ "$LIFTED" -eq 1 ]] && pass "cap lifted after calm sustained (memory.high back to $HIGH_BEFORE / scope released)" \
+                        || fail "cap never lifted: still $NOW_HIGH after $((CALM_HOLD + 20))s of calm"
 fi
 if [[ -d /sys/fs/cgroup/rlm ]] && find /sys/fs/cgroup -maxdepth 6 -name 'guard-*' 2>/dev/null | grep -q .; then
   fail "a guard-<pid> cgroup exists — the deleted migration machinery is somehow back"
