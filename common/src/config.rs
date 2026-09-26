@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 const MAX_CONFIG_SIZE: u64 = 1_048_576;
 
 #[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default)]
     pub profiles: HashMap<String, Profile>,
@@ -28,6 +29,7 @@ pub struct Config {
 /// in `match_exe` are placed into a shared `app-<name>` cgroup with these limits.
 /// Limits are stored inline (a snapshot), not as a reference to a profile.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AppRule {
     /// Executable basenames this rule matches.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -88,7 +90,7 @@ impl AppRule {
 /// Configuration for the `rlm-guard` freeze-guard daemon. Every field defaults,
 /// so a missing `guard:` section (or any missing key) yields a working setup.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct GuardConfig {
     pub enabled: bool,
     pub trigger: GuardTrigger,
@@ -113,11 +115,45 @@ impl GuardConfig {
     pub fn is_default(&self) -> bool {
         *self == GuardConfig::default()
     }
+
+    /// Reject values the guard cannot act on safely. Called by rlm-guard at
+    /// startup and by `rlm guard status` / `rlm doctor`.
+    pub fn validate(&self) -> Result<()> {
+        let bad = |m: &str| Err(Error::Config(format!("guard: {m}")));
+        let t = &self.trigger;
+        let pct = |v: f64| v > 0.0 && v <= 100.0;
+        if !pct(t.psi_some_warn) || !pct(t.psi_some_high) || !pct(t.psi_full_critical) {
+            return bad("trigger PSI thresholds must be between 0 (exclusive) and 100");
+        }
+        if t.psi_some_warn >= t.psi_some_high {
+            return bad("trigger.psi_some_warn must be below trigger.psi_some_high");
+        }
+        if !(1..=100).contains(&t.act_below_available_pct) {
+            return bad("trigger.act_below_available_pct must be between 1 and 100");
+        }
+        let tm = &self.timing;
+        if !(100..=60_000).contains(&tm.sample_interval_ms) {
+            return bad("timing.sample_interval_ms must be between 100 and 60000");
+        }
+        if !(1..=60).contains(&tm.freeze_hold_secs) {
+            return bad("timing.freeze_hold_secs must be between 1 and 60");
+        }
+        if tm.calm_hold_secs == 0 {
+            return bad("timing.calm_hold_secs must be at least 1");
+        }
+        if tm.freeze_cooldown_secs < tm.freeze_hold_secs {
+            return bad("timing.freeze_cooldown_secs must be at least timing.freeze_hold_secs");
+        }
+        if self.selection.protect.iter().any(|p| p.trim().is_empty()) {
+            return bad("selection.protect must not contain empty names");
+        }
+        Ok(())
+    }
 }
 
 /// Pressure thresholds (PSI percentages and a MemAvailable backstop).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct GuardTrigger {
     /// PSI `some` avg10 (%) at which to start warning.
     pub psi_some_warn: f64,
@@ -127,6 +163,8 @@ pub struct GuardTrigger {
     pub psi_full_critical: f64,
     /// Hard floor: act if MemAvailable drops below this many MB.
     pub mem_available_floor_mb: u64,
+    /// Act only while MemAvailable is below this percentage of MemTotal (or below the floor).
+    pub act_below_available_pct: u64,
 }
 
 impl Default for GuardTrigger {
@@ -136,13 +174,14 @@ impl Default for GuardTrigger {
             psi_some_high: 30.0,
             psi_full_critical: 10.0,
             mem_available_floor_mb: 400,
+            act_below_available_pct: 20,
         }
     }
 }
 
 /// Timing/hysteresis knobs.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct GuardTiming {
     /// How long a freeze is held before auto-thaw.
     pub freeze_hold_secs: u64,
@@ -167,7 +206,7 @@ impl Default for GuardTiming {
 
 /// Victim-selection knobs.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct GuardSelection {
     /// Ignore processes smaller than this (MB of RSS+swap).
     pub min_rss_mb: u64,
@@ -223,6 +262,7 @@ pub fn is_protected(set: &HashSet<String>, comm: &str, exe: Option<&str>) -> boo
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Profile {
     /// Executables this profile matches
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -363,6 +403,13 @@ impl Config {
         }
 
         Ok(config)
+    }
+
+    /// `load()` plus guard validation. rlm-guard refuses to start on `Err`.
+    pub fn load_validated() -> Result<Self> {
+        let c = Self::load()?;
+        c.guard.validate()?;
+        Ok(c)
     }
 
     /// Load config from a specific file
@@ -547,5 +594,73 @@ mod tests {
         );
         assert!(is_protected(&s, "bash", None));
         assert!(!is_protected(&s, "firefox", Some("firefox")));
+    }
+
+    #[test]
+    fn readme_guard_example_parses_and_validates() {
+        let yaml = "guard:\n  enabled: true\n  trigger:   { psi_some_warn: 10, psi_some_high: 30, psi_full_critical: 10, mem_available_floor_mb: 400 }\n  timing:    { freeze_hold_secs: 5, calm_hold_secs: 30, freeze_cooldown_secs: 60, sample_interval_ms: 1000 }\n  selection: { min_rss_mb: 200, protect: [] }\n  notify: true\n";
+        let cfg: Config = serde_yaml_ng::from_str(yaml).unwrap();
+        cfg.guard.validate().unwrap();
+        assert_eq!(cfg.guard.trigger.act_below_available_pct, 20);
+    }
+
+    #[test]
+    fn unknown_guard_key_is_an_error() {
+        let err = serde_yaml_ng::from_str::<Config>("guard:\n  selection: { min_rss: 100 }\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("min_rss"), "{err}");
+    }
+
+    #[test]
+    fn unknown_top_level_and_profile_keys_are_errors() {
+        assert!(serde_yaml_ng::from_str::<Config>("gaurd:\n  enabled: false\n").is_err());
+        assert!(serde_yaml_ng::from_str::<Config>("profiles:\n  a: { memroy: 2G }\n").is_err());
+    }
+
+    #[test]
+    fn claude_md_profile_example_still_parses() {
+        let yaml = "profiles:\n  browser:\n    match_exe: [firefox, chrome]\n    memory: \"4G\"\n    cpu: \"75%\"\n    io_read: \"100M\"\n    io_write: \"50M\"\n";
+        let cfg: Config = serde_yaml_ng::from_str(yaml).unwrap();
+        assert_eq!(cfg.profiles["browser"].memory.as_deref(), Some("4G"));
+    }
+
+    #[test]
+    fn default_guard_config_validates() {
+        GuardConfig::default().validate().unwrap();
+    }
+
+    #[test]
+    #[allow(clippy::type_complexity)]
+    fn validate_rejects_bad_values() {
+        let bad: Vec<Box<dyn Fn(&mut GuardConfig)>> = vec![
+            Box::new(|c| {
+                c.trigger.psi_some_warn = 40.0;
+                c.trigger.psi_some_high = 30.0
+            }),
+            Box::new(|c| c.trigger.psi_full_critical = 0.0),
+            Box::new(|c| c.trigger.psi_some_high = f64::NAN),
+            Box::new(|c| c.trigger.act_below_available_pct = 0),
+            Box::new(|c| c.trigger.act_below_available_pct = 101),
+            Box::new(|c| c.timing.sample_interval_ms = 0),
+            Box::new(|c| c.timing.freeze_hold_secs = 0),
+            Box::new(|c| c.timing.calm_hold_secs = 0),
+            Box::new(|c| c.timing.freeze_cooldown_secs = 1),
+            Box::new(|c| c.selection.protect = vec!["  ".into()]),
+        ];
+        for (i, f) in bad.iter().enumerate() {
+            let mut c = GuardConfig::default();
+            f(&mut c);
+            assert!(c.validate().is_err(), "case {i} should be rejected");
+        }
+    }
+
+    #[test]
+    fn load_from_names_the_file_on_parse_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("config.yaml");
+        std::fs::write(&p, "profiles: [\n").unwrap();
+        let err = Config::load_from(&p).unwrap_err().to_string();
+        assert!(err.contains("config.yaml"), "{err}");
     }
 }

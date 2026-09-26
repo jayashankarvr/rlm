@@ -14,6 +14,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// Exit status for an invalid config. Matches `RestartPreventExitStatus` in
+/// the shipped unit, so systemd does not restart-loop against a file that
+/// cannot fix itself.
+const EX_CONFIG: i32 = 78;
+
 fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -22,14 +27,39 @@ fn main() {
         )
         .init();
 
-    if let Err(e) = run() {
+    let config = match Config::load_validated() {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(
+                "rlm-guard not started: {e}. Fix the file, then run: systemctl --user restart rlm-guard"
+            );
+            // A crash may have left a cgroup frozen or capped; restore it even though we will not run.
+            recover_only();
+            std::process::exit(EX_CONFIG);
+        }
+    };
+
+    if let Err(e) = run(config) {
         tracing::error!("rlm-guard exiting: {e}");
         std::process::exit(1);
     }
 }
 
-fn run() -> common::Result<()> {
-    let config = Config::load().unwrap_or_default();
+/// Replay the write-ahead journal so nothing stays frozen or capped, then return.
+fn recover_only() {
+    let Ok(manager) = CgroupManager::new() else {
+        return;
+    };
+    let Ok(journal) = Journal::open(journal_path(), cgfs::boot_id()) else {
+        return;
+    };
+    let systemd = SystemdUser::connect();
+    if let Err(e) = Effector::new(&manager, &journal, systemd.as_ref()).sweep_leftovers() {
+        tracing::warn!("journal recovery failed: {e}");
+    }
+}
+
+fn run(config: Config) -> common::Result<()> {
     let gcfg = config.guard.clone();
     let enforcer = RulesEnforcer::new(&config);
 
@@ -193,5 +223,28 @@ fn sleep_responsive(total: Duration, shutdown: &AtomicBool) {
         let chunk = step.min(total - slept);
         std::thread::sleep(chunk);
         slept += chunk;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    const UNIT: &str = include_str!("../../cli/assets/rlm-guard.service");
+
+    #[test]
+    fn unit_does_not_restart_on_config_errors() {
+        assert!(UNIT.contains(&format!("RestartPreventExitStatus={}", super::EX_CONFIG)));
+    }
+
+    #[test]
+    fn unit_has_no_directives_a_user_manager_ignores() {
+        assert!(
+            !UNIT.contains("OOMScoreAdjust"),
+            "a user unit cannot lower its OOM score"
+        );
+        assert!(
+            !UNIT.contains("MemoryMin"),
+            "MemoryMin is inert without an ancestor chain"
+        );
+        assert!(UNIT.contains("ExecStart=/usr/bin/rlm-guard"));
     }
 }

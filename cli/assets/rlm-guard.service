@@ -1,0 +1,25 @@
+[Unit]
+Description=rlm guard: freezes or caps a runaway app under memory pressure
+Documentation=https://github.com/jayashankarvr/rlm
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/rlm-guard
+Restart=on-failure
+RestartSec=2
+# Exit status 78 means the config file is invalid. Restarting cannot fix
+# that, so the unit stays failed until the file is corrected.
+RestartPreventExitStatus=78
+# SIGTERM makes the guard undo every freeze and cap before it exits.
+KillSignal=SIGTERM
+TimeoutStopSec=10
+# CPU priority over sibling units when the CPU is contended. This unit
+# intentionally sets no OOM-badness or memory-floor directive: a user unit
+# cannot lower how likely the kernel is to kill it under memory pressure,
+# and a memory floor here would have no effect without a protected ancestor
+# slice reserving memory too.
+CPUWeight=300
+
+[Install]
+WantedBy=default.target
