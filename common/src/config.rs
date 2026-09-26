@@ -1,6 +1,6 @@
 use crate::{Error, Limit, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -205,6 +205,22 @@ pub const BUILTIN_PROTECT: &[&str] = &[
     "zsh",
     "fish",
 ];
+
+/// Built-in protect names plus the user's additions from `guard.selection.protect`.
+pub fn protect_set(extra: &[String]) -> HashSet<String> {
+    BUILTIN_PROTECT
+        .iter()
+        .map(|s| (*s).to_string())
+        .chain(extra.iter().cloned())
+        .collect()
+}
+
+/// A process is protected if its full executable basename is in `set`, or,
+/// when the executable is unreadable, if its comm is. comm is truncated to 15
+/// characters by the kernel, so it only matches short names.
+pub fn is_protected(set: &HashSet<String>, comm: &str, exe: Option<&str>) -> bool {
+    exe.is_some_and(|e| set.contains(e)) || set.contains(comm)
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Profile {
@@ -508,5 +524,28 @@ mod tests {
         assert!(cfg.remove_rule("code"));
         assert!(!cfg.remove_rule("code"));
         assert!(cfg.rules.is_empty());
+    }
+
+    #[test]
+    fn protect_set_merges_builtin_and_extra() {
+        let s = protect_set(&["gnome-control-center".into()]);
+        assert!(s.contains("gnome-shell"));
+        assert!(s.contains("gnome-control-center"));
+    }
+
+    #[test]
+    fn is_protected_prefers_full_exe_name_over_truncated_comm() {
+        let s = protect_set(&["gnome-control-center".into()]);
+        assert!(is_protected(
+            &s,
+            "gnome-control-c",
+            Some("gnome-control-center")
+        ));
+        assert!(
+            !is_protected(&s, "gnome-control-c", None),
+            "truncated comm alone cannot match"
+        );
+        assert!(is_protected(&s, "bash", None));
+        assert!(!is_protected(&s, "firefox", Some("firefox")));
     }
 }

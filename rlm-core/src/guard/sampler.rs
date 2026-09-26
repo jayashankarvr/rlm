@@ -9,7 +9,7 @@ use std::path::Path;
 use super::cgfs;
 use super::resolve::{candidate_target, finalize, Resolution};
 use super::types::{ProcInfo, Sample};
-use common::{GuardConfig, BUILTIN_PROTECT};
+use common::GuardConfig;
 
 /// Samples system pressure and the user's eligible processes.
 pub struct Sampler {
@@ -56,9 +56,7 @@ impl Sampler {
     pub fn new(cfg: GuardConfig, self_pid: u32, uid: u32, rlm_base: Option<String>) -> Self {
         // Merge the baked-in protect-list with the user's additions once, up
         // front, so the per-process scan is a cheap hash lookup.
-        let mut protect: HashSet<String> =
-            BUILTIN_PROTECT.iter().map(|s| (*s).to_string()).collect();
-        protect.extend(cfg.selection.protect.iter().cloned());
+        let protect = common::protect_set(&cfg.selection.protect);
 
         Self {
             cfg,
@@ -152,9 +150,7 @@ impl Sampler {
             // user-configured names like "gnome-control-center". Comm is
             // kept as a fallback for processes whose /proc/<pid>/exe isn't
             // readable (e.g. already exited, or a kernel thread).
-            let protected_by_exe =
-                cgfs::exe_basename(pid).is_some_and(|exe| self.protect.contains(&exe));
-            if protected_by_exe || self.protect.contains(&pname) {
+            if common::is_protected(&self.protect, &pname, cgfs::exe_basename(pid).as_deref()) {
                 continue;
             }
 
@@ -271,12 +267,9 @@ impl Sampler {
 }
 
 /// Parse the v2 line of /proc/<pid>/cgroup ("0::<path>"). Hybrid-mode lines
-/// for other controllers are noise and skipped.
-pub fn parse_cgroup_path(content: &str) -> Option<String> {
-    content
-        .lines()
-        .find_map(|l| l.strip_prefix("0::").map(|p| p.to_string()))
-}
+/// for other controllers are noise and skipped. Delegates to
+/// [`crate::process::parse_cgroup_v2`]; kept under this name for callers.
+pub use crate::process::parse_cgroup_v2 as parse_cgroup_path;
 
 /// Fallback comm lookup (`Name:` in /proc/<pid>/status) for member processes
 /// whose `/proc/<pid>/exe` isn't readable.
@@ -337,40 +330,9 @@ fn parse_mem_available_mb(meminfo: &str) -> Option<u64> {
 }
 
 /// Parse `/proc/<pid>/status`, returning `(real_uid, name, rss_kb)` where
-/// `rss_kb = VmRSS + VmSwap`.
-///
-/// - `Uid:` line is `Uid:\t<real>\t<effective>\t<saved>\t<fs>`; we take the
-///   first (real) field.
-/// - `Name:` is the comm, truncated to 15 chars by the kernel — that's fine,
-///   it matches the protect-list which also compares against comm.
-/// - `VmSwap:` may be absent (e.g. kernel thread / no swap) — treated as 0.
-///
-/// Returns `None` only if the required `Uid:` or `Name:` lines are missing.
+/// `rss_kb = VmRSS + VmSwap`. Delegates to [`crate::process::parse_status`].
 fn parse_proc_status(status: &str) -> Option<(u32, String, u64)> {
-    let mut uid = None;
-    let mut name = None;
-    let mut vm_rss = 0u64;
-    let mut vm_swap = 0u64;
-
-    for line in status.lines() {
-        if let Some(rest) = line.strip_prefix("Name:") {
-            name = Some(rest.trim().to_string());
-        } else if let Some(rest) = line.strip_prefix("Uid:") {
-            // First whitespace-separated field is the real uid.
-            uid = rest.split_whitespace().next().and_then(|v| v.parse().ok());
-        } else if let Some(rest) = line.strip_prefix("VmRSS:") {
-            vm_rss = first_kb(rest).unwrap_or(0);
-        } else if let Some(rest) = line.strip_prefix("VmSwap:") {
-            vm_swap = first_kb(rest).unwrap_or(0);
-        }
-    }
-
-    Some((uid?, name?, vm_rss.saturating_add(vm_swap)))
-}
-
-/// Parse the leading integer of a `"   1234 kB"` style value as a kB count.
-fn first_kb(rest: &str) -> Option<u64> {
-    rest.split_whitespace().next()?.parse().ok()
+    crate::process::parse_status(status).map(|f| (f.uid, f.name, f.rss_kb))
 }
 
 #[cfg(test)]

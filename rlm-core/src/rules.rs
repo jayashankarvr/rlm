@@ -261,9 +261,8 @@ mod tests {
         ProcessInfo {
             pid,
             name: name.to_string(),
-            ppid: None,
-            session: None,
             executable: exe.map(PathBuf::from),
+            ..Default::default()
         }
     }
 
