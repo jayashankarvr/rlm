@@ -104,10 +104,10 @@ impl PolicyEngine {
     /// `targets` are the cgroups eligible for action this tick (already
     /// filtered for uid, protect list and min RSS by the Sampler).
     ///
-    /// `live_cgroups` is the set of cgroups the Sampler currently resolves
-    /// for *any* of the user's real processes, with no min-RSS or protect
-    /// filtering applied (see `Sampler::live_cgroups`) — it is deliberately
-    /// a superset of the targets' cgroups. Pruning checks liveness against
+    /// `live_cgroups` is the subset of the engine's intervened cgroups that
+    /// still hold a process (see `sampler::live_cgroups`), with no min-RSS
+    /// or protect filtering applied; it is deliberately independent of
+    /// `targets`. Pruning checks liveness against
     /// this set, not against `targets`: a successful `Cap` sizes off
     /// anon+swap but `memory.high` also bounds file-backed pages, so capping
     /// a mapped-file-heavy process can push its `rss_kb` below the min-RSS

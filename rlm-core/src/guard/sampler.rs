@@ -1,5 +1,5 @@
-//! Reads memory pressure (PSI) and enumerates eligible processes. Pure reads of
-//! `/proc`; no decisions. The parsing is factored into small pure free
+//! Reads memory pressure (PSI) and picks escalation candidates from a process
+//! snapshot. Pure reads; no decisions. The parsing is factored into small pure free
 //! functions so it can be unit-tested without touching the filesystem.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use super::cgfs;
 use super::resolve::{candidate_target, finalize, Resolution};
 use super::types::{ProcInfo, PsiSource, Sample, Target};
+use crate::process::ProcessInfo;
 use common::GuardConfig;
 
 /// Samples system pressure and the user's eligible processes.
@@ -91,165 +92,49 @@ impl Sampler {
         })
     }
 
-    /// Enumerate eligible processes: owned by `uid`, not protected (builtin +
-    /// config protect-list), `rss_kb >= min_rss_mb * 1024`, excluding the guard
-    /// itself. Sorted by `rss_kb` descending. Robust to processes vanishing
-    /// mid-scan — any unreadable entry is simply skipped.
+    /// The escalation candidates in `snapshot` (normally
+    /// `process::list_for_uid(uid)`, taken once per tick and shared with the
+    /// rules enforcer): owned by `uid`, not the guard itself, at least
+    /// `min_rss_mb`, and not protected (builtin + config protect-list, matched
+    /// on comm and on the untruncated exe basename). Sorted by `rss_kb`
+    /// descending.
     ///
-    /// Also resolves each surviving process to its freeze/cap target (see
-    /// [`ProcInfo::resolution`]). Resolutions are cached per candidate cgroup
-    /// for the duration of this call, so N processes sharing one cgroup (e.g.
-    /// N Firefox content processes) cost a single member scan.
-    pub fn eligible(&self) -> Vec<ProcInfo> {
+    /// Each candidate is named by its exe basename (comm fallback): Firefox
+    /// content processes have comm "Isolated Web Co" but run `firefox`.
+    /// Resolutions are cached per candidate cgroup, so N processes sharing
+    /// one cgroup cost a single member scan.
+    pub fn candidates(&self, snapshot: &[ProcessInfo]) -> Vec<ProcInfo> {
         let min_rss_kb = self.cfg.selection.min_rss_mb.saturating_mul(1024);
-
-        let entries = match fs::read_dir("/proc") {
-            Ok(e) => e,
-            Err(_) => return Vec::new(),
-        };
-
-        let mut resolved: HashMap<String, Resolution> = HashMap::new();
-        let mut out = Vec::new();
-        for entry in entries.flatten() {
-            // `/proc/<pid>` directories are named by their numeric PID; skip
-            // everything else (cpuinfo, self, net, ...).
-            let file_name = entry.file_name();
-            let name = match file_name.to_str() {
-                Some(n) => n,
-                None => continue,
-            };
-            let pid: u32 = match name.parse() {
-                Ok(p) => p,
-                Err(_) => continue,
-            };
-
-            // Never act on ourselves.
-            if pid == self.self_pid {
-                continue;
-            }
-
-            // The process may exit between read_dir and now — that's fine, skip.
-            let status = match fs::read_to_string(format!("/proc/{pid}/status")) {
-                Ok(s) => s,
-                Err(_) => continue,
-            };
-
-            let (owner_uid, pname, rss_kb) = match parse_proc_status(&status) {
-                Some(v) => v,
-                None => continue,
-            };
-
-            // Only the user's own processes are eligible.
-            if owner_uid != self.uid {
-                continue;
-            }
-            // Below the min-RSS threshold — not worth acting on.
-            if rss_kb < min_rss_kb {
-                continue;
-            }
-            // Protected by builtin defaults or user config. The exe basename
-            // (realpath, full name) is authoritative — it's what avoids the
-            // kernel's 15-char `comm` truncation silently missing
-            // user-configured names like "gnome-control-center". Comm is
-            // kept as a fallback for processes whose /proc/<pid>/exe isn't
-            // readable (e.g. already exited, or a kernel thread).
-            let exe = cgfs::exe_basename(pid);
-            if common::is_protected(&self.protect, &pname, exe.as_deref()) {
-                continue;
-            }
-
-            let resolution = self.resolve(pid, &mut resolved);
-
-            // The exe basename names the app: Firefox content processes have
-            // comm "Isolated Web Co" but run the `firefox` binary.
-            out.push(ProcInfo {
-                pid,
-                name: exe.unwrap_or(pname),
-                rss_kb,
-                resolution,
-            });
-        }
-
-        // Largest first, for stable output.
+        let mut cache: HashMap<String, Resolution> = HashMap::new();
+        let mut out: Vec<ProcInfo> = snapshot
+            .iter()
+            .filter(|p| p.pid != self.self_pid && p.uid == self.uid && p.rss_kb >= min_rss_kb)
+            .filter(|p| !common::is_protected(&self.protect, &p.name, p.exe_name()))
+            .map(|p| ProcInfo {
+                pid: p.pid,
+                name: p.display_name().to_string(),
+                rss_kb: p.rss_kb,
+                resolution: p
+                    .cgroup
+                    .as_deref()
+                    .and_then(|cg| self.resolve_cgroup(cg, &mut cache)),
+            })
+            .collect();
         out.sort_by_key(|p| std::cmp::Reverse(p.rss_kb));
         out
     }
 
-    /// Every cgroup currently resolved for one of the user's own, live
-    /// processes — deliberately with **no** min-RSS or protect filtering
-    /// applied (unlike [`Sampler::eligible`]). This is a liveness signal,
-    /// not an escalation candidate list: `PolicyEngine::tick` prunes its
-    /// interventions against this set rather than against `eligible()`'s
-    /// filtered output, because a successful `Cap` sizes off anon+swap while
-    /// `memory.high` also bounds file-backed pages — capping a
-    /// mapped-file-heavy process can push its `rss_kb` below the min-RSS
-    /// floor on the very next tick even though the cgroup, and the process
-    /// in it, are both still very much alive (D2 fix).
-    ///
-    /// Deliberately calls [`candidate_target`] directly rather than
-    /// `Self::resolve`: `resolve` (via `finalize`) additionally runs a
-    /// recursive `cgfs::pids_under` tree walk plus a `readlink
-    /// /proc/<pid>/exe` per member to compute `verdict`/`coverage`, neither
-    /// of which this function uses — only `candidate.cgroup` (`finalize`
-    /// passes `candidate.cgroup` through unchanged into `Resolution::cgroup`,
-    /// so the output is identical). Because this function has no min-RSS
-    /// filter (that's the D2 fix above), it runs for every one of the user's
-    /// processes on every tick, not just the heavy ones, so the member-scan
-    /// work `resolve` does is pure waste here (NEW-3 fix).
-    pub fn live_cgroups(&self) -> HashSet<String> {
-        let mut live = HashSet::new();
-
-        let Some(rlm_base) = self.rlm_base.as_deref() else {
-            return live;
-        };
-
-        let Ok(entries) = fs::read_dir("/proc") else {
-            return live;
-        };
-        for entry in entries.flatten() {
-            let file_name = entry.file_name();
-            let Some(name) = file_name.to_str() else {
-                continue;
-            };
-            let Ok(pid) = name.parse::<u32>() else {
-                continue;
-            };
-            if pid == self.self_pid {
-                continue;
-            }
-
-            let Ok(status) = fs::read_to_string(format!("/proc/{pid}/status")) else {
-                continue;
-            };
-            let Some((owner_uid, _, _)) = parse_proc_status(&status) else {
-                continue;
-            };
-            if owner_uid != self.uid {
-                continue;
-            }
-
-            let Ok(cgroup_file) = fs::read_to_string(format!("/proc/{pid}/cgroup")) else {
-                continue;
-            };
-            let Some(victim_cgroup) = parse_cgroup_path(&cgroup_file) else {
-                continue;
-            };
-            if let Some(candidate) = candidate_target(&victim_cgroup, self.uid, rlm_base) {
-                live.insert(candidate.cgroup);
-            }
-        }
-        live
-    }
-
-    /// Resolve `pid` to its freeze/cap target, if any. `cache` is keyed by
-    /// candidate cgroup so callers in the same eligible-cgroup only pay for
-    /// the member scan once. Returns `None` outright if `rlm_base` failed to
-    /// compute at startup — see [`strip_cgroup_root`].
-    fn resolve(&self, pid: u32, cache: &mut HashMap<String, Resolution>) -> Option<Resolution> {
+    /// Resolve a process's cgroup (the "0::" path) to its freeze/cap target,
+    /// if any. `cache` is keyed by candidate cgroup so processes sharing one
+    /// only pay for the member scan once. Returns `None` outright if
+    /// `rlm_base` failed to compute at startup; see [`strip_cgroup_root`].
+    fn resolve_cgroup(
+        &self,
+        victim_cgroup: &str,
+        cache: &mut HashMap<String, Resolution>,
+    ) -> Option<Resolution> {
         let rlm_base = self.rlm_base.as_deref()?;
-        let cgroup_file = fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
-        let victim_cgroup = parse_cgroup_path(&cgroup_file)?;
-        let candidate = candidate_target(&victim_cgroup, self.uid, rlm_base)?;
+        let candidate = candidate_target(victim_cgroup, self.uid, rlm_base)?;
 
         if let Some(cached) = cache.get(&candidate.cgroup) {
             return Some(cached.clone());
@@ -272,9 +157,26 @@ impl Sampler {
     }
 }
 
+/// The cgroups in `cgroups` that still hold at least one process
+/// (`cgroup.events` says `populated 1`). `PolicyEngine::tick` prunes its
+/// interventions against this set, so only the cgroups it holds are checked:
+/// one small read each, no `/proc` scan. A cgroup whose events file can't be
+/// read (removed, or never existed) is not live.
+///
+/// This is deliberately not derived from the candidate list: a successful
+/// `Cap` can push a process below the min-RSS floor while its cgroup, and
+/// the process in it, are still alive (D2).
+pub fn live_cgroups(cgroups: &[String]) -> HashSet<String> {
+    cgroups
+        .iter()
+        .filter(|cg| cgfs::is_populated(cg) == Some(true))
+        .cloned()
+        .collect()
+}
+
 /// Runtimes, interpreters and shells: many unrelated apps run the same
 /// binary, so for these the exe basename alone does not identify an app.
-/// Matched exactly, except `python3.` and `ld-linux` which match by prefix.
+/// Matched exactly, except the [`RUNTIME_PREFIXES`] which match by prefix.
 const RUNTIME_EXES: &[&str] = &[
     "java",
     "node",
@@ -286,6 +188,8 @@ const RUNTIME_EXES: &[&str] = &[
     "wine",
     "wine64",
     "wine-preloader",
+    "wine64-preloader",
+    "gjs-console",
     "bash",
     "sh",
     "dash",
@@ -300,8 +204,12 @@ const RUNTIME_EXES: &[&str] = &[
     "bun",
 ];
 
+/// Versioned interpreters, the dynamic loader, and QEMU system emulators
+/// (each user VM is its own app).
+const RUNTIME_PREFIXES: &[&str] = &["python2.", "python3.", "ld-linux", "qemu-system-"];
+
 fn is_runtime_exe(name: &str) -> bool {
-    RUNTIME_EXES.contains(&name) || name.starts_with("python3.") || name.starts_with("ld-linux")
+    RUNTIME_EXES.contains(&name) || RUNTIME_PREFIXES.iter().any(|p| name.starts_with(p))
 }
 
 /// The grouping key for a cgroup whose largest process is `name`: the exe
@@ -442,16 +350,15 @@ pub fn pick_pressure(
         .map(|(s, f)| (s, f, PsiSource::System))
 }
 
-/// Parse `/proc/<pid>/status`, returning `(real_uid, name, rss_kb)` where
-/// `rss_kb = VmRSS + VmSwap`. Delegates to [`crate::process::parse_status`].
-fn parse_proc_status(status: &str) -> Option<(u32, String, u64)> {
-    crate::process::parse_status(status).map(|f| (f.uid, f.name, f.rss_kb))
-}
-
 #[cfg(test)]
 mod tests {
     use super::super::resolve::{Coverage, Mechanism, Verdict};
     use super::*;
+
+    /// `(real_uid, name, rss_kb)` from `/proc/<pid>/status` text.
+    fn parse_proc_status(status: &str) -> Option<(u32, String, u64)> {
+        crate::process::parse_status(status).map(|f| (f.uid, f.name, f.rss_kb))
+    }
 
     fn pinfo(pid: u32, name: &str, rss_mb: u64, cg: Option<&str>) -> ProcInfo {
         ProcInfo {
@@ -497,6 +404,67 @@ mod tests {
         frozen(&e.tick(0, high_sample(), &ts, &live))
     }
 
+    const RLM: &str = "/user.slice/user-1000.slice/user@1000.service/rlm";
+
+    fn snap(pid: u32, uid: u32, comm: &str, exe: &str, rss_mb: u64, cg: &str) -> ProcessInfo {
+        ProcessInfo {
+            pid,
+            uid,
+            name: comm.into(),
+            executable: Some(format!("/usr/bin/{exe}").into()),
+            rss_kb: rss_mb * 1024,
+            cgroup: Some(cg.into()),
+            ..Default::default()
+        }
+    }
+    fn app(n: &str) -> String {
+        format!("/user.slice/user-1000.slice/user@1000.service/app.slice/app-{n}.scope")
+    }
+
+    #[test]
+    fn candidates_keep_own_large_unprotected_processes_only() {
+        let s = Sampler::new(GuardConfig::default(), 1, 1000, Some(RLM.into()));
+        let snapshot = vec![
+            snap(1, 1000, "rlm-guard", "rlm-guard", 500, &app("guard")), // the guard itself
+            snap(10, 1000, "Isolated Web Co", "firefox", 900, &app("ff")),
+            snap(11, 1001, "firefox", "firefox", 900, &app("other")), // another user
+            snap(12, 1000, "gnome-shell", "gnome-shell", 900, &app("gs")), // protected
+            snap(13, 1000, "tiny", "tiny", 10, &app("tiny")),         // below min_rss
+        ];
+        let c = s.candidates(&snapshot);
+        assert_eq!(c.iter().map(|p| p.pid).collect::<Vec<_>>(), vec![10]);
+        assert_eq!(c[0].name, "firefox", "app identity is the exe basename");
+        assert!(c[0].resolution.is_some());
+    }
+
+    #[test]
+    fn session_scope_processes_have_no_resolution() {
+        // Review Focus 1: a runaway started from a tty or ssh login lives in session-N.scope.
+        let s = Sampler::new(GuardConfig::default(), 1, 1000, Some(RLM.into()));
+        let snapshot = vec![snap(
+            20,
+            1000,
+            "python3",
+            "python3",
+            900,
+            "/user.slice/user-1000.slice/session-3.scope",
+        )];
+        let c = s.candidates(&snapshot);
+        assert_eq!(c.len(), 1);
+        assert!(
+            c[0].resolution.is_none(),
+            "outside app.slice and rlm/, never a target"
+        );
+    }
+
+    #[test]
+    fn candidates_name_a_replaced_binary_without_the_deleted_suffix() {
+        let s = Sampler::new(GuardConfig::default(), 1, 1000, Some(RLM.into()));
+        let mut p = snap(30, 1000, "chrome", "chrome", 900, &app("c"));
+        p.executable = Some("/opt/google/chrome/chrome (deleted)".into());
+        assert_eq!(s.candidates(&[p])[0].name, "chrome");
+    }
+
     #[test]
     fn two_java_scopes_are_two_apps() {
         let procs = vec![
@@ -524,6 +492,10 @@ mod tests {
             pinfo(1, "python3.12", 900, Some("/app.slice/run-u7.service")),
             pinfo(2, "ld-linux-x86-64.so.2", 900, Some("/app.slice/x.scope")),
             pinfo(3, "firefox", 900, Some("/app.slice/ff.scope")),
+            pinfo(4, "wine64-preloader", 900, Some("/app.slice/w.scope")),
+            pinfo(5, "gjs-console", 900, Some("/app.slice/g.scope")),
+            pinfo(6, "python2.7", 900, Some("/app.slice/p2.scope")),
+            pinfo(7, "qemu-system-x86_64", 900, Some("/app.slice/vm.scope")),
         ];
         let mut apps: Vec<String> = targets_from_procs(&procs, &|_| None)
             .into_iter()
@@ -534,8 +506,12 @@ mod tests {
             apps,
             vec![
                 "firefox",
+                "gjs-console@g.scope",
                 "ld-linux-x86-64.so.2@x.scope",
-                "python3.12@run-u7.service"
+                "python2.7@p2.scope",
+                "python3.12@run-u7.service",
+                "qemu-system-x86_64@vm.scope",
+                "wine64-preloader@w.scope",
             ]
         );
     }

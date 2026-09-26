@@ -21,6 +21,13 @@ pub fn read_frozen(cg: &str) -> Option<bool> {
     parse_frozen(&content)
 }
 
+/// Whether the cgroup (or any descendant) holds a process, from
+/// `cgroup.events`. `None` if unreadable (e.g. the cgroup is gone).
+pub fn is_populated(cg: &str) -> Option<bool> {
+    let content = fs::read_to_string(abs(cg).join("cgroup.events")).ok()?;
+    parse_populated(&content)
+}
+
 /// Freeze or unfreeze a cgroup (write to cgroup.freeze).
 pub fn write_freeze(cg: &str, on: bool) -> Result<()> {
     let value = if on { "1" } else { "0" };
@@ -199,6 +206,15 @@ pub fn parse_frozen(events: &str) -> Option<bool> {
     })
 }
 
+/// Pure parser: the "populated <0|1>" line of cgroup.events, or `None` if
+/// absent.
+pub fn parse_populated(events: &str) -> Option<bool> {
+    events.lines().find_map(|l| {
+        let rest = l.strip_prefix("populated ")?;
+        Some(rest.trim() == "1")
+    })
+}
+
 /// Pure parser: extract anon memory value from memory.stat text.
 /// Looks for "anon <value>" line and returns the parsed value, or None if not found.
 pub fn parse_anon(stat: &str) -> Option<u64> {
@@ -235,6 +251,13 @@ mod tests {
         assert_eq!(parse_frozen("populated 1\nfrozen 0\n"), Some(false));
         assert_eq!(parse_frozen("populated 1\nfrozen 1\n"), Some(true));
         assert_eq!(parse_frozen("populated 1\n"), None);
+    }
+
+    #[test]
+    fn parse_populated_reads_events() {
+        assert_eq!(parse_populated("populated 1\nfrozen 0\n"), Some(true));
+        assert_eq!(parse_populated("populated 0\nfrozen 1\n"), Some(false));
+        assert_eq!(parse_populated("frozen 0\n"), None);
     }
 
     #[test]

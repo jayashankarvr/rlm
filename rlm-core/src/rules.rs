@@ -4,12 +4,13 @@
 //! The decision logic ([`plan`]) is pure and takes an injected snapshot of the
 //! currently-running processes plus the set of PIDs already placed, so it is
 //! unit-testable without root. [`RulesEnforcer::reconcile`] wires that decision
-//! to real `/proc` enumeration and a [`CgroupManager`].
+//! to the caller's process snapshot and a [`CgroupManager`].
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::os::unix::fs::MetadataExt;
 
 use crate::guard::cgfs;
-use crate::process::{self, ProcessInfo};
+use crate::process::ProcessInfo;
 use crate::CgroupManager;
 use common::{AppRule, Config, Limit};
 
@@ -128,9 +129,22 @@ pub fn plan(
     actions
 }
 
+/// Whether a rule cgroup's limits must be (re)written. `recorded_inode` is
+/// the cgroup directory's inode when the limits were last written,
+/// `current_inode` its inode now (`None`: the cgroup does not exist). Limits
+/// are rewritten only when the cgroup is new or was recreated: writing
+/// `memory.high` below current usage makes the writer reclaim synchronously,
+/// so rewriting unchanged limits every tick costs the daemon real work under
+/// exactly the pressure it exists to handle.
+pub fn needs_ensure(recorded_inode: Option<u64>, current_inode: Option<u64>) -> bool {
+    current_inode.is_none() || recorded_inode != current_inode
+}
+
 /// Enforces persistent application rules against real cgroups.
 pub struct RulesEnforcer {
     rules: Vec<CompiledRule>,
+    /// Rule cgroup name to the directory inode at the last limit write.
+    ensured: HashMap<String, u64>,
 }
 
 impl RulesEnforcer {
@@ -142,37 +156,38 @@ impl RulesEnforcer {
             .iter()
             .filter_map(|(name, rule)| CompiledRule::compile(name, rule))
             .collect();
-        Self { rules }
+        Self {
+            rules,
+            ensured: HashMap::new(),
+        }
     }
 
     pub fn rule_count(&self) -> usize {
         self.rules.len()
     }
 
-    /// Reconcile every rule once. Best-effort: a failure on one rule or PID is
-    /// logged and never aborts the others. Returns the actions that were applied
-    /// (useful for logging/tests).
+    /// Reconcile every rule once against `procs`, a snapshot of the user's
+    /// processes (the daemon shares one `/proc` scan per tick between the
+    /// guard and this). Best-effort: a failure on one rule or PID is logged
+    /// and never aborts the others. Returns the actions that were applied
+    /// (useful for logging/tests). An `EnsureCgroup` whose cgroup already
+    /// carries the limits (same inode as at the last write, see
+    /// [`needs_ensure`]) writes nothing and is not reported.
     ///
-    /// `held_cgroups` is `PolicyEngine::intervened_cgroups()` — the set of
-    /// cgroups the freeze guard currently holds a freeze *or* cap
-    /// intervention on (D1 fix). A rule whose cgroup is in that set is
-    /// skipped entirely for the tick: `RulesEnforcer` and the guard now both
-    /// write to the same rule cgroup (act-in-place makes rule cgroups
-    /// first-class guard targets), and rewriting `memory.high` on a cgroup
-    /// the guard just capped would silently revert the cap within the same
-    /// daemon-loop tick while leaving `PolicyEngine` believing it still holds
-    /// one — which then blocks the real culprit from being re-selected as a
-    /// victim for the rest of the pressure episode.
-    pub fn reconcile(&self, mgr: &CgroupManager, held_cgroups: &[String]) -> Vec<RuleAction> {
-        // One /proc scan shared across all rules.
-        let procs = match process::list_all() {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::warn!(error = %e, "rules: failed to list processes; skipping tick");
-                return Vec::new();
-            }
-        };
-
+    /// `held_cgroups` is `PolicyEngine::intervened_cgroups()`: the cgroups
+    /// the freeze guard currently holds a freeze *or* cap intervention on
+    /// (D1 fix). A rule whose cgroup is in that set is skipped entirely for
+    /// the tick: `RulesEnforcer` and the guard both write to the same rule
+    /// cgroup (act-in-place makes rule cgroups first-class guard targets),
+    /// and rewriting `memory.high` on a cgroup the guard just capped would
+    /// silently revert the cap while leaving `PolicyEngine` believing it
+    /// still holds one.
+    pub fn reconcile(
+        &mut self,
+        mgr: &CgroupManager,
+        procs: &[ProcessInfo],
+        held_cgroups: &[String],
+    ) -> Vec<RuleAction> {
         // rlm's own base cgroup path, relative to /sys/fs/cgroup (same
         // convention cgfs uses), for building each rule's held/frozen-check
         // path below. `None` only if base_path is somehow outside
@@ -211,34 +226,53 @@ impl RulesEnforcer {
             let placed = mgr.pids_in_cgroup(&rule.cgroup);
             let exists = !placed.is_empty() || mgr.cgroup_exists(&rule.cgroup);
 
-            for action in plan(rule, &procs, &placed, exists, blocked) {
-                if let Err(e) = self.apply(mgr, rule, &action) {
-                    tracing::warn!(?action, error = %e, "rules: action failed");
-                } else {
-                    applied.push(action);
+            for action in plan(rule, procs, &placed, exists, blocked) {
+                match apply(mgr, rule, &action, &mut self.ensured) {
+                    Ok(true) => applied.push(action),
+                    Ok(false) => {}
+                    Err(e) => tracing::warn!(?action, error = %e, "rules: action failed"),
                 }
             }
         }
         applied
     }
+}
 
-    fn apply(
-        &self,
-        mgr: &CgroupManager,
-        rule: &CompiledRule,
-        action: &RuleAction,
-    ) -> common::Result<()> {
-        match action {
-            RuleAction::EnsureCgroup { .. } => {
-                // prepare_cgroup creates the cgroup (idempotent) and (re)sets limits.
-                mgr.prepare_cgroup(&rule.cgroup, &rule.limit)?;
-                Ok(())
+/// Inode of a rule cgroup's directory, or `None` if it does not exist.
+fn cgroup_inode(mgr: &CgroupManager, cgroup: &str) -> Option<u64> {
+    std::fs::metadata(mgr.base_path().join(cgroup))
+        .ok()
+        .map(|m| m.ino())
+}
+
+/// Apply one action. `Ok(false)` means nothing needed doing.
+fn apply(
+    mgr: &CgroupManager,
+    rule: &CompiledRule,
+    action: &RuleAction,
+    ensured: &mut HashMap<String, u64>,
+) -> common::Result<bool> {
+    match action {
+        RuleAction::EnsureCgroup { .. } => {
+            let current = cgroup_inode(mgr, &rule.cgroup);
+            if !needs_ensure(ensured.get(&rule.cgroup).copied(), current) {
+                return Ok(false);
             }
-            RuleAction::AddPid { pid, .. } => {
-                let path = mgr.base_path().join(&rule.cgroup);
-                mgr.add_to_cgroup(&path, *pid)
-            }
-            RuleAction::TeardownEmpty { .. } => mgr.cleanup_cgroup(&rule.cgroup),
+            // prepare_cgroup creates the cgroup (idempotent) and (re)sets limits.
+            mgr.prepare_cgroup(&rule.cgroup, &rule.limit)?;
+            match cgroup_inode(mgr, &rule.cgroup) {
+                Some(ino) => ensured.insert(rule.cgroup.clone(), ino),
+                None => ensured.remove(&rule.cgroup),
+            };
+            Ok(true)
+        }
+        RuleAction::AddPid { pid, .. } => {
+            let path = mgr.base_path().join(&rule.cgroup);
+            mgr.add_to_cgroup(&path, *pid).map(|()| true)
+        }
+        RuleAction::TeardownEmpty { .. } => {
+            ensured.remove(&rule.cgroup);
+            mgr.cleanup_cgroup(&rule.cgroup).map(|()| true)
         }
     }
 }
@@ -264,6 +298,15 @@ mod tests {
             executable: exe.map(PathBuf::from),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn ensure_only_when_new_or_recreated() {
+        assert!(needs_ensure(None, None), "missing cgroup");
+        assert!(needs_ensure(None, Some(7)), "never written");
+        assert!(needs_ensure(Some(7), Some(9)), "recreated with a new inode");
+        assert!(needs_ensure(Some(7), None), "removed since");
+        assert!(!needs_ensure(Some(7), Some(7)), "unchanged: no writes");
     }
 
     #[test]

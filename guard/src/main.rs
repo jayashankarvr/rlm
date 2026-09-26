@@ -1,12 +1,12 @@
 //! `rlm-guard` — the freeze-guard daemon.
 //!
 //! Runs as a per-user systemd service. Each tick it samples memory pressure (PSI)
-//! and the user's eligible processes, asks the pure [`PolicyEngine`] what to do,
+//! and, only when needed, the user's own processes, asks the pure [`PolicyEngine`] what to do,
 //! and applies the resulting actions via the [`Effector`]. On shutdown it undoes
 //! every intervention so nothing is left frozen.
 
 use common::Config;
-use rlm_core::guard::sampler::{strip_cgroup_root, targets_from_procs};
+use rlm_core::guard::sampler::{live_cgroups, strip_cgroup_root, targets_from_procs};
 use rlm_core::guard::{cgfs, journal_path, Effector, Journal, PolicyEngine, Sampler, SystemdUser};
 use rlm_core::rules::RulesEnforcer;
 use rlm_core::CgroupManager;
@@ -18,6 +18,35 @@ use std::time::{Duration, Instant};
 /// the shipped unit, so systemd does not restart-loop against a file that
 /// cannot fix itself.
 const EX_CONFIG: i32 = 78;
+
+/// How often persistent rules are reconciled. New matching processes are
+/// absorbed within this delay.
+const RULES_INTERVAL_MS: u64 = 5_000;
+
+/// What one tick reads from `/proc`.
+#[derive(Debug, PartialEq, Eq)]
+struct ScanPlan {
+    /// Take a process snapshot (own user only) this tick.
+    scan: bool,
+    /// Reconcile persistent rules this tick.
+    rules: bool,
+}
+
+/// A calm tick reads only the PSI and meminfo files. The process snapshot is
+/// taken when the policy wants candidates (pressure above Calm) or when
+/// rules are due, and is shared by both. `since_rules_ms` is the time since
+/// the last reconcile, `None` if there has not been one.
+fn plan_scan(
+    wants_candidates: bool,
+    rules_configured: bool,
+    since_rules_ms: Option<u64>,
+) -> ScanPlan {
+    let rules = rules_configured && since_rules_ms.is_none_or(|d| d >= RULES_INTERVAL_MS);
+    ScanPlan {
+        scan: wants_candidates || rules,
+        rules,
+    }
+}
 
 fn main() {
     tracing_subscriber::fmt()
@@ -61,7 +90,7 @@ fn recover_only() {
 
 fn run(config: Config) -> common::Result<()> {
     let gcfg = config.guard.clone();
-    let enforcer = RulesEnforcer::new(&config);
+    let mut enforcer = RulesEnforcer::new(&config);
 
     let self_pid = std::process::id();
     // SAFETY: getuid() is always safe; it just reads our real UID from the kernel.
@@ -162,6 +191,7 @@ fn run(config: Config) -> common::Result<()> {
     let interval = Duration::from_millis(gcfg.timing.sample_interval_ms.max(100));
     let start = Instant::now();
     let mut warned_no_psi = false;
+    let mut last_rules_ms: Option<u64> = None;
 
     tracing::info!(
         uid,
@@ -176,30 +206,53 @@ fn run(config: Config) -> common::Result<()> {
         let now_ms = start.elapsed().as_millis() as u64;
 
         // Freeze protection (PSI-driven), only when enabled and journal-backed.
-        if gcfg.enabled {
-            if let Some(effector) = &effector {
-                if let Some(sample) = sampler.sample() {
-                    let procs = sampler.eligible();
-                    let targets = targets_from_procs(&procs, &cgfs::current_bytes);
-                    let live = sampler.live_cgroups();
-                    for action in engine.tick(now_ms, sample, &targets, &live) {
-                        if let Err(e) = effector.apply(&action) {
-                            tracing::warn!(?action, "action failed: {e}");
-                        }
+        let guard_on = gcfg.enabled && effector.is_some();
+        let sample = if guard_on { sampler.sample() } else { None };
+        let wants = sample.is_some_and(|s| engine.wants_candidates(s));
+        let plan = plan_scan(
+            wants,
+            enforcer.rule_count() > 0,
+            last_rules_ms.map(|t| now_ms.saturating_sub(t)),
+        );
+        let snapshot = if plan.scan {
+            rlm_core::process::list_for_uid(uid).unwrap_or_else(|e| {
+                tracing::warn!("process scan failed: {e}");
+                Vec::new()
+            })
+        } else {
+            Vec::new()
+        };
+
+        match (&effector, sample) {
+            (Some(effector), Some(sample)) if gcfg.enabled => {
+                let procs = if wants {
+                    sampler.candidates(&snapshot)
+                } else {
+                    Vec::new()
+                };
+                let targets = targets_from_procs(&procs, &cgfs::current_bytes);
+                let live = live_cgroups(&engine.intervened_cgroups());
+                for action in engine.tick(now_ms, sample, &targets, &live) {
+                    if let Err(e) = effector.apply(&action) {
+                        tracing::warn!(?action, "action failed: {e}");
                     }
-                } else if !warned_no_psi {
-                    tracing::warn!("/proc/pressure/memory unavailable; guard cannot act on PSI");
-                    warned_no_psi = true;
                 }
             }
+            _ if guard_on && !warned_no_psi => {
+                tracing::warn!("memory PSI unavailable; guard cannot act");
+                warned_no_psi = true;
+            }
+            _ => {}
         }
 
-        // Persistent application rules: reconcile every tick (best-effort,
-        // logs internally). Absorbs newly-launched matching instances.
-        // Skip any rule cgroup the freeze guard currently holds a freeze or
-        // cap intervention on (D1) — the two write to the same cgroups now
-        // that the guard acts in place, so the enforcer must not fight it.
-        enforcer.reconcile(&manager, &engine.intervened_cgroups());
+        // Persistent application rules, every RULES_INTERVAL_MS: absorbs
+        // newly launched matching instances. Skips any rule cgroup the
+        // freeze guard currently holds a freeze or cap on (D1), since the
+        // two write to the same cgroups.
+        if plan.rules {
+            enforcer.reconcile(&manager, &snapshot, &engine.intervened_cgroups());
+            last_rules_ms = Some(now_ms);
+        }
 
         sleep_responsive(interval, &shutdown);
     }
@@ -230,6 +283,45 @@ fn sleep_responsive(total: Duration, shutdown: &AtomicBool) {
 #[cfg(test)]
 mod tests {
     const UNIT: &str = include_str!("../../cli/assets/rlm-guard.service");
+
+    #[test]
+    fn idle_ticks_do_not_scan_proc() {
+        assert_eq!(
+            super::plan_scan(false, false, None),
+            super::ScanPlan {
+                scan: false,
+                rules: false
+            }
+        );
+        assert_eq!(
+            super::plan_scan(false, true, Some(2_000)),
+            super::ScanPlan {
+                scan: false,
+                rules: false
+            }
+        );
+        assert_eq!(
+            super::plan_scan(false, true, None),
+            super::ScanPlan {
+                scan: true,
+                rules: true
+            }
+        );
+        assert_eq!(
+            super::plan_scan(false, true, Some(5_000)),
+            super::ScanPlan {
+                scan: true,
+                rules: true
+            }
+        );
+        assert_eq!(
+            super::plan_scan(true, false, None),
+            super::ScanPlan {
+                scan: true,
+                rules: false
+            }
+        );
+    }
 
     #[test]
     fn unit_does_not_restart_on_config_errors() {

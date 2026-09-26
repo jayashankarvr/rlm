@@ -21,9 +21,12 @@ pub struct ProcessInfo {
 }
 
 impl ProcessInfo {
-    /// Basename of `executable`, if set and valid UTF-8.
+    /// Basename of `executable`, if set and valid UTF-8, without the
+    /// ` (deleted)` suffix the kernel adds after the binary was replaced
+    /// (e.g. by a package upgrade).
     pub fn exe_name(&self) -> Option<&str> {
-        self.executable.as_deref()?.file_name()?.to_str()
+        let name = self.executable.as_deref()?.file_name()?.to_str()?;
+        Some(name.strip_suffix(" (deleted)").unwrap_or(name))
     }
 
     /// The executable's basename when readable (not truncated by the
@@ -477,5 +480,14 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(q.display_name(), "kworker");
+    }
+
+    #[test]
+    fn exe_name_ignores_deleted_suffix() {
+        let p = ProcessInfo {
+            executable: Some(PathBuf::from("/opt/google/chrome/chrome (deleted)")),
+            ..Default::default()
+        };
+        assert_eq!(p.exe_name(), Some("chrome"));
     }
 }

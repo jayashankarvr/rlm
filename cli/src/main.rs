@@ -782,10 +782,12 @@ fn guard_test(manager: &CgroupManager) {
         println!("PSI unavailable; cannot evaluate guard actions.");
         return;
     };
-    let procs = sampler.eligible();
+    let snapshot = rlm_core::process::list_for_uid(current_uid()).unwrap_or_default();
+    let procs = sampler.candidates(&snapshot);
     let targets =
         rlm_core::guard::sampler::targets_from_procs(&procs, &rlm_core::guard::cgfs::current_bytes);
-    let live = sampler.live_cgroups();
+    // A fresh engine holds no interventions, so nothing needs a liveness check.
+    let live = std::collections::HashSet::new();
     println!(
         "Memory pressure ({}): some={:.1}%  full={:.1}%  available {} MB of {} MB  |  {} eligible process(es)",
         sample.source,
