@@ -6,7 +6,7 @@
 //! every intervention so nothing is left frozen.
 
 use common::Config;
-use rlm_core::guard::sampler::strip_cgroup_root;
+use rlm_core::guard::sampler::{strip_cgroup_root, targets_from_procs};
 use rlm_core::guard::{cgfs, journal_path, Effector, Journal, PolicyEngine, Sampler, SystemdUser};
 use rlm_core::rules::RulesEnforcer;
 use rlm_core::CgroupManager;
@@ -180,8 +180,9 @@ fn run(config: Config) -> common::Result<()> {
             if let Some(effector) = &effector {
                 if let Some(sample) = sampler.sample() {
                     let procs = sampler.eligible();
+                    let targets = targets_from_procs(&procs, &cgfs::current_bytes);
                     let live = sampler.live_cgroups();
-                    for action in engine.tick(now_ms, sample, &procs, &live) {
+                    for action in engine.tick(now_ms, sample, &targets, &live) {
                         if let Err(e) = effector.apply(&action) {
                             tracing::warn!(?action, "action failed: {e}");
                         }

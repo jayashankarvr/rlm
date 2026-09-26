@@ -1,5 +1,5 @@
 //! Freeze-guard engine: watch memory pressure and proactively freeze/soft-cap
-//! the user's biggest non-protected process before the system locks up, healing
+//! the non-protected app driving the pressure before the system locks up, healing
 //! itself once pressure clears. Pure engine + sampler live here; the daemon loop
 //! lives in the `rlm-guard` binary.
 
@@ -19,7 +19,7 @@ pub use journal::Journal;
 pub use policy::PolicyEngine;
 pub use sampler::Sampler;
 pub use systemd::SystemdUser;
-pub use types::{Action, Intervention, Level, ProcInfo, PsiSource, Sample};
+pub use types::{Action, Intervention, Level, ProcInfo, PsiSource, Sample, Target};
 
 /// Default path for the guard's write-ahead restore journal.
 ///

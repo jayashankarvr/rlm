@@ -2,13 +2,13 @@
 //! `/proc`; no decisions. The parsing is factored into small pure free
 //! functions so it can be unit-tested without touching the filesystem.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use super::cgfs;
 use super::resolve::{candidate_target, finalize, Resolution};
-use super::types::{ProcInfo, PsiSource, Sample};
+use super::types::{ProcInfo, PsiSource, Sample, Target};
 use common::GuardConfig;
 
 /// Samples system pressure and the user's eligible processes.
@@ -153,21 +153,24 @@ impl Sampler {
             // user-configured names like "gnome-control-center". Comm is
             // kept as a fallback for processes whose /proc/<pid>/exe isn't
             // readable (e.g. already exited, or a kernel thread).
-            if common::is_protected(&self.protect, &pname, cgfs::exe_basename(pid).as_deref()) {
+            let exe = cgfs::exe_basename(pid);
+            if common::is_protected(&self.protect, &pname, exe.as_deref()) {
                 continue;
             }
 
             let resolution = self.resolve(pid, &mut resolved);
 
+            // The exe basename names the app: Firefox content processes have
+            // comm "Isolated Web Co" but run the `firefox` binary.
             out.push(ProcInfo {
                 pid,
-                name: pname,
+                name: exe.unwrap_or(pname),
                 rss_kb,
                 resolution,
             });
         }
 
-        // Biggest memory hog first — that's the victim the engine prefers.
+        // Largest first, for stable output.
         out.sort_by_key(|p| std::cmp::Reverse(p.rss_kb));
         out
     }
@@ -267,6 +270,35 @@ impl Sampler {
         cache.insert(key, resolution.clone());
         Some(resolution)
     }
+}
+
+/// Group resolved processes by cgroup into one [`Target`] each. The app is
+/// named after the cgroup's largest process, and `current_bytes` reads the
+/// cgroup's `memory.current` (injected so tests stay off the real cgroupfs).
+/// Unresolved processes are dropped: the guard can't act on them.
+pub fn targets_from_procs(
+    procs: &[ProcInfo],
+    current_bytes: &dyn Fn(&str) -> Option<u64>,
+) -> Vec<Target> {
+    let mut heaviest: BTreeMap<&str, &ProcInfo> = BTreeMap::new();
+    for p in procs {
+        let Some(res) = p.resolution.as_ref() else {
+            continue;
+        };
+        let slot = heaviest.entry(res.cgroup.as_str()).or_insert(p);
+        if p.rss_kb > slot.rss_kb {
+            *slot = p;
+        }
+    }
+    heaviest
+        .into_iter()
+        .map(|(cg, p)| Target {
+            app: p.name.clone(),
+            resolution: p.resolution.clone().expect("grouped only resolved procs"),
+            rss_kb: p.rss_kb,
+            current_bytes: current_bytes(cg),
+        })
+        .collect()
 }
 
 /// Parse the v2 line of /proc/<pid>/cgroup ("0::<path>"). Hybrid-mode lines
@@ -373,7 +405,37 @@ fn parse_proc_status(status: &str) -> Option<(u32, String, u64)> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::resolve::{Coverage, Mechanism, Verdict};
     use super::*;
+
+    fn pinfo(pid: u32, name: &str, rss_mb: u64, cg: Option<&str>) -> ProcInfo {
+        ProcInfo {
+            pid,
+            name: name.into(),
+            rss_kb: rss_mb * 1024,
+            resolution: cg.map(|c| Resolution {
+                cgroup: c.into(),
+                unit: None,
+                verdict: Verdict::Freeze,
+                coverage: Coverage::Full,
+                mechanism: Mechanism::Raw,
+            }),
+        }
+    }
+
+    #[test]
+    fn targets_merge_processes_sharing_a_cgroup_and_drop_unresolved() {
+        let procs = vec![
+            pinfo(10, "firefox", 900, Some("/a.scope")),
+            pinfo(11, "firefox", 1200, Some("/a.scope")),
+            pinfo(12, "stray", 5000, None),
+        ];
+        let t = targets_from_procs(&procs, &|_| Some(42));
+        assert_eq!(t.len(), 1);
+        assert_eq!(t[0].app, "firefox");
+        assert_eq!(t[0].rss_kb, 1200 * 1024);
+        assert_eq!(t[0].current_bytes, Some(42));
+    }
 
     // ---- parse_cgroup_path ------------------------------------------------
 

@@ -783,6 +783,8 @@ fn guard_test(manager: &CgroupManager) {
         return;
     };
     let procs = sampler.eligible();
+    let targets =
+        rlm_core::guard::sampler::targets_from_procs(&procs, &rlm_core::guard::cgfs::current_bytes);
     let live = sampler.live_cgroups();
     println!(
         "Memory pressure ({}): some={:.1}%  full={:.1}%  available {} MB of {} MB  |  {} eligible process(es)",
@@ -794,7 +796,7 @@ fn guard_test(manager: &CgroupManager) {
         procs.len()
     );
 
-    let actions = engine.tick(0, sample, &procs, &live);
+    let actions = engine.tick(0, sample, &targets, &live);
     if actions.is_empty() {
         println!("No action would be taken right now.");
     } else {
