@@ -19,7 +19,7 @@ pub use journal::Journal;
 pub use policy::PolicyEngine;
 pub use sampler::Sampler;
 pub use systemd::SystemdUser;
-pub use types::{Action, Intervention, Level, ProcInfo, Sample};
+pub use types::{Action, Intervention, Level, ProcInfo, PsiSource, Sample};
 
 /// Default path for the guard's write-ahead restore journal.
 ///

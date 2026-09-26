@@ -4,11 +4,11 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use super::cgfs;
 use super::resolve::{candidate_target, finalize, Resolution};
-use super::types::{ProcInfo, Sample};
+use super::types::{ProcInfo, PsiSource, Sample};
 use common::GuardConfig;
 
 /// Samples system pressure and the user's eligible processes.
@@ -67,24 +67,27 @@ impl Sampler {
         }
     }
 
-    /// Read current pressure. `None` if PSI is unavailable (e.g. the kernel was
-    /// built without `CONFIG_PSI`, so `/proc/pressure/memory` doesn't exist).
+    /// Read current pressure. Prefers the user's app.slice PSI (what the
+    /// processes the guard can act on actually feel) and falls back to system
+    /// PSI only when that file is missing. `None` if neither is readable (e.g.
+    /// a kernel built without `CONFIG_PSI`).
     pub fn sample(&self) -> Option<Sample> {
-        // PSI is the primary signal; if we can't read it, we have no sample.
-        let psi = fs::read_to_string("/proc/pressure/memory").ok()?;
-        let (some_avg10, full_avg10) = parse_psi(&psi)?;
+        let app = fs::read_to_string(app_slice_pressure_path(self.uid)).ok();
+        let sys = fs::read_to_string("/proc/pressure/memory").ok();
+        let (some_avg10, full_avg10, source) = pick_pressure(app.as_deref(), sys.as_deref())?;
 
-        // MemAvailable is only a backstop floor. If it can't be read, fall back
-        // to u64::MAX so the floor check can never trip spuriously.
-        let mem_available_mb = fs::read_to_string("/proc/meminfo")
+        // Unreadable meminfo reports "plenty available, total unknown", which
+        // the policy's scarcity gate treats as not scarce: no action.
+        let mem = fs::read_to_string("/proc/meminfo")
             .ok()
-            .and_then(|m| parse_mem_available_mb(&m))
-            .unwrap_or(u64::MAX);
+            .and_then(|m| parse_meminfo(&m));
 
         Some(Sample {
             some_avg10,
             full_avg10,
-            mem_available_mb,
+            mem_available_mb: mem.map_or(u64::MAX, |m| m.available_mb),
+            mem_total_mb: mem.map_or(0, |m| m.total_mb),
+            source,
         })
     }
 
@@ -316,17 +319,50 @@ fn field_f64(tokens: &str, key: &str) -> Option<f64> {
     })
 }
 
-/// Parse `MemAvailable:` (in kB) from `/proc/meminfo` and convert to MB.
-/// Returns `None` if the field is missing or malformed.
-fn parse_mem_available_mb(meminfo: &str) -> Option<u64> {
-    for line in meminfo.lines() {
-        if let Some(rest) = line.strip_prefix("MemAvailable:") {
-            // e.g. "   12345678 kB" — first whitespace token is the kB value.
-            let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
-            return Some(kb / 1024);
-        }
+/// The fields of `/proc/meminfo` the guard uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemInfo {
+    pub available_mb: u64,
+    pub total_mb: u64,
+    pub swap_total_kb: u64,
+}
+
+/// Parse `/proc/meminfo`. `MemAvailable` and `MemTotal` are required;
+/// a missing `SwapTotal` reads as 0.
+pub fn parse_meminfo(s: &str) -> Option<MemInfo> {
+    let kb = |key: &str| {
+        s.lines()
+            .find_map(|l| l.strip_prefix(key))
+            .and_then(|r| r.split_whitespace().next()?.parse::<u64>().ok())
+    };
+    Some(MemInfo {
+        available_mb: kb("MemAvailable:")? / 1024,
+        total_mb: kb("MemTotal:")? / 1024,
+        swap_total_kb: kb("SwapTotal:").unwrap_or(0),
+    })
+}
+
+/// The memory PSI file of the user's `app.slice`: covers the apps the guard
+/// may act on, and excludes rlm's own subtree (`user@UID.service/rlm/`) and
+/// `session.slice`.
+pub fn app_slice_pressure_path(uid: u32) -> PathBuf {
+    PathBuf::from(format!(
+        "/sys/fs/cgroup/user.slice/user-{uid}.slice/user@{uid}.service/app.slice/memory.pressure"
+    ))
+}
+
+/// Choose the pressure to act on: app.slice PSI when it parses, otherwise
+/// system PSI. Returns `(some_avg10, full_avg10, source)`.
+pub fn pick_pressure(
+    app_slice: Option<&str>,
+    system: Option<&str>,
+) -> Option<(f64, f64, PsiSource)> {
+    if let Some((s, f)) = app_slice.and_then(parse_psi) {
+        return Some((s, f, PsiSource::AppSlice));
     }
-    None
+    system
+        .and_then(parse_psi)
+        .map(|(s, f)| (s, f, PsiSource::System))
 }
 
 /// Parse `/proc/<pid>/status`, returning `(real_uid, name, rss_kb)` where
@@ -400,34 +436,71 @@ mod tests {
         assert_eq!(parse_psi(s), Some((1.0, 0.0)));
     }
 
-    // ---- parse_mem_available_mb -----------------------------------------
+    // ---- pick_pressure / parse_meminfo ------------------------------------
+
+    const APP_CALM: &str = "some avg10=0.00 avg60=0.00 avg300=0.00 total=0\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0\n";
+    const SYS_HOT: &str = "some avg10=60.00 avg60=20.00 avg300=5.00 total=1\nfull avg10=40.00 avg60=10.00 avg300=2.00 total=1\n";
 
     #[test]
-    fn mem_available_basic() {
-        // 2_097_152 kB == 2048 MB
-        let m = "MemTotal:       16000000 kB\n\
-                 MemFree:         1000000 kB\n\
-                 MemAvailable:    2097152 kB\n";
-        assert_eq!(parse_mem_available_mb(m), Some(2048));
+    fn stall_inside_a_limited_rlm_cgroup_does_not_count_as_app_pressure() {
+        // Incident replay: a cgroup rlm limited thrashed at its own memory.max;
+        // system PSI read 60% while nothing in app.slice was waiting.
+        assert_eq!(
+            pick_pressure(Some(APP_CALM), Some(SYS_HOT)),
+            Some((0.0, 0.0, PsiSource::AppSlice))
+        );
     }
 
     #[test]
-    fn mem_available_missing_is_none() {
-        let m = "MemTotal:       16000000 kB\nMemFree: 1000000 kB\n";
-        assert_eq!(parse_mem_available_mb(m), None);
+    fn falls_back_to_system_psi_when_app_slice_file_missing() {
+        assert_eq!(
+            pick_pressure(None, Some(SYS_HOT)),
+            Some((60.0, 40.0, PsiSource::System))
+        );
+        assert_eq!(
+            pick_pressure(Some("garbage"), Some(SYS_HOT)),
+            Some((60.0, 40.0, PsiSource::System))
+        );
     }
 
     #[test]
-    fn mem_available_malformed_is_none() {
-        let m = "MemAvailable:    not_a_number kB\n";
-        assert_eq!(parse_mem_available_mb(m), None);
+    fn no_psi_anywhere_is_none() {
+        assert_eq!(pick_pressure(None, None), None);
     }
 
     #[test]
-    fn mem_available_truncates_down() {
-        // 1500 kB -> 1 MB (integer division)
-        let m = "MemAvailable:       1500 kB\n";
-        assert_eq!(parse_mem_available_mb(m), Some(1));
+    fn app_slice_pressure_path_is_under_the_user_manager() {
+        assert_eq!(
+            app_slice_pressure_path(1000),
+            std::path::PathBuf::from(
+                "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/memory.pressure"
+            )
+        );
+    }
+
+    #[test]
+    fn parse_meminfo_reads_available_total_and_swap() {
+        let m = "MemTotal:       16384000 kB\nMemFree: 1 kB\nMemAvailable:    2097152 kB\nSwapTotal:       8388604 kB\n";
+        assert_eq!(
+            parse_meminfo(m),
+            Some(MemInfo {
+                available_mb: 2048,
+                total_mb: 16000,
+                swap_total_kb: 8_388_604
+            })
+        );
+    }
+
+    #[test]
+    fn parse_meminfo_without_swaptotal_defaults_zero() {
+        let m = "MemTotal: 1024000 kB\nMemAvailable: 512000 kB\n";
+        assert_eq!(parse_meminfo(m).unwrap().swap_total_kb, 0);
+    }
+
+    #[test]
+    fn parse_meminfo_requires_available_and_total() {
+        assert_eq!(parse_meminfo("MemTotal: 1 kB\n"), None);
+        assert_eq!(parse_meminfo("MemAvailable: 1 kB\n"), None);
     }
 
     // ---- parse_proc_status ----------------------------------------------

@@ -3,15 +3,39 @@
 
 use super::resolve::Resolution;
 
-/// One memory-pressure sample taken from the system.
+/// Which PSI file a [`Sample`]'s pressure numbers came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PsiSource {
+    /// The user's `app.slice/memory.pressure`: stalls felt by the processes
+    /// the guard can act on, excluding rlm's own limited cgroups.
+    AppSlice,
+    /// System-wide `/proc/pressure/memory`, used only when the app.slice file
+    /// is missing or unreadable.
+    System,
+}
+
+impl std::fmt::Display for PsiSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            PsiSource::AppSlice => "app.slice",
+            PsiSource::System => "system",
+        })
+    }
+}
+
+/// One memory-pressure sample.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Sample {
     /// PSI `some` avg10, percent in `0.0..=100.0`.
     pub some_avg10: f64,
     /// PSI `full` avg10, percent.
     pub full_avg10: f64,
-    /// MemAvailable, in MB.
+    /// MemAvailable, in MB. `u64::MAX` when /proc/meminfo is unreadable.
     pub mem_available_mb: u64,
+    /// MemTotal, in MB. `0` when /proc/meminfo is unreadable.
+    pub mem_total_mb: u64,
+    /// Where the PSI numbers came from.
+    pub source: PsiSource,
 }
 
 /// Pressure level derived from a [`Sample`]. Hysteresis (separate rise/fall

@@ -720,8 +720,8 @@ fn guard_status(manager: &CgroupManager) {
 
     match sampler.sample() {
         Some(s) => println!(
-            "Memory pressure: some(avg10)={:.1}%  full(avg10)={:.1}%  available={} MB",
-            s.some_avg10, s.full_avg10, s.mem_available_mb
+            "Memory pressure ({}): some(avg10)={:.1}%  full(avg10)={:.1}%  available {} MB of {} MB",
+            s.source, s.some_avg10, s.full_avg10, s.mem_available_mb, s.mem_total_mb
         ),
         None => println!("Memory pressure: PSI unavailable (/proc/pressure/memory)"),
     }
@@ -785,10 +785,12 @@ fn guard_test(manager: &CgroupManager) {
     let procs = sampler.eligible();
     let live = sampler.live_cgroups();
     println!(
-        "Pressure: some={:.1}%  full={:.1}%  available={} MB  |  {} eligible process(es)",
+        "Memory pressure ({}): some={:.1}%  full={:.1}%  available {} MB of {} MB  |  {} eligible process(es)",
+        sample.source,
         sample.some_avg10,
         sample.full_avg10,
         sample.mem_available_mb,
+        sample.mem_total_mb,
         procs.len()
     );
 

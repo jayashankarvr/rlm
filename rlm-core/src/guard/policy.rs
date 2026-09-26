@@ -19,6 +19,16 @@ const FULL_HIGH_RISE: f64 = 3.0;
 /// Rate-limit window for `Notify` actions (ms): at most one notification a minute.
 const NOTIFY_INTERVAL_MS: u64 = 60_000;
 
+/// True when the host is actually short of memory: below the hard floor, or
+/// below `act_below_available_pct` percent of RAM. A stall confined to one
+/// cgroup's memory.max leaves MemAvailable high, so it never passes this gate.
+pub fn is_scarce(s: &Sample, t: &common::GuardTrigger) -> bool {
+    s.mem_available_mb < t.mem_available_floor_mb
+        || (s.mem_total_mb > 0
+            && s.mem_available_mb.saturating_mul(100)
+                < s.mem_total_mb.saturating_mul(t.act_below_available_pct))
+}
+
 /// Self-healing circuit-breaker policy engine.
 ///
 /// On a memory spike it drives the ladder *notify -> freeze (short) -> auto-thaw
@@ -158,9 +168,12 @@ impl PolicyEngine {
             self.interventions.remove(&cg);
         }
 
-        // 5. Escalate, but only when pressure actually warrants action.
+        // 5. Escalate, but only when apps feel pressure and memory is
+        //    actually short (see `is_scarce`).
         let mut victim_name: Option<String> = None;
-        if matches!(self.level, Level::High | Level::Critical) {
+        if matches!(self.level, Level::High | Level::Critical)
+            && is_scarce(&sample, &self.cfg.trigger)
+        {
             // Global gate: after acting on one hog, wait a freeze-hold before
             // acting again so we re-measure instead of cascading freezes —
             // *unless* the last action only achieved partial coverage (a
@@ -343,6 +356,7 @@ impl PolicyEngine {
 #[cfg(test)]
 mod tests {
     use super::super::resolve::Mechanism;
+    use super::super::types::PsiSource;
     use super::*;
 
     /// Default config = the documented zero-config defaults.
@@ -355,6 +369,8 @@ mod tests {
             some_avg10: some,
             full_avg10: full,
             mem_available_mb: avail_mb,
+            mem_total_mb: 16_000,
+            source: PsiSource::AppSlice,
         }
     }
 
@@ -398,9 +414,40 @@ mod tests {
         sample(0.0, 0.0, 8000)
     }
 
-    /// A clearly-High sample (well above psi_some_high=30, below critical).
+    /// High PSI while only 12.5% of RAM is available: a real shortage.
     fn high() -> Sample {
-        sample(50.0, 0.0, 8000)
+        sample(50.0, 0.0, 2_000)
+    }
+
+    #[test]
+    fn high_pressure_with_plenty_of_free_memory_never_escalates() {
+        let mut e = PolicyEngine::new(cfg());
+        let procs = vec![proc(2, "chrome", 4000)];
+        // Half of RAM available: this stall is local to some memory.max, not a shortage.
+        let a = e.tick(0, sample(80.0, 20.0, 8_000), &procs, &live_from(&procs));
+        assert_eq!(e.level, Level::Critical);
+        assert!(
+            !a.iter()
+                .any(|x| matches!(x, Action::Freeze { .. } | Action::Cap { .. })),
+            "escalated without scarcity: {a:?}"
+        );
+    }
+
+    #[test]
+    fn is_scarce_uses_floor_or_percentage() {
+        let t = common::GuardTrigger::default(); // floor 400 MB, 20%
+        assert!(is_scarce(&sample(0.0, 0.0, 300), &t));
+        assert!(is_scarce(&sample(0.0, 0.0, 3_000), &t)); // 18.75%
+        assert!(!is_scarce(&sample(0.0, 0.0, 3_300), &t)); // 20.6%
+        let unknown = Sample {
+            mem_total_mb: 0,
+            mem_available_mb: u64::MAX,
+            ..sample(0.0, 0.0, 0)
+        };
+        assert!(
+            !is_scarce(&unknown, &t),
+            "unreadable meminfo must not enable actions"
+        );
     }
 
     fn freeze_targets(actions: &[Action]) -> Vec<String> {
