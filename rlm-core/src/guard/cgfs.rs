@@ -171,8 +171,14 @@ fn collect_pids_recursive(dir: &Path, out: &mut Vec<u32>) {
 
 /// Get the executable basename for a process (from /proc/<pid>/exe).
 pub fn exe_basename(pid: u32) -> Option<String> {
-    let path = std::fs::read_link(format!("/proc/{pid}/exe")).ok()?;
-    path.file_name()?.to_str().map(|s| s.to_string())
+    exe_name(&std::fs::read_link(format!("/proc/{pid}/exe")).ok()?)
+}
+
+/// Basename of an exe link target, without the ` (deleted)` suffix the
+/// kernel adds after the binary was replaced (e.g. by a package upgrade).
+fn exe_name(link: &Path) -> Option<String> {
+    let name = link.file_name()?.to_str()?;
+    Some(name.strip_suffix(" (deleted)").unwrap_or(name).to_string())
 }
 
 /// Get the boot_id from /proc/sys/kernel/random/boot_id, trimmed.
@@ -211,6 +217,18 @@ pub fn parse_file(stat: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exe_name_strips_deleted_suffix() {
+        assert_eq!(
+            exe_name(Path::new("/opt/google/chrome/chrome (deleted)")).as_deref(),
+            Some("chrome")
+        );
+        assert_eq!(
+            exe_name(Path::new("/usr/bin/firefox")).as_deref(),
+            Some("firefox")
+        );
+    }
 
     #[test]
     fn parse_frozen_reads_events() {

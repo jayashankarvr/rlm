@@ -1083,6 +1083,32 @@ mod tests {
     }
 
     #[test]
+    fn held_limit_counts_apps_not_cgroups() {
+        let mut e = PolicyEngine::new(cfg());
+        let ts = vec![
+            target("a", "/app.slice/a1.scope", 2000),
+            target("a", "/app.slice/a2.scope", 2000),
+            target("b", "/app.slice/b.scope", 1500),
+            target("c", "/app.slice/c.scope", 1200),
+            target("d", "/app.slice/d.scope", 1100),
+        ];
+        for step in 0..40u64 {
+            e.tick(step * 5_000, high(), &ts, &live_from(&ts));
+        }
+        let held: Vec<String> = e.interventions().into_iter().map(|(cg, _)| cg).collect();
+        assert_eq!(
+            held,
+            vec![
+                "/app.slice/a1.scope",
+                "/app.slice/a2.scope",
+                "/app.slice/b.scope",
+                "/app.slice/c.scope"
+            ],
+            "4 cgroups across 3 apps are allowed, a 4th app is refused"
+        );
+    }
+
+    #[test]
     fn candidates_are_wanted_only_above_calm() {
         let e = PolicyEngine::new(cfg());
         assert!(!e.wants_candidates(calm()));

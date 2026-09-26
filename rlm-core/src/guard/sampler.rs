@@ -272,8 +272,53 @@ impl Sampler {
     }
 }
 
+/// Runtimes, interpreters and shells: many unrelated apps run the same
+/// binary, so for these the exe basename alone does not identify an app.
+/// Matched exactly, except `python3.` and `ld-linux` which match by prefix.
+const RUNTIME_EXES: &[&str] = &[
+    "java",
+    "node",
+    "nodejs",
+    "python",
+    "python2",
+    "python3",
+    "electron",
+    "wine",
+    "wine64",
+    "wine-preloader",
+    "bash",
+    "sh",
+    "dash",
+    "zsh",
+    "fish",
+    "ruby",
+    "perl",
+    "php",
+    "dotnet",
+    "mono",
+    "deno",
+    "bun",
+];
+
+fn is_runtime_exe(name: &str) -> bool {
+    RUNTIME_EXES.contains(&name) || name.starts_with("python3.") || name.starts_with("ld-linux")
+}
+
+/// The grouping key for a cgroup whose largest process is `name`: the exe
+/// basename, so every scope of one browser is one app, except for runtimes,
+/// which get `<name>@<cgroup leaf>` so each unit is its own app (a growing
+/// Gradle daemon must not take IntelliJ down with it).
+fn app_key(name: &str, cgroup: &str) -> String {
+    if is_runtime_exe(name) {
+        let leaf = cgroup.rsplit('/').next().unwrap_or(cgroup);
+        format!("{name}@{leaf}")
+    } else {
+        name.to_string()
+    }
+}
+
 /// Group resolved processes by cgroup into one [`Target`] each. The app is
-/// named after the cgroup's largest process, and `current_bytes` reads the
+/// named after the cgroup's largest process (see [`app_key`]), and `current_bytes` reads the
 /// cgroup's `memory.current` (injected so tests stay off the real cgroupfs).
 /// Unresolved processes are dropped: the guard can't act on them.
 pub fn targets_from_procs(
@@ -293,7 +338,7 @@ pub fn targets_from_procs(
     heaviest
         .into_iter()
         .map(|(cg, p)| Target {
-            app: p.name.clone(),
+            app: app_key(&p.name, cg),
             resolution: p.resolution.clone().expect("grouped only resolved procs"),
             rss_kb: p.rss_kb,
             current_bytes: current_bytes(cg),
@@ -421,6 +466,78 @@ mod tests {
                 mechanism: Mechanism::Raw,
             }),
         }
+    }
+
+    fn high_sample() -> Sample {
+        Sample {
+            some_avg10: 50.0,
+            full_avg10: 0.0,
+            mem_available_mb: 2_000,
+            mem_total_mb: 16_000,
+            source: PsiSource::AppSlice,
+        }
+    }
+
+    fn frozen(actions: &[super::super::types::Action]) -> Vec<String> {
+        let mut v: Vec<String> = actions
+            .iter()
+            .filter_map(|a| match a {
+                super::super::types::Action::Freeze { res, .. } => Some(res.cgroup.clone()),
+                _ => None,
+            })
+            .collect();
+        v.sort();
+        v
+    }
+
+    fn tick_once(procs: &[ProcInfo]) -> Vec<String> {
+        let ts = targets_from_procs(procs, &|_| None);
+        let live: HashSet<String> = ts.iter().map(|t| t.resolution.cgroup.clone()).collect();
+        let mut e = super::super::PolicyEngine::new(GuardConfig::default());
+        frozen(&e.tick(0, high_sample(), &ts, &live))
+    }
+
+    #[test]
+    fn two_java_scopes_are_two_apps() {
+        let procs = vec![
+            pinfo(1, "java", 3000, Some("/app.slice/app-idea-1.scope")),
+            pinfo(2, "java", 2000, Some("/app.slice/app-gradle-2.scope")),
+        ];
+        assert_eq!(tick_once(&procs), vec!["/app.slice/app-idea-1.scope"]);
+    }
+
+    #[test]
+    fn two_chrome_scopes_are_still_one_app() {
+        let procs = vec![
+            pinfo(1, "chrome", 3000, Some("/app.slice/app-a-1.scope")),
+            pinfo(2, "chrome", 2000, Some("/app.slice/app-b-2.scope")),
+        ];
+        assert_eq!(
+            tick_once(&procs),
+            vec!["/app.slice/app-a-1.scope", "/app.slice/app-b-2.scope"]
+        );
+    }
+
+    #[test]
+    fn runtime_binaries_are_keyed_per_unit() {
+        let procs = vec![
+            pinfo(1, "python3.12", 900, Some("/app.slice/run-u7.service")),
+            pinfo(2, "ld-linux-x86-64.so.2", 900, Some("/app.slice/x.scope")),
+            pinfo(3, "firefox", 900, Some("/app.slice/ff.scope")),
+        ];
+        let mut apps: Vec<String> = targets_from_procs(&procs, &|_| None)
+            .into_iter()
+            .map(|t| t.app)
+            .collect();
+        apps.sort();
+        assert_eq!(
+            apps,
+            vec![
+                "firefox",
+                "ld-linux-x86-64.so.2@x.scope",
+                "python3.12@run-u7.service"
+            ]
+        );
     }
 
     #[test]
