@@ -195,23 +195,27 @@ fn mb_text(mb: u64) -> String {
 }
 
 /// How much memory pressure a sample shows, judged by the level the guard
-/// itself would enter for it ([`rise_level`]), so the page never says "no
-/// memory pressure" while the guard acts.
-pub fn pressure_words(s: &Sample, t: &GuardTrigger) -> &'static str {
+/// would rise to for it ([`rise_level`]). That check has no memory of earlier
+/// samples, while the guard only steps back down once pressure falls to half
+/// its thresholds, so with `acting` (the guard has apps frozen or capped) a
+/// calm sample reads "pressure easing" rather than "no memory pressure".
+pub fn pressure_words(s: &Sample, t: &GuardTrigger, acting: bool) -> &'static str {
     match rise_level(s, t) {
         Level::Critical | Level::High => "high memory pressure",
         Level::Warn => "some memory pressure",
+        Level::Calm if acting => "pressure easing",
         Level::Calm => "no memory pressure",
     }
 }
 
 /// The Pressure row in plain words, such as "9.8 GB of 14.8 GB free, no
-/// memory pressure". The raw PSI numbers go in the row's tooltip.
-pub fn pressure_summary(sample: Option<&Sample>, t: &GuardTrigger) -> String {
+/// memory pressure". `acting` is as for [`pressure_words`]. The raw PSI
+/// numbers go in the row's tooltip.
+pub fn pressure_summary(sample: Option<&Sample>, t: &GuardTrigger, acting: bool) -> String {
     let Some(s) = sample else {
         return "Cannot read memory pressure on this system".to_string();
     };
-    let words = pressure_words(s, t);
+    let words = pressure_words(s, t, acting);
     if s.mem_available_mb == u64::MAX || s.mem_total_mb == 0 {
         format!("Free memory unknown, {words}")
     } else {
@@ -282,7 +286,7 @@ pub fn build_view(
     let service_desc = capitalize(&describe(service));
     let config = cfg.as_ref().map(|_| ()).map_err(Clone::clone);
     let trigger = cfg.as_ref().map(|c| c.trigger.clone()).unwrap_or_default();
-    let pressure = pressure_summary(sample.as_ref(), &trigger);
+    let pressure = pressure_summary(sample.as_ref(), &trigger, !entries.is_empty());
     let pressure_detail =
         sample.map_or_else(|| pressure_unavailable().to_string(), |s| pressure_line(&s));
     let policy = cfg.as_ref().map_or_else(
@@ -767,27 +771,27 @@ mod tests {
     fn pressure_in_plain_words() {
         let t = GuardTrigger::default();
         assert_eq!(
-            pressure_summary(Some(&sample(0.4, 0.0, 10035, 15155)), &t),
+            pressure_summary(Some(&sample(0.4, 0.0, 10035, 15155)), &t, false),
             "9.8 GB of 14.8 GB free, no memory pressure"
         );
         assert_eq!(
-            pressure_summary(Some(&sample(12.0, 0.0, 900, 15155)), &t),
+            pressure_summary(Some(&sample(12.0, 0.0, 900, 15155)), &t, false),
             "900 MB of 14.8 GB free, some memory pressure"
         );
         assert_eq!(
-            pressure_summary(Some(&sample(31.0, 0.0, 900, 15155)), &t),
+            pressure_summary(Some(&sample(31.0, 0.0, 900, 15155)), &t, false),
             "900 MB of 14.8 GB free, high memory pressure"
         );
         assert_eq!(
-            pressure_summary(Some(&sample(1.0, 10.0, 900, 15155)), &t),
+            pressure_summary(Some(&sample(1.0, 10.0, 900, 15155)), &t, false),
             "900 MB of 14.8 GB free, high memory pressure"
         );
         assert_eq!(
-            pressure_summary(Some(&sample(0.0, 0.0, u64::MAX, 0)), &t),
+            pressure_summary(Some(&sample(0.0, 0.0, u64::MAX, 0)), &t, false),
             "Free memory unknown, no memory pressure"
         );
         assert_eq!(
-            pressure_summary(None, &t),
+            pressure_summary(None, &t, false),
             "Cannot read memory pressure on this system"
         );
     }
@@ -797,16 +801,16 @@ mod tests {
         let t = GuardTrigger::default();
         // PSI full at 4 enters High in the guard even with low `some`.
         assert_ne!(
-            pressure_summary(Some(&sample(5.0, 4.0, 2000, 15155)), &t),
+            pressure_summary(Some(&sample(5.0, 4.0, 2000, 15155)), &t, false),
             "2.0 GB of 14.8 GB free, no memory pressure"
         );
         assert_ne!(
-            pressure_words(&sample(5.0, 4.0, 2000, 15155), &t),
+            pressure_words(&sample(5.0, 4.0, 2000, 15155), &t, false),
             "no memory pressure"
         );
         // Below the free-memory floor the guard is Critical with no PSI at all.
         assert_eq!(
-            pressure_words(&sample(0.0, 0.0, 300, 15155), &t),
+            pressure_words(&sample(0.0, 0.0, 300, 15155), &t, false),
             "high memory pressure"
         );
     }
@@ -819,11 +823,28 @@ mod tests {
             ..GuardTrigger::default()
         };
         assert_eq!(
-            pressure_words(&sample(1.5, 0.0, 8000, 16000), &t),
+            pressure_words(&sample(1.5, 0.0, 8000, 16000), &t, false),
             "some memory pressure"
         );
         assert_eq!(
-            pressure_words(&sample(2.0, 0.0, 8000, 16000), &t),
+            pressure_words(&sample(2.0, 0.0, 8000, 16000), &t, false),
+            "high memory pressure"
+        );
+    }
+
+    #[test]
+    fn calm_sample_reads_easing_while_the_guard_acts() {
+        let t = GuardTrigger::default();
+        let calm = sample(0.4, 0.0, 10035, 15155);
+        assert_eq!(pressure_words(&calm, &t, false), "no memory pressure");
+        assert_eq!(pressure_words(&calm, &t, true), "pressure easing");
+        assert_eq!(
+            pressure_summary(Some(&calm), &t, true),
+            "9.8 GB of 14.8 GB free, pressure easing"
+        );
+        // Real pressure is still named as such while acting.
+        assert_eq!(
+            pressure_words(&sample(31.0, 0.0, 900, 15155), &t, true),
             "high memory pressure"
         );
     }
