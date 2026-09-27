@@ -45,7 +45,9 @@ struct LimitState {
     /// Each application row's Select button, keyed like `group_pids`. An
     /// expander row draws no selection highlight, so the button shows it.
     group_buttons: RefCell<std::collections::HashMap<String, gtk::Button>>,
-    save_rule_check: gtk::CheckButton, // Persist as a rule (application mode only)
+    /// Persist as a rule (whole-app mode only)
+    save_rule_switch: adw::SwitchRow,
+    summary_label: gtk::Label,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -83,37 +85,26 @@ pub fn create(manager: Option<Arc<CgroupManager>>) -> gtk::Widget {
     let mode_group = adw::PreferencesGroup::new();
     mode_group.set_title("Limit Mode");
     mode_group.set_description(Some(
-        "Individual limits one process. Application puts several processes under one shared limit.",
+        "Whole app puts every process of the selected apps under one shared limit. \
+         Single process limits one process on its own.",
     ));
 
     let mode_row = adw::ComboRow::new();
     mode_row.set_title("Mode");
-    // No subtitle: a long one squeezes the selected value down to "A...".
-    // The group description and the hint under Find Process explain the modes.
+    // No subtitle: a long one squeezes the selected value down to "W...".
+    // The group description and the hint under Target explain the modes.
 
-    let mode_list = gtk::StringList::new(&["Individual", "Application (Shared)"]);
+    // Order matches mode_for_index.
+    let mode_list = gtk::StringList::new(&["Whole app (shared limit)", "Single process"]);
     mode_row.set_model(Some(&mode_list));
     mode_row.set_selected(0);
     mode_group.add(&mode_row);
 
     page.add(&mode_group);
 
-    // Target process group
-    let target_group = adw::PreferencesGroup::new();
-    target_group.set_title("Target Process");
-    target_group.set_description(Some("Type a PID, or pick from the list below"));
-
-    let pid_entry = adw::EntryRow::new();
-    pid_entry.set_title("Process ID");
-    pid_entry.set_input_purpose(gtk::InputPurpose::Digits);
-    setup_pid_validation(&pid_entry);
-    target_group.add(&pid_entry);
-
-    page.add(&target_group);
-
-    // Process search group
+    // Target: search, what is selected, then the list
     let search_group = adw::PreferencesGroup::new();
-    search_group.set_title("Find Process");
+    search_group.set_title("Target");
 
     // Refresh button in header
     let refresh_btn = gtk::Button::from_icon_name("view-refresh-symbolic");
@@ -126,6 +117,7 @@ pub fn create(manager: Option<Arc<CgroupManager>>) -> gtk::Widget {
     mode_info_label.add_css_class("dim-label");
     mode_info_label.set_margin_bottom(6);
     mode_info_label.set_wrap(true);
+    mode_info_label.set_xalign(0.0);
     search_group.add(&mode_info_label);
 
     let search_entry = gtk::SearchEntry::new();
@@ -133,9 +125,17 @@ pub fn create(manager: Option<Arc<CgroupManager>>) -> gtk::Widget {
     search_entry.set_margin_bottom(12);
     search_group.add(&search_entry);
 
+    // What the limits will apply to, e.g. "2 apps selected, 8 processes"
+    let summary_label = gtk::Label::new(None);
+    summary_label.add_css_class("heading");
+    summary_label.set_xalign(0.0);
+    summary_label.set_wrap(true);
+    summary_label.set_margin_bottom(6);
+    search_group.add(&summary_label);
+
     let process_list = gtk::ListBox::new();
-    // Individual mode selects one row; filter_processes switches this per mode.
-    process_list.set_selection_mode(gtk::SelectionMode::Single);
+    // filter_processes sets single or multiple selection per mode.
+    process_list.set_selection_mode(gtk::SelectionMode::Multiple);
     process_list.add_css_class("boxed-list");
 
     let scroll = gtk::ScrolledWindow::new();
@@ -151,6 +151,22 @@ pub fn create(manager: Option<Arc<CgroupManager>>) -> gtk::Widget {
     cap_label.set_visible(false);
     search_group.add(&cap_label);
     page.add(&search_group);
+
+    // Manual PID entry, tucked below the list. It mirrors the list
+    // selection, and typing in it is the way to reach a process the list
+    // does not show.
+    let manual_group = adw::PreferencesGroup::new();
+    let manual_row = adw::ExpanderRow::new();
+    manual_row.set_title("Enter PIDs manually");
+    manual_row.set_subtitle("Process IDs, separated by commas");
+
+    let pid_entry = adw::EntryRow::new();
+    pid_entry.set_title("Process ID");
+    pid_entry.set_input_purpose(gtk::InputPurpose::Digits);
+    setup_pid_validation(&pid_entry);
+    manual_row.add_row(&pid_entry);
+    manual_group.add(&manual_row);
+    page.add(&manual_group);
 
     // Profile selection group
     let profile_group = adw::PreferencesGroup::new();
@@ -212,12 +228,15 @@ pub fn create(manager: Option<Arc<CgroupManager>>) -> gtk::Widget {
     io_write_entry.add_suffix(&io_write_unit);
     limits_group.add(&io_write_entry);
 
-    page.add(&limits_group);
+    // Persist as a rule; only whole-app limits can be saved, so it is
+    // hidden in single-process mode.
+    let save_rule_switch = adw::SwitchRow::new();
+    save_rule_switch.set_title("Save as a rule for rlm-guard");
+    save_rule_switch
+        .set_subtitle("rlm-guard then applies these limits to future instances of the app");
+    limits_group.add(&save_rule_switch);
 
-    // Persist-as-rule toggle (only meaningful in application mode; hidden otherwise)
-    let save_rule_check = gtk::CheckButton::with_label("Also save as a rule for rlm-guard");
-    save_rule_check.set_halign(gtk::Align::Center);
-    save_rule_check.set_visible(false);
+    page.add(&limits_group);
 
     // Apply button
     let apply_btn = gtk::Button::with_label("Apply Limits");
@@ -229,7 +248,6 @@ pub fn create(manager: Option<Arc<CgroupManager>>) -> gtk::Widget {
 
     let button_box = gtk::Box::new(gtk::Orientation::Vertical, 12);
     button_box.append(&status_label);
-    button_box.append(&save_rule_check);
     button_box.append(&apply_btn);
 
     let button_group = adw::PreferencesGroup::new();
@@ -252,11 +270,12 @@ pub fn create(manager: Option<Arc<CgroupManager>>) -> gtk::Widget {
         cap_label: cap_label.clone(),
         manager: manager.clone(),
         all_processes: RefCell::new(Vec::new()),
-        limit_mode: RefCell::new(LimitMode::Individual),
+        limit_mode: RefCell::new(LimitMode::Application),
         group_pids: RefCell::new(std::collections::HashMap::new()),
         rebuilding: std::cell::Cell::new(false),
         group_buttons: RefCell::new(std::collections::HashMap::new()),
-        save_rule_check: save_rule_check.clone(),
+        save_rule_switch: save_rule_switch.clone(),
+        summary_label: summary_label.clone(),
     }));
 
     // Load initial processes
@@ -268,24 +287,27 @@ pub fn create(manager: Option<Arc<CgroupManager>>) -> gtk::Widget {
     let mode_info_label_clone = mode_info_label.clone();
     let search_entry_clone = search_entry.clone();
     mode_row.connect_selected_notify(move |row| {
-        let mode = if row.selected() == 0 {
-            LimitMode::Individual
-        } else {
-            LimitMode::Application
-        };
+        let mode = mode_for_index(row.selected());
         state_clone.borrow().limit_mode.replace(mode);
         // A PID list from Application mode means nothing in Individual mode
         // (and the reverse), so start each mode with an empty selection.
         state_clone.borrow().pid_entry.set_text("");
         update_mode_info(&mode_info_label_clone, mode);
-        // The "save as rule" toggle only applies to application (shared) mode.
+        // The "save as rule" switch only applies to whole-app mode.
         state_clone
             .borrow()
-            .save_rule_check
+            .save_rule_switch
             .set_visible(mode == LimitMode::Application);
         filter_processes(&state_clone, search_entry_clone.text().as_str());
     });
-    update_mode_info(&mode_info_label, LimitMode::Individual);
+    update_mode_info(&mode_info_label, LimitMode::Application);
+
+    // The summary follows the PID field, which mirrors the list selection.
+    let state_clone = state.clone();
+    pid_entry.connect_changed(move |_| {
+        update_summary(&state_clone.borrow());
+    });
+    update_summary(&state.borrow());
 
     // Refresh button handler
     let state_clone = state.clone();
@@ -494,6 +516,54 @@ fn load_all_processes(state: &Rc<RefCell<LimitState>>) {
     }
 }
 
+/// The mode a Mode row index stands for: whole app first, the default.
+fn mode_for_index(index: u32) -> LimitMode {
+    if index == 0 {
+        LimitMode::Application
+    } else {
+        LimitMode::Individual
+    }
+}
+
+/// Plural-aware "1 app" / "2 apps".
+fn count(n: usize, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
+}
+
+/// What the limits will apply to, from the selected app rows and the PIDs
+/// in the PID field.
+fn selection_summary(mode: LimitMode, apps: usize, pids: &[u32]) -> String {
+    match (mode, pids) {
+        (LimitMode::Individual, []) => "No process selected".into(),
+        (LimitMode::Individual, [pid]) => format!("PID {pid}"),
+        (LimitMode::Individual, _) => format!(
+            "{} entered; Single process mode takes one",
+            count(pids.len(), "PID", "PIDs")
+        ),
+        (LimitMode::Application, []) => "No application selected".into(),
+        (LimitMode::Application, _) if apps > 0 => format!(
+            "{} selected, {}",
+            count(apps, "app", "apps"),
+            count(pids.len(), "process", "processes")
+        ),
+        (LimitMode::Application, _) => {
+            format!("{} entered", count(pids.len(), "process", "processes"))
+        }
+    }
+}
+
+fn update_summary(state: &LimitState) {
+    let mode = *state.limit_mode.borrow();
+    let pids = parse_pid_list(&state.pid_entry.text()).unwrap_or_default();
+    let apps = match mode {
+        LimitMode::Application => state.process_list.selected_rows().len(),
+        LimitMode::Individual => 0,
+    };
+    state
+        .summary_label
+        .set_text(&selection_summary(mode, apps, &pids));
+}
+
 fn update_mode_info(label: &gtk::Label, mode: LimitMode) {
     match mode {
         LimitMode::Individual => {
@@ -666,6 +736,7 @@ fn filter_processes(state: &Rc<RefCell<LimitState>>, query: &str) {
     }
     sync_group_buttons(&state_ref, list);
     state_ref.rebuilding.set(false);
+    update_summary(&state_ref);
 }
 
 /// Memory in KB as "900 KB", "512 MB" or "1.2 GB".
@@ -832,7 +903,7 @@ fn apply_limits(state: &Rc<RefCell<LimitState>>) {
         LimitMode::Application => {
             // Application mode - shared limits
             if pid_text.is_empty() {
-                show_status(&state.status_label, "Select processes first", true);
+                show_status(&state.status_label, "Select an application first", true);
                 return;
             }
 
@@ -887,7 +958,7 @@ fn apply_limits(state: &Rc<RefCell<LimitState>>) {
                     // Persist as a rule if requested. A rule matches by executable
                     // basename, so only save when every selected PID is the same
                     // app, otherwise the saved match_exe would be misleading.
-                    if state.save_rule_check.is_active() {
+                    if state.save_rule_switch.is_active() {
                         match common_exe_basename(&state.all_processes.borrow(), &pids) {
                             Some(exe) => match save_app_rule(
                                 &exe,
@@ -928,7 +999,7 @@ fn apply_limits(state: &Rc<RefCell<LimitState>>) {
         LimitMode::Individual => {
             // Individual mode - separate limits per process
             if pid_text.is_empty() {
-                show_status(&state.status_label, "Enter a PID first", true);
+                show_status(&state.status_label, "Select a process first", true);
                 return;
             }
 
@@ -939,7 +1010,7 @@ fn apply_limits(state: &Rc<RefCell<LimitState>>) {
                     show_status(
                         &state.status_label,
                         if several {
-                            "Individual mode takes one PID; to limit several processes together, switch to Application mode"
+                            "Single process mode takes one PID; to limit several processes together, switch to Whole app mode"
                         } else {
                             "Enter a positive PID"
                         },
@@ -1045,6 +1116,36 @@ mod tests {
             Some("Showing 50 of 312; type to search")
         );
         assert!(cap_note(30, 40, true).unwrap().contains("type more"));
+    }
+
+    #[test]
+    fn whole_app_is_the_first_and_default_mode() {
+        assert!(mode_for_index(0) == LimitMode::Application);
+        assert!(mode_for_index(1) == LimitMode::Individual);
+    }
+
+    #[test]
+    fn summary_says_what_the_limits_apply_to() {
+        use LimitMode::*;
+        assert_eq!(
+            selection_summary(Application, 2, &[1, 2, 3, 4, 5, 6, 7, 8]),
+            "2 apps selected, 8 processes"
+        );
+        assert_eq!(
+            selection_summary(Application, 1, &[9]),
+            "1 app selected, 1 process"
+        );
+        assert_eq!(
+            selection_summary(Application, 0, &[9, 10]),
+            "2 processes entered"
+        );
+        assert_eq!(
+            selection_summary(Application, 0, &[]),
+            "No application selected"
+        );
+        assert_eq!(selection_summary(Individual, 0, &[3019]), "PID 3019");
+        assert_eq!(selection_summary(Individual, 0, &[]), "No process selected");
+        assert!(selection_summary(Individual, 0, &[1, 2]).starts_with("2 PIDs entered"));
     }
 
     #[test]
