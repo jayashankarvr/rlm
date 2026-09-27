@@ -36,7 +36,7 @@ assets = [
     { source = "target/release/rlm-guard", dest = "/usr/bin/rlm-guard", mode = "755" },
     { source = "assets/rlm-guard.service", dest = "/usr/lib/systemd/user/rlm-guard.service", mode = "644" },
     { source = "../README.md", dest = "/usr/share/doc/rlm/README.md", mode = "644" },
-    { source = "../dist/rlm-delegate.conf", dest = "/etc/systemd/system/user@.service.d/rlm-delegate.conf", mode = "644", config = true },
+    { source = "../dist/rlm-delegate.conf", dest = "/etc/systemd/system/user@.service.d/rlm-delegate.conf", mode = "644", config = "noreplace" },
 ]
 post_install_script = "../dist/rpm/post"
 pre_uninstall_script = "../dist/rpm/preun"
