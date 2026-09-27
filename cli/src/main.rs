@@ -924,6 +924,13 @@ fn guard_enable() -> Result<ExitCode> {
     let config_dir = dirs::config_dir()
         .ok_or_else(|| Error::InvalidArgs("cannot find the user config directory".into()))?;
     let unit_path = guard_unit::user_unit_path(&config_dir);
+    // Read before `enable --now`, which starts a stopped service.
+    let state = rlm_core::guard::service::query();
+    if let Some(msg) = guard_unit::masked_error(&state.enabled) {
+        eprintln!("error: {msg}");
+        return Ok(ExitCode::FAILURE);
+    }
+    let was_active = state.active == "active";
     let existing = std::fs::read_to_string(&unit_path).ok();
     let current_exe = std::env::current_exe().ok();
     let path_env = std::env::var_os("PATH");
@@ -938,8 +945,6 @@ fn guard_enable() -> Result<ExitCode> {
         guard_bin.as_deref(),
         &unit_path,
     );
-    // Read before `enable --now`, which starts a stopped service.
-    let was_active = rlm_core::guard::service::query().active == "active";
     let mut unit_written = false;
     match plan {
         guard_unit::EnablePlan::NoBinary => {

@@ -159,6 +159,26 @@ pub fn plan_enable(
     }
 }
 
+/// Error for `rlm guard enable` when `systemctl --user is-enabled` reports
+/// the unit as masked (`masked` or `masked-runtime`). A masked user unit is
+/// a symlink to `/dev/null` at the user unit path, which would otherwise read
+/// as an empty user-written unit and be kept as "your own".
+pub fn masked_error(enabled: &str) -> Option<String> {
+    let runtime = match enabled {
+        "masked" => false,
+        "masked-runtime" => true,
+        _ => return None,
+    };
+    let unmask = if runtime {
+        "systemctl --user unmask --runtime rlm-guard"
+    } else {
+        "systemctl --user unmask rlm-guard"
+    };
+    Some(format!(
+        "the rlm-guard unit is masked, so systemd will not start it. Unmask it with: {unmask} and then rerun: rlm guard enable"
+    ))
+}
+
 /// Write `contents` to `path` through a temporary file in the same
 /// directory and a rename, so an interrupted write never leaves a truncated
 /// unit behind. The temporary name does not end in `.service`, so systemd
@@ -213,6 +233,19 @@ mod tests {
         assert!(restart_note(true, false)
             .unwrap()
             .contains("systemctl --user restart rlm-guard"));
+    }
+
+    #[test]
+    fn masked_units_get_an_unmask_hint() {
+        assert_eq!(masked_error("enabled"), None);
+        assert_eq!(masked_error("disabled"), None);
+        assert_eq!(masked_error("not-found"), None);
+        let m = masked_error("masked").unwrap();
+        assert!(m.contains("masked"));
+        assert!(m.contains("systemctl --user unmask rlm-guard"));
+        assert!(masked_error("masked-runtime")
+            .unwrap()
+            .contains("systemctl --user unmask --runtime rlm-guard"));
     }
 
     #[test]
