@@ -65,9 +65,8 @@ pub fn create(manager: Option<Arc<CgroupManager>>) -> gtk::Widget {
 
     let mode_row = adw::ComboRow::new();
     mode_row.set_title("Mode");
-    mode_row.set_subtitle(
-        "Individual: each process gets its own limit. Application: all processes share limits",
-    );
+    // No subtitle: a long one squeezes the selected value down to "A...".
+    // The Find Process description below explains the chosen mode.
 
     let mode_list = gtk::StringList::new(&["Individual", "Application (Shared)"]);
     mode_row.set_model(Some(&mode_list));
