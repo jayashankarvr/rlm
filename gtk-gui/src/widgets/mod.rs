@@ -150,9 +150,10 @@ pub fn fit_list_height(list: &gtk::ListBox) {
 }
 
 /// A success toast whose "Open" button shows the Managed Processes page,
-/// where the new limits can be seen and removed.
+/// where the new limits can be seen and removed. The text is shown as
+/// plain text, so exe names with `&` or `<` in them are not read as markup.
 pub fn status_toast(text: &str, timeout: u32) -> adw::Toast {
-    let toast = adw::Toast::new(text);
+    let toast = crate::pages::plain_toast(text);
     toast.set_timeout(timeout);
     toast.set_button_label(Some("Open"));
     toast.set_action_name(Some("win.goto-status"));

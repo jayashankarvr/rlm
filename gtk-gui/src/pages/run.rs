@@ -555,7 +555,7 @@ fn run_command(state: &Rc<RefCell<RunState>>) {
         } else {
             lines.join("\n")
         };
-        let toast = adw::Toast::new(&text);
+        let toast = super::plain_toast(&text);
         toast.set_timeout(5);
         toast_overlay.add_toast(toast);
     });
