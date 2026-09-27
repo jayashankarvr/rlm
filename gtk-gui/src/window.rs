@@ -195,13 +195,13 @@ impl Window {
         let limit_page = pages::limit::create(self.manager());
         let run_page = pages::run::create(self.manager());
         let profiles_page = pages::profiles::create();
-        let guard_page = pages::guard::create();
+        let guard_page = pages::guard::GuardPage::new();
 
         content_stack.add_named(&status_page.widget(), Some("status"));
         content_stack.add_named(&limit_page, Some("limit"));
         content_stack.add_named(&run_page, Some("run"));
         content_stack.add_named(&profiles_page, Some("profiles"));
-        content_stack.add_named(&guard_page, Some("guard"));
+        content_stack.add_named(&guard_page.widget(), Some("guard"));
 
         // Create sidebar
         let sidebar_list = gtk::ListBox::new();
@@ -262,9 +262,7 @@ impl Window {
                 "run" => {
                     pages::run::refresh_profiles(&run_page_clone);
                 }
-                "guard" => {
-                    pages::guard::refresh(&guard_page_clone);
-                }
+                "guard" => guard_page_clone.refresh(),
                 _ => {}
             }
         });
@@ -332,23 +330,22 @@ impl Window {
         row
     }
 
+    /// Refresh the status or guard page every 2 s while it is visible. Each
+    /// page only redraws what changed.
     fn setup_auto_refresh(
         &self,
         stack: &gtk::Stack,
         status_page: &Rc<pages::status::StatusPage>,
-        guard_page: &gtk::Widget,
+        guard_page: &Rc<pages::guard::GuardPage>,
     ) {
-        let stack_clone = stack.clone();
-        let status_page_clone = status_page.clone();
-        let guard_page_clone = guard_page.clone();
-        let status_widget = status_page.widget();
-
+        let stack = stack.clone();
+        let status_page = status_page.clone();
+        let guard_page = guard_page.clone();
         glib::timeout_add_local(std::time::Duration::from_secs(2), move || {
-            let visible = stack_clone.visible_child();
-            if visible.as_ref() == Some(&status_widget) {
-                status_page_clone.refresh();
-            } else if visible.as_ref() == Some(&guard_page_clone) {
-                pages::guard::refresh(&guard_page_clone);
+            match stack.visible_child_name().as_deref() {
+                Some("status") => status_page.refresh(),
+                Some("guard") => guard_page.refresh(),
+                _ => {}
             }
             glib::ControlFlow::Continue
         });
