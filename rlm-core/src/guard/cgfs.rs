@@ -50,46 +50,11 @@ pub fn write_high(cg: &str, val: &str) -> Result<()> {
     Ok(())
 }
 
-/// Get total anonymous + swap memory (anon from memory.stat + memory.swap.current).
-/// `anon` is required — without it we have nothing to cap against. `swap` is
-/// tolerant: a merely-unreadable `memory.swap.current` (the norm when swap is
-/// disabled, or `swapaccount=0`) must not discard a perfectly good `anon`
-/// value and collapse the caller's cap to the `MIN_CAP_BYTES` floor (D4 fix)
-/// — it defaults to 0 instead.
-pub fn anon_swap_bytes(cg: &str) -> Option<u64> {
-    let stat = fs::read_to_string(abs(cg).join("memory.stat")).ok()?;
-    let anon = parse_anon(&stat)?;
-    let swap_content = fs::read_to_string(abs(cg).join("memory.swap.current")).ok();
-    Some(combine_anon_swap(anon, swap_content.as_deref()))
-}
-
-/// Pure: add a possibly-unreadable/unparseable swap reading to a required
-/// `anon` value, defaulting the swap half to 0 rather than discarding
-/// `anon` (D4 fix — only the parse used to be tolerant; the read wasn't,
-/// so a merely-absent swap file threw away a perfectly good `anon` and
-/// forced the caller's cap down to its most aggressive floor).
-fn combine_anon_swap(anon: u64, swap_content: Option<&str>) -> u64 {
-    let swap = swap_content
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        .unwrap_or(0);
-    anon + swap
-}
-
 /// Read the current memory usage (memory.current), in bytes.
 pub fn current_bytes(cg: &str) -> Option<u64> {
     fs::read_to_string(abs(cg).join("memory.current"))
         .ok()
         .and_then(|s| s.trim().parse::<u64>().ok())
-}
-
-/// Read the raw `memory.swap.max` value (verbatim, trimmed: either "max" or a
-/// byte count). `0` means the cgroup cannot swap out anon memory at all —
-/// rlm writes this on every cgroup it creates (see `cgroup.rs`'s
-/// `set_memory_limit`) to keep a hard `memory.max` a true RAM ceiling.
-pub fn swap_max(cg: &str) -> Option<String> {
-    fs::read_to_string(abs(cg).join("memory.swap.max"))
-        .ok()
-        .map(|s| s.trim().to_string())
 }
 
 /// Get the file-backed (page cache) byte count from `memory.stat`'s `file`
@@ -99,22 +64,39 @@ pub fn file_bytes(cg: &str) -> Option<u64> {
     parse_file(&stat)
 }
 
-/// Whether this cgroup's anon memory is reclaimable via swap. Delegates the
-/// decision to the pure [`parse_can_reclaim_anon`]; unreadable is treated
-/// permissively (true) since most cgroups (systemd unit scopes) have swap
-/// enabled and a missing read shouldn't wrongly floor a soft cap.
-pub fn can_reclaim_anon(cg: &str) -> bool {
-    parse_can_reclaim_anon(swap_max(cg).as_deref())
+/// Pure: whether anon memory can be reclaimed at all. It cannot when the host
+/// has no swap device (`SwapTotal` of 0) or when `memory.swap.max` is `0` on
+/// the cgroup or any ancestor (rlm writes `0` on every cgroup it creates, see
+/// `cgroup.rs`'s `set_memory_limit`). Unreadable levels (`None`) do not pin.
+pub fn anon_reclaimable_from(swap_total_kb: u64, swap_max_chain: &[Option<String>]) -> bool {
+    swap_total_kb > 0
+        && !swap_max_chain
+            .iter()
+            .any(|v| v.as_deref().map(str::trim) == Some("0"))
 }
 
-/// Pure: given the raw (already-trimmed) `memory.swap.max` content, whether
-/// anon memory in the cgroup is reclaimable via swap. `Some("0")` means
-/// swap is explicitly disabled for this cgroup — anon is pinned and only
-/// file-backed pages can be freed. `"max"`, any other positive number, or an
-/// unreadable file (`None`) all mean anon can be reclaimed (or we can't tell,
-/// so assume the common case).
-pub fn parse_can_reclaim_anon(swap_max: Option<&str>) -> bool {
-    !matches!(swap_max.and_then(|s| s.parse::<u64>().ok()), Some(0))
+/// `memory.swap.max` of `cg` and each ancestor below the cgroupfs root,
+/// nearest first. Unreadable levels are `None`.
+pub fn swap_max_chain(cg: &str) -> Vec<Option<String>> {
+    let root = Path::new(CGROUP_ROOT);
+    let mut out = Vec::new();
+    let mut p = abs(cg);
+    while p.starts_with(root) && p != root {
+        out.push(
+            fs::read_to_string(p.join("memory.swap.max"))
+                .ok()
+                .map(|s| s.trim().to_string()),
+        );
+        if !p.pop() {
+            break;
+        }
+    }
+    out
+}
+
+/// Whether `cg`'s anon memory can go to swap, given the host's `SwapTotal`.
+pub fn anon_reclaimable(cg: &str, swap_total_kb: u64) -> bool {
+    anon_reclaimable_from(swap_total_kb, &swap_max_chain(cg))
 }
 
 /// Get the inode number of the cgroup directory.
@@ -275,41 +257,24 @@ mod tests {
     }
 
     #[test]
-    fn parse_can_reclaim_anon_reads_swap_max() {
-        assert!(
-            !parse_can_reclaim_anon(Some("0")),
-            "swap.max=0 means anon is pinned, unreclaimable"
-        );
-        assert!(
-            parse_can_reclaim_anon(Some("max")),
-            "\"max\" means unlimited swap, anon reclaimable"
-        );
-        assert!(
-            parse_can_reclaim_anon(Some("2147483648")),
-            "a positive swap budget means anon reclaimable"
-        );
-        assert!(
-            parse_can_reclaim_anon(None),
-            "unreadable file degrades permissively (assume reclaimable)"
-        );
+    fn no_swap_device_pins_anon() {
+        assert!(!anon_reclaimable_from(0, &[Some("max".into())]));
     }
 
     #[test]
-    fn combine_anon_swap_tolerates_missing_or_unparseable_swap() {
-        // The common case on the target platforms: no memory.swap.current
-        // at all (swap disabled) must NOT discard a perfectly good `anon`.
-        assert_eq!(
-            combine_anon_swap(1_000_000, None),
-            1_000_000,
-            "missing swap file must not zero out anon"
-        );
-        // Unparseable content degrades the same way: swap defaults to 0.
-        assert_eq!(
-            combine_anon_swap(1_000_000, Some("not-a-number")),
-            1_000_000
-        );
-        // A real, readable swap value is added on top of anon.
-        assert_eq!(combine_anon_swap(1_000_000, Some("500\n")), 1_000_500);
+    fn any_ancestor_with_zero_swap_max_pins_anon() {
+        assert!(!anon_reclaimable_from(
+            8_000_000,
+            &[Some("max".into()), Some("0".into()), None]
+        ));
+    }
+
+    #[test]
+    fn swap_and_no_zero_in_chain_is_reclaimable() {
+        assert!(anon_reclaimable_from(
+            8_000_000,
+            &[Some("max".into()), None, Some("2147483648".into())]
+        ));
     }
 
     #[test]

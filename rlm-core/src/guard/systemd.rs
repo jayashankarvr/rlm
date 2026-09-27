@@ -20,7 +20,6 @@ use std::time::Duration;
 
 use common::{Error, Result};
 use zbus::blocking::Connection;
-use zbus::zvariant::Value;
 
 const DESTINATION: &str = "org.freedesktop.systemd1";
 const PATH: &str = "/org/freedesktop/systemd1";
@@ -70,24 +69,6 @@ impl SystemdUser {
             )
             .map(|_| ())
             .map_err(|e| Error::Cgroup(format!("ThawUnit({unit}) failed: {e}")))
-        })
-    }
-
-    /// `SetUnitProperties(name, runtime=true, [("MemoryHigh", u64)])`.
-    /// `bytes = u64::MAX` means "max" (systemd's infinity convention).
-    pub fn set_memory_high(&self, unit: &str, bytes: u64, timeout: Duration) -> Result<()> {
-        let unit = unit.to_string();
-        self.call_with_timeout(timeout, move |conn| {
-            let props = vec![("MemoryHigh", Value::from(bytes))];
-            conn.call_method(
-                Some(DESTINATION),
-                PATH,
-                Some(INTERFACE),
-                "SetUnitProperties",
-                &(unit.as_str(), true, props),
-            )
-            .map(|_| ())
-            .map_err(|e| Error::Cgroup(format!("SetUnitProperties({unit}) failed: {e}")))
         })
     }
 

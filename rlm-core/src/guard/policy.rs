@@ -108,8 +108,8 @@ impl PolicyEngine {
     /// still hold a process (see `sampler::live_cgroups`), with no min-RSS
     /// or protect filtering applied; it is deliberately independent of
     /// `targets`. Pruning checks liveness against
-    /// this set, not against `targets`: a successful `Cap` sizes off
-    /// anon+swap but `memory.high` also bounds file-backed pages, so capping
+    /// this set, not against `targets`: `memory.high` also bounds
+    /// file-backed pages, so capping
     /// a mapped-file-heavy process can push its `rss_kb` below the min-RSS
     /// floor on the very next tick, dropping it out of `targets` even though
     /// the cgroup is very much still alive. Pruning against `targets` there
