@@ -5,6 +5,35 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.3] - 2026-09-28
+
+A pass over the GUI for people who are not cgroup experts.
+
+### Added
+
+- Limit Running: select whole applications with a Select button on each row; the selection and the PID field always agree. Rows show process count and memory, largest first. Single-process apps are listed too.
+- Limit Running and Launch New: the Apply Limits and Run Command button stays in a bar at the bottom of the window, Enter in a field submits, and the success message has an Open button that shows Managed Processes.
+- Managed Processes: an empty page with buttons to get started, Undo after removing a limit (only for processes that are still the same ones, checked by start time), and Forget rule when a saved rule would bring the limit back.
+- Profiles: the built-in presets are listed and marked Built-in, or Built-in, changed with a Restore button. New and Edit share one dialog that checks the values as you type.
+- A menu with Keyboard Shortcuts and an About window, and a banner when resource limiting is unavailable (Apply and Run are then disabled).
+
+### Changed
+
+- Limit Running starts in Whole app (shared limit) mode; the other mode is Single process. Typing PIDs moved under Enter PIDs manually.
+- Units: memory in MB or GB, I/O in KB/s, MB/s or GB/s, CPU as a percentage of one core, with the core count and minimums shown.
+- Guard page in plain words. The pressure wording follows the guard's own policy, so it never reads calmer than the guard acts; the raw numbers are in a tooltip.
+- The About page is gone from the sidebar; pages are Ctrl+1 to Ctrl+5.
+- rlmctl-core: `group_by_executable` includes single-process apps and sorts by memory; `DesktopApp.exec` is a quoted command line that keeps `env` wrappers; new `guard::policy::rise_level`, `process::start_time` and `parse_start_time`.
+
+### Fixed
+
+- Choosing a profile replaces every limit field, and values such as 1.5G or 4GiB are shown exactly. The Edit Profile dialog saves fields you did not touch exactly as they were stored.
+- Limit Running reloads processes when shown and skips any that exited or whose PID now belongs to another process, instead of limiting the wrong one.
+- Errors name the field and are shown instead of failing silently (removing a limit, saving a profile).
+- Launch New runs commands and desktop entries with quoted arguments correctly, and holding Enter launches once.
+- Managed Processes and Guard update rows in place, so keyboard focus and scrolling survive the refresh.
+- Process grouping read the wrong parent and session for processes whose name contains spaces.
+
 ## [0.2.2] - 2026-09-27
 
 ### Fixed

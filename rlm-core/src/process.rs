@@ -48,9 +48,9 @@ pub struct StatusFields {
 ///
 /// - `Uid:` line is `Uid:\t<real>\t<effective>\t<saved>\t<fs>`; we take the
 ///   first (real) field.
-/// - `Name:` is the comm, truncated to 15 chars by the kernel — that's fine,
+/// - `Name:` is the comm, truncated to 15 chars by the kernel; that is fine:
 ///   it matches the protect-list which also compares against comm.
-/// - `VmSwap:` may be absent (e.g. kernel thread / no swap) — treated as 0.
+/// - `VmSwap:` may be absent (e.g. kernel thread / no swap) and then counts as 0.
 ///
 /// Returns `None` only if the required `Uid:` or `Name:` lines are missing.
 pub fn parse_status(status: &str) -> Option<StatusFields> {
@@ -105,19 +105,42 @@ pub struct ProcessGroup {
     pub processes: Vec<ProcessInfo>,
 }
 
+impl ProcessGroup {
+    /// Memory of all processes in the group (RSS + swap), in KB.
+    pub fn rss_kb(&self) -> u64 {
+        self.processes.iter().map(|p| p.rss_kb).sum()
+    }
+}
+
 /// Read process stat file to get PPID and session
 fn read_process_stat(proc_path: &Path) -> Option<(u32, u32)> {
-    // Format: pid comm state ppid pgrp session ...
-    // Fields: 0   1    2     3    4    5
-    if let Ok(content) = fs::read_to_string(proc_path.join("stat")) {
-        let parts: Vec<&str> = content.split_whitespace().collect();
-        if parts.len() >= 6 {
-            if let (Ok(ppid), Ok(session)) = (parts[3].parse(), parts[5].parse()) {
-                return Some((ppid, session));
-            }
-        }
-    }
-    None
+    parse_ppid_session(&fs::read_to_string(proc_path.join("stat")).ok()?)
+}
+
+/// PPID (field 4) and session (field 6) from the text of `/proc/<pid>/stat`.
+/// Fields are counted from the last ')', since the comm may hold spaces.
+fn parse_ppid_session(stat: &str) -> Option<(u32, u32)> {
+    let mut fields = stat[stat.rfind(')')? + 1..].split_whitespace();
+    // After the comm: state, ppid, pgrp, session.
+    let ppid = fields.nth(1)?.parse().ok()?;
+    let session = fields.nth(1)?.parse().ok()?;
+    Some((ppid, session))
+}
+
+/// The start time (field 22, clock ticks after boot) from the text of
+/// `/proc/<pid>/stat`. The comm field is in parentheses and may itself hold
+/// spaces or ')', so fields are counted from the last ')'.
+pub fn parse_start_time(stat: &str) -> Option<u64> {
+    let rest = &stat[stat.rfind(')')? + 1..];
+    // After the comm comes field 3 (state); field 22 is 19 further on.
+    rest.split_whitespace().nth(19)?.parse().ok()
+}
+
+/// When `pid` started, or `None` if it is gone. With the PID it names one
+/// process: a PID reused later by another process has a different start
+/// time.
+pub fn start_time(pid: u32) -> Option<u64> {
+    parse_start_time(&fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
 }
 
 /// Get executable path for a process
@@ -312,7 +335,8 @@ pub fn find_by_name_for_uid(name: &str, uid: u32) -> Result<NameMatches> {
     Ok(NameMatches { pids, other_users })
 }
 
-/// Group processes by executable path (same application)
+/// Group processes by executable basename (same application), largest
+/// memory first. Apps with a single process get a group of their own.
 pub fn group_by_executable(processes: &[ProcessInfo]) -> Vec<ProcessGroup> {
     let mut groups: HashMap<String, Vec<ProcessInfo>> = HashMap::new();
 
@@ -338,12 +362,11 @@ pub fn group_by_executable(processes: &[ProcessInfo]) -> Vec<ProcessGroup> {
                 processes: procs,
             }
         })
-        .filter(|group| group.processes.len() > 1) // Only groups with multiple processes
         .collect();
+    // Biggest memory users first: those are the apps worth limiting.
     groups.sort_by(|a, b| {
-        b.processes
-            .len()
-            .cmp(&a.processes.len())
+        b.rss_kb()
+            .cmp(&a.rss_kb())
             .then_with(|| a.name.cmp(&b.name))
     });
     groups
@@ -434,6 +457,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn start_time_is_field_22_counted_after_the_comm() {
+        let tail = "R 2238197 2238197 2238197 0 -1 4194304 519 0 0 0 0 0 0 0 20 0 1 0 5852809 18214912 1841";
+        assert_eq!(
+            parse_start_time(&format!("2238200 (cat) {tail}")),
+            Some(5852809)
+        );
+        // A comm with spaces and a ')' of its own.
+        assert_eq!(
+            parse_start_time(&format!("42 (Web Co) (x)) {tail}")),
+            Some(5852809)
+        );
+        assert_eq!(parse_start_time("42 (cat) R 1 2"), None);
+        assert_eq!(parse_start_time(""), None);
+        assert!(start_time(std::process::id()).is_some());
+    }
+
+    #[test]
     fn parse_status_reads_uid_name_and_rss_plus_swap() {
         let s = "Name:\tIsolated Web Co\nUid:\t1000\t1000\t1000\t1000\nVmRSS:\t  500000 kB\nVmSwap:\t   2000 kB\n";
         assert_eq!(
@@ -499,26 +539,37 @@ mod tests {
     }
 
     #[test]
-    fn groups_are_ordered_by_size_then_name() {
-        let p = |pid: u32, exe: &str| ProcessInfo {
+    fn groups_are_ordered_by_memory_then_name() {
+        let p = |pid: u32, exe: &str, rss_kb: u64| ProcessInfo {
             pid,
             name: exe.into(),
             executable: Some(format!("/bin/{exe}").into()),
+            rss_kb,
             ..Default::default()
         };
         let procs = vec![
-            p(1, "b"),
-            p(2, "b"),
-            p(3, "a"),
-            p(4, "a"),
-            p(5, "c"),
-            p(6, "c"),
-            p(7, "c"),
+            p(1, "b", 100),
+            p(2, "b", 100),
+            p(3, "a", 150),
+            p(4, "a", 50),
+            p(5, "c", 10),
+            p(6, "c", 10),
+            p(7, "c", 10),
+            p(8, "d", 900),
         ];
-        let names: Vec<String> = group_by_executable(&procs)
-            .into_iter()
-            .map(|g| g.name)
-            .collect();
-        assert_eq!(names, vec!["c", "a", "b"]);
+        let groups = group_by_executable(&procs);
+        let names: Vec<&str> = groups.iter().map(|g| g.name.as_str()).collect();
+        // Single-process apps are listed too; equal memory sorts by name.
+        assert_eq!(names, vec!["d", "a", "b", "c"]);
+        assert_eq!(groups[0].rss_kb(), 900);
+        assert_eq!(groups[1].rss_kb(), 200);
+    }
+
+    #[test]
+    fn ppid_and_session_survive_a_comm_with_spaces() {
+        let stat = "4242 (Isolated Web Co) S 4100 4100 3000 0 -1 4194560";
+        assert_eq!(parse_ppid_session(stat), Some((4100, 3000)));
+        assert_eq!(parse_ppid_session("7 (a) b) R 1 7 7 0"), Some((1, 7)));
+        assert_eq!(parse_ppid_session("garbage"), None);
     }
 }

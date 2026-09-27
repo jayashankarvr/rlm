@@ -4,21 +4,63 @@ use adw::subclass::prelude::*;
 use gtk::{gio, glib};
 use rlm_core::CgroupManager;
 use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::Arc;
 
-/// The sidebar pages, in display order: (id, title, icon).
-pub const NAV_PAGES: [(&str, &str, &str); 6] = [
+/// The sidebar pages, in display order: (id, title, icon). Ctrl+1 opens the
+/// first, Ctrl+2 the second, and so on.
+pub const NAV_PAGES: [(&str, &str, &str); 5] = [
     ("status", "Managed Processes", "view-list-symbolic"),
     ("limit", "Limit Running", "power-profile-balanced-symbolic"),
     ("run", "Launch New", "media-playback-start-symbolic"),
     ("profiles", "Profiles", "document-properties-symbolic"),
     ("guard", "Guard", "security-high-symbolic"),
-    ("about", "About", "help-about-symbolic"),
 ];
+
+/// Shown at the top of the content area when the cgroup manager could not
+/// be set up.
+const UNAVAILABLE_BANNER: &str =
+    "Resource limiting is unavailable. Run rlm doctor in a terminal to see why.";
 
 /// The sidebar row index for a page id, or `None` if it isn't a nav page.
 pub fn nav_index(page: &str) -> Option<usize> {
     NAV_PAGES.iter().position(|(id, _, _)| *id == page)
+}
+
+/// The keyboard shortcuts window, as GtkBuilder XML: one Ctrl+N entry per
+/// sidebar page, then the general shortcuts.
+fn shortcuts_ui() -> String {
+    let shortcut = |accel: &str, title: &str| {
+        format!(
+            "<child><object class=\"GtkShortcutsShortcut\">\
+             <property name=\"accelerator\">{}</property>\
+             <property name=\"title\">{}</property>\
+             </object></child>",
+            glib::markup_escape_text(accel),
+            glib::markup_escape_text(title)
+        )
+    };
+    let pages: String = NAV_PAGES
+        .iter()
+        .enumerate()
+        .map(|(i, (_, title, _))| shortcut(&format!("<Control>{}", i + 1), title))
+        .collect();
+    let general = [
+        shortcut("<Control>question", "Keyboard Shortcuts"),
+        shortcut("<Control>q", "Quit"),
+    ]
+    .concat();
+    format!(
+        "<interface><object class=\"GtkShortcutsWindow\" id=\"shortcuts\">\
+         <property name=\"modal\">true</property>\
+         <child><object class=\"GtkShortcutsSection\">\
+         <property name=\"section-name\">shortcuts</property>\
+         <child><object class=\"GtkShortcutsGroup\">\
+         <property name=\"title\">Pages</property>{pages}</object></child>\
+         <child><object class=\"GtkShortcutsGroup\">\
+         <property name=\"title\">General</property>{general}</object></child>\
+         </object></child></object></interface>"
+    )
 }
 
 mod imp {
@@ -75,9 +117,9 @@ impl Window {
         self.add_action(&quit_action);
         app.set_accels_for_action("win.quit", &["<Control>q"]);
 
-        // Page navigation shortcuts (Ctrl+1 through Ctrl+6). Selecting the
-        // sidebar row (rather than switching the stack directly) keeps the
-        // highlight in sync with the visible page.
+        // Page navigation shortcuts (Ctrl+1 onwards). Selecting the sidebar
+        // row (rather than switching the stack directly) keeps the highlight
+        // in sync with the visible page.
         for (i, (id, _, _)) in NAV_PAGES.iter().enumerate() {
             let action = gio::SimpleAction::new(&format!("goto-{id}"), None);
             let window_clone = self.clone();
@@ -91,10 +133,57 @@ impl Window {
             self.add_action(&action);
             app.set_accels_for_action(&format!("win.goto-{id}"), &[&format!("<Control>{}", i + 1)]);
         }
+
+        // Keyboard Shortcuts window: GtkApplicationWindow adds the
+        // win.show-help-overlay action once a help overlay is set.
+        let builder = gtk::Builder::from_string(&shortcuts_ui());
+        if let Some(shortcuts) = builder.object::<gtk::ShortcutsWindow>("shortcuts") {
+            self.set_help_overlay(Some(&shortcuts));
+            app.set_accels_for_action("win.show-help-overlay", &["<Control>question"]);
+        }
+
+        let about_action = gio::SimpleAction::new("about", None);
+        let window = self.clone();
+        about_action.connect_activate(move |_, _| {
+            window.show_about();
+        });
+        self.add_action(&about_action);
+    }
+
+    fn show_about(&self) {
+        let about = adw::AboutWindow::builder()
+            .transient_for(self)
+            .modal(true)
+            .application_name("Resource Limit Manager")
+            .application_icon("io.github.rlm.gtk")
+            .developer_name("Jayashankar")
+            .version(env!("CARGO_PKG_VERSION"))
+            .comments(
+                "Set memory, CPU and I/O limits on your own processes with cgroups, and \
+                 optionally let a guard freeze or cap a runaway app under memory pressure.",
+            )
+            .website("https://github.com/jayashankarvr/rlm")
+            .issue_url("https://github.com/jayashankarvr/rlm/issues")
+            .license_type(gtk::License::Apache20)
+            .copyright("© 2025-2026 Jayashankar")
+            .build();
+        about.present();
     }
 
     fn manager(&self) -> Option<Arc<CgroupManager>> {
         self.imp().manager.borrow().clone()
+    }
+
+    fn primary_menu() -> gtk::MenuButton {
+        let menu = gio::Menu::new();
+        menu.append(Some("Keyboard Shortcuts"), Some("win.show-help-overlay"));
+        menu.append(Some("About Resource Limit Manager"), Some("win.about"));
+        let button = gtk::MenuButton::new();
+        button.set_icon_name("open-menu-symbolic");
+        button.set_menu_model(Some(&menu));
+        button.set_tooltip_text(Some("Main Menu"));
+        button.update_property(&[gtk::accessible::Property::Label("Main Menu")]);
+        button
     }
 
     fn setup_ui(&self) {
@@ -103,19 +192,17 @@ impl Window {
         content_stack.set_transition_type(gtk::StackTransitionType::Crossfade);
 
         // Add pages
-        let status_page = pages::status::create(self.manager());
+        let status_page = pages::status::StatusPage::new(self.manager());
         let limit_page = pages::limit::create(self.manager());
         let run_page = pages::run::create(self.manager());
-        let profiles_page = pages::profiles::create();
-        let guard_page = pages::guard::create();
-        let about_page = pages::about::create();
+        let profiles_page = pages::profiles::ProfilesPage::new();
+        let guard_page = pages::guard::GuardPage::new();
 
-        content_stack.add_named(&status_page, Some("status"));
+        content_stack.add_named(&status_page.widget(), Some("status"));
         content_stack.add_named(&limit_page, Some("limit"));
         content_stack.add_named(&run_page, Some("run"));
-        content_stack.add_named(&profiles_page, Some("profiles"));
-        content_stack.add_named(&guard_page, Some("guard"));
-        content_stack.add_named(&about_page, Some("about"));
+        content_stack.add_named(&profiles_page.widget(), Some("profiles"));
+        content_stack.add_named(&guard_page.widget(), Some("guard"));
 
         // Create sidebar
         let sidebar_list = gtk::ListBox::new();
@@ -129,35 +216,57 @@ impl Window {
 
         self.imp().sidebar.replace(Some(sidebar_list.clone()));
 
+        // Content area: header bar, then the pages under a toast overlay.
+        // The header shows the content page's title, which follows the
+        // selected sidebar row.
+        let content_header = adw::HeaderBar::new();
+        let content_toolbar = adw::ToolbarView::new();
+        content_toolbar.add_top_bar(&content_header);
+        if self.manager().is_none() {
+            // Stays up for the whole session: nothing on the Limit or Launch
+            // pages can work until the cause is fixed and the app restarted.
+            let banner = adw::Banner::new(UNAVAILABLE_BANNER);
+            banner.set_revealed(true);
+            content_toolbar.add_top_bar(&banner);
+        }
+        let toast_overlay = adw::ToastOverlay::new();
+        toast_overlay.set_child(Some(&content_stack));
+        content_toolbar.set_content(Some(&toast_overlay));
+        let content_page = adw::NavigationPage::new(&content_toolbar, NAV_PAGES[0].1);
+
         // Connect sidebar selection to stack
         let content_stack_clone = content_stack.clone();
+        let content_page_clone = content_page.clone();
         let status_page_clone = status_page.clone();
         let limit_page_clone = limit_page.clone();
         let run_page_clone = run_page.clone();
+        let profiles_page_clone = profiles_page.clone();
         let guard_page_clone = guard_page.clone();
-        let manager_clone = self.manager();
         sidebar_list.connect_row_selected(move |_, row| {
-            if let Some(row) = row {
-                if let Some(id) = row.widget_name().as_str().strip_prefix("nav-") {
-                    content_stack_clone.set_visible_child_name(id);
-                    match id {
-                        "status" => {
-                            if let Some(ref mgr) = manager_clone {
-                                pages::status::refresh(&status_page_clone, mgr.clone());
-                            }
-                        }
-                        "limit" => {
-                            pages::limit::refresh_profiles(&limit_page_clone);
-                        }
-                        "run" => {
-                            pages::run::refresh_profiles(&run_page_clone);
-                        }
-                        "guard" => {
-                            pages::guard::refresh(&guard_page_clone);
-                        }
-                        _ => {}
-                    }
+            let Some(row) = row else { return };
+            let Some(id) = row
+                .widget_name()
+                .as_str()
+                .strip_prefix("nav-")
+                .map(str::to_string)
+            else {
+                return;
+            };
+            content_stack_clone.set_visible_child_name(&id);
+            if let Some(i) = nav_index(&id) {
+                content_page_clone.set_title(NAV_PAGES[i].1);
+            }
+            match id.as_str() {
+                "status" => status_page_clone.refresh(),
+                "limit" => {
+                    pages::limit::refresh_profiles(&limit_page_clone);
                 }
+                "run" => {
+                    pages::run::refresh_profiles(&run_page_clone);
+                }
+                "profiles" => profiles_page_clone.refresh(),
+                "guard" => guard_page_clone.refresh(),
+                _ => {}
             }
         });
 
@@ -168,8 +277,9 @@ impl Window {
             }
         }
 
-        // Sidebar with header
+        // Sidebar with header and the primary menu
         let sidebar_header = adw::HeaderBar::new();
+        sidebar_header.pack_end(&Self::primary_menu());
 
         let sidebar_content = gtk::Box::new(gtk::Orientation::Vertical, 0);
         let sidebar_scroll = gtk::ScrolledWindow::new();
@@ -181,17 +291,10 @@ impl Window {
         sidebar_toolbar.add_top_bar(&sidebar_header);
         sidebar_toolbar.set_content(Some(&sidebar_content));
 
-        // Content area with header
-        let content_header = adw::HeaderBar::new();
-        let content_toolbar = adw::ToolbarView::new();
-        content_toolbar.add_top_bar(&content_header);
-        content_toolbar.set_content(Some(&content_stack));
-
         // Create split view
         let split_view = adw::NavigationSplitView::new();
 
         let sidebar_page = adw::NavigationPage::new(&sidebar_toolbar, "RLM");
-        let content_page = adw::NavigationPage::new(&content_toolbar, "Resource Limit Manager");
 
         split_view.set_sidebar(Some(&sidebar_page));
         split_view.set_content(Some(&content_page));
@@ -230,25 +333,22 @@ impl Window {
         row
     }
 
+    /// Refresh the status or guard page every 2 s while it is visible. Each
+    /// page only redraws what changed.
     fn setup_auto_refresh(
         &self,
         stack: &gtk::Stack,
-        status_page: &gtk::Widget,
-        guard_page: &gtk::Widget,
+        status_page: &Rc<pages::status::StatusPage>,
+        guard_page: &Rc<pages::guard::GuardPage>,
     ) {
-        let stack_clone = stack.clone();
-        let status_page_clone = status_page.clone();
-        let guard_page_clone = guard_page.clone();
-        let manager = self.manager();
-
+        let stack = stack.clone();
+        let status_page = status_page.clone();
+        let guard_page = guard_page.clone();
         glib::timeout_add_local(std::time::Duration::from_secs(2), move || {
-            let visible = stack_clone.visible_child();
-            if visible.as_ref() == Some(&status_page_clone) {
-                if let Some(ref mgr) = manager {
-                    pages::status::refresh(&status_page_clone, mgr.clone());
-                }
-            } else if visible.as_ref() == Some(&guard_page_clone) {
-                pages::guard::refresh(&guard_page_clone);
+            match stack.visible_child_name().as_deref() {
+                Some("status") => status_page.refresh(),
+                Some("guard") => guard_page.refresh(),
+                _ => {}
             }
             glib::ControlFlow::Continue
         });
@@ -258,10 +358,23 @@ impl Window {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
     fn every_page_has_a_sidebar_row_and_shortcut() {
         assert_eq!(nav_index("status"), Some(0));
-        assert_eq!(nav_index("about"), Some(NAV_PAGES.len() - 1));
+        assert_eq!(nav_index("guard"), Some(NAV_PAGES.len() - 1));
+        assert_eq!(nav_index("about"), None);
         assert_eq!(nav_index("nope"), None);
+    }
+
+    #[test]
+    fn shortcuts_window_lists_every_page_and_quit() {
+        let ui = shortcuts_ui();
+        for (i, (_, title, _)) in NAV_PAGES.iter().enumerate() {
+            assert!(ui.contains(&format!("&lt;Control&gt;{}", i + 1)), "{ui}");
+            assert!(ui.contains(title), "{title} missing");
+        }
+        assert!(ui.contains("&lt;Control&gt;q"));
+        assert!(!ui.contains(&format!("&lt;Control&gt;{}", NAV_PAGES.len() + 1)));
     }
 }
