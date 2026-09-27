@@ -41,7 +41,41 @@ pub fn journal_path() -> PathBuf {
 }
 
 /// Path of the lock file that keeps a second `rlm-guard` from running.
-/// It sits next to the journal the lock protects.
-pub fn lock_path() -> PathBuf {
-    journal_path().with_file_name("rlm-guard.lock")
+///
+/// It sits next to the journal the lock protects, in the per-user state dir.
+/// When no state dir can be resolved it falls back to `$XDG_RUNTIME_DIR`,
+/// which is per-user and mode 0700. It never falls back to a shared,
+/// world-writable dir such as `/tmp`, where another user could create and
+/// hold the lock file to keep the guard from starting. `None` means neither
+/// dir is known; the caller then runs without the lock.
+pub fn lock_path() -> Option<PathBuf> {
+    lock_path_from(dirs::state_dir(), dirs::runtime_dir())
+}
+
+fn lock_path_from(state: Option<PathBuf>, runtime: Option<PathBuf>) -> Option<PathBuf> {
+    state
+        .map(|d| d.join("rlm").join("rlm-guard.lock"))
+        .or_else(|| runtime.map(|d| d.join("rlm-guard.lock")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lock_prefers_the_state_dir() {
+        assert_eq!(
+            lock_path_from(Some("/s".into()), Some("/r".into())),
+            Some(PathBuf::from("/s/rlm/rlm-guard.lock"))
+        );
+    }
+
+    #[test]
+    fn lock_falls_back_to_the_runtime_dir_not_tmp() {
+        assert_eq!(
+            lock_path_from(None, Some("/run/user/1000".into())),
+            Some(PathBuf::from("/run/user/1000/rlm-guard.lock"))
+        );
+        assert_eq!(lock_path_from(None, None), None);
+    }
 }
