@@ -10,6 +10,7 @@ use rlm_core::CgroupManager;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Instant;
 
 // Field length limits
 /// Longest text the PID field keeps: room for a few hundred PIDs when an
@@ -49,6 +50,10 @@ struct LimitState {
     /// Persist as a rule (whole-app mode only)
     save_rule_switch: adw::SwitchRow,
     summary_label: gtk::Label,
+    /// When limits were last applied. Holding Enter in a field repeats the
+    /// activation, so applies closer together than a second are ignored, as
+    /// Launch New does for launches.
+    last_apply: Cell<Option<Instant>>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -269,6 +274,7 @@ pub fn create(manager: Option<Arc<CgroupManager>>) -> gtk::Widget {
         group_buttons: RefCell::new(std::collections::HashMap::new()),
         save_rule_switch: save_rule_switch.clone(),
         summary_label: summary_label.clone(),
+        last_apply: Cell::new(None),
     }));
 
     // Load initial processes
@@ -854,6 +860,9 @@ fn save_app_rule(
 
 fn apply_limits(state: &Rc<RefCell<LimitState>>) {
     let state = state.borrow();
+    if super::run::too_soon(state.last_apply.get(), Instant::now()) {
+        return;
+    }
     let mode = *state.limit_mode.borrow();
 
     let pid_text = state.pid_entry.text();
@@ -934,6 +943,7 @@ fn apply_limits(state: &Rc<RefCell<LimitState>>) {
 
             match manager.apply_limit_to_multiple(&pids, &limit, &cgroup_name) {
                 Ok(warnings) => {
+                    state.last_apply.set(Some(Instant::now()));
                     show_warnings(&state.status_label, &warnings);
                     let mut msg = if pids.len() == 1 {
                         format!("Limits applied to PID {}", pids[0])
@@ -1007,6 +1017,7 @@ fn apply_limits(state: &Rc<RefCell<LimitState>>) {
 
             match manager.apply_limit(pid, &limit) {
                 Ok(warnings) => {
+                    state.last_apply.set(Some(Instant::now()));
                     show_warnings(&state.status_label, &warnings);
                     let toast = status_toast(&format!("Limits applied to PID {pid}"), 5);
                     state.toast_overlay.add_toast(toast);

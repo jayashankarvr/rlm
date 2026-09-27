@@ -41,8 +41,9 @@ struct RunState {
 /// Shortest time between two launches; see `RunState::last_launch`.
 const RELAUNCH_GAP: Duration = Duration::from_secs(1);
 
-/// Whether a launch at `now` comes too soon after the one at `last`.
-fn too_soon(last: Option<Instant>, now: Instant) -> bool {
+/// Whether a launch (or, on the Limit Running page, an apply) at `now` comes
+/// too soon after the one at `last`.
+pub(super) fn too_soon(last: Option<Instant>, now: Instant) -> bool {
     last.is_some_and(|t| now.saturating_duration_since(t) < RELAUNCH_GAP)
 }
 
