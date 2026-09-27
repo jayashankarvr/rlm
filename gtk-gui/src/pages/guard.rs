@@ -88,20 +88,69 @@ fn rlm_binary() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("rlm"))
 }
 
+/// How long the switch waits for `rlm guard enable`/`disable` before killing
+/// it. The command talks to systemd, which can hang on a wedged D-Bus; the
+/// switch would otherwise stay greyed out forever.
+const GUARD_VERB_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Run `cmd` with stdin and stdout closed and return its exit status and
+/// stderr, or `None` if it did not exit within `timeout` (it is then killed
+/// and reaped). stderr is drained on a separate thread so a chatty child
+/// cannot block on a full pipe; after exit we wait at most a second for it,
+/// since a grandchild may still hold the pipe open.
+fn output_with_timeout(
+    mut cmd: std::process::Command,
+    timeout: Duration,
+) -> std::io::Result<Option<(std::process::ExitStatus, String)>> {
+    use std::io::Read;
+    use std::process::Stdio;
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let stderr = child.stderr.take();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut text = String::new();
+        if let Some(mut e) = stderr {
+            let _ = e.read_to_string(&mut text);
+        }
+        let _ = tx.send(text);
+    });
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            let text = rx.recv_timeout(Duration::from_secs(1)).unwrap_or_default();
+            return Ok(Some((status, text)));
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(None);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 /// Run `rlm guard <verb>` and return its error text on failure.
 fn run_guard_verb(verb: &str) -> std::result::Result<(), String> {
-    let out = std::process::Command::new(rlm_binary())
-        .args(["guard", verb])
-        .stdin(std::process::Stdio::null())
-        .output()
-        .map_err(|e| format!("could not run rlm: {e}"))?;
-    if out.status.success() {
+    let mut cmd = std::process::Command::new(rlm_binary());
+    cmd.args(["guard", verb]);
+    let (status, stderr) = output_with_timeout(cmd, GUARD_VERB_TIMEOUT)
+        .map_err(|e| format!("could not run rlm: {e}"))?
+        .ok_or_else(|| {
+            format!(
+                "rlm guard {verb} did not finish in {} s",
+                GUARD_VERB_TIMEOUT.as_secs()
+            )
+        })?;
+    if status.success() {
         return Ok(());
     }
-    let text = String::from_utf8_lossy(&out.stderr);
-    let text = text.trim();
+    let text = stderr.trim();
     Err(if text.is_empty() {
-        format!("rlm guard {verb} failed ({})", out.status)
+        format!("rlm guard {verb} failed ({status})")
     } else {
         text.to_string()
     })
@@ -426,6 +475,32 @@ pub fn refresh(widget: &gtk::Widget) {
 mod tests {
     use super::*;
     use rlm_core::guard::history::{HistoryEvent, HistoryKind};
+
+    fn sh(script: &str) -> std::process::Command {
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args(["-c", script]);
+        cmd
+    }
+
+    #[test]
+    fn output_with_timeout_returns_status_and_stderr() {
+        let (status, err) = output_with_timeout(
+            sh("echo out; echo oops >&2; exit 3"),
+            Duration::from_secs(10),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(status.code(), Some(3));
+        assert_eq!(err.trim(), "oops");
+    }
+
+    #[test]
+    fn output_with_timeout_kills_a_hung_child() {
+        let start = Instant::now();
+        let r = output_with_timeout(sh("exec sleep 30"), Duration::from_millis(200)).unwrap();
+        assert!(r.is_none());
+        assert!(start.elapsed() < Duration::from_secs(5));
+    }
 
     fn svc(a: &str, e: &str) -> ServiceState {
         ServiceState {
