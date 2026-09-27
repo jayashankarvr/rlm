@@ -266,6 +266,27 @@ pub const BUILTIN_PROTECT: &[&str] = &[
     "bash",
     "zsh",
     "fish",
+    // Terminal emulators. Most run as their own unit in app.slice with the
+    // shells in other scopes, so without this they could be frozen.
+    // Matched on the exe basename; terminator is a Python script, so its
+    // exe is python3 and it matches on comm instead.
+    "gnome-terminal-server",
+    "ptyxis",
+    "ptyxis-agent",
+    "kgx",
+    "konsole",
+    "kitty",
+    "alacritty",
+    "wezterm-gui",
+    "foot",
+    "tilix",
+    "xfce4-terminal",
+    "xterm",
+    "terminator",
+    // Terminal multiplexers. The tmux server sets its comm to "tmux: server".
+    "tmux",
+    "tmux: server",
+    "screen",
 ];
 
 /// Built-in protect names plus the user's additions from `guard.selection.protect`.
@@ -639,6 +660,33 @@ mod tests {
         let s = protect_set(&["gnome-control-center".into()]);
         assert!(s.contains("gnome-shell"));
         assert!(s.contains("gnome-control-center"));
+    }
+
+    /// Terminals and multiplexers are protected by their exe basename, and
+    /// tmux also by the comm "tmux: server" it sets on its server process.
+    #[test]
+    fn terminals_and_multiplexers_are_protected() {
+        let s = protect_set(&[]);
+        for exe in [
+            "gnome-terminal-server",
+            "ptyxis",
+            "ptyxis-agent",
+            "kgx",
+            "konsole",
+            "kitty",
+            "alacritty",
+            "wezterm-gui",
+            "foot",
+            "tilix",
+            "xfce4-terminal",
+            "xterm",
+            "terminator",
+            "tmux",
+            "screen",
+        ] {
+            assert!(is_protected(&s, "x", Some(exe)), "{exe}");
+        }
+        assert!(is_protected(&s, "tmux: server", None));
     }
 
     #[test]
