@@ -1149,6 +1149,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn packaging_metadata_is_consistent() {
+        const MANIFEST: &str = include_str!("../Cargo.toml");
+        assert!(
+            MANIFEST.contains("name = \"rlmctl\""),
+            "crates.io package name"
+        );
+        assert!(
+            MANIFEST.contains("name = \"rlm\"\npath = \"src/main.rs\""),
+            "binary stays rlm"
+        );
+        assert!(
+            MANIFEST.contains("name = \"rlm-guard\""),
+            "guard ships in the same package"
+        );
+        assert!(MANIFEST.contains("rlm-delegate.conf"));
+        assert!(!MANIFEST.contains("dist/delegate.conf"));
+        assert!(MANIFEST.contains("maintainer-scripts = \"../dist/deb\""));
+        assert_eq!(env!("CARGO_PKG_VERSION"), "0.2.0");
+    }
+
+    #[test]
     fn parse_pid_list_basic() {
         assert_eq!(parse_pid_list("1,2,3").unwrap(), vec![1, 2, 3]);
     }

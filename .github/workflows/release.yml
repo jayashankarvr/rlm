@@ -18,6 +18,14 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Check tag matches Cargo version
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          want="${REF_NAME#v}"
+          have="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name=="rlmctl") | .version')"
+          test "$want" = "$have" || { echo "tag $REF_NAME does not match Cargo version $have"; exit 1; }
+
       - name: Install dependencies
         run: |
           sudo apt-get update
@@ -27,11 +35,11 @@ jobs:
         run: cargo install cargo-deb cargo-generate-rpm
 
       - name: Build release binaries
-        run: cargo build --release
+        run: cargo build --release --locked
 
       - name: Build .deb packages
         run: |
-          cargo deb -p rlm --no-build
+          cargo deb -p rlmctl --no-build
           cargo deb -p rlm-gtk --no-build
 
       - name: Build .rpm packages
@@ -48,14 +56,12 @@ jobs:
           cp target/release/rlm-guard release/
           cp target/release/rlm-gtk release/
           cp cli/assets/rlm-guard.service release/
+          cp dist/rlm-delegate.conf release/
           cp README.md LICENSE release/
           tar -czvf "rlm-${REF_NAME}-x86_64-linux.tar.gz" -C release .
 
-      - name: Get version
-        id: version
-        env:
-          REF_NAME: ${{ github.ref_name }}
-        run: echo "version=${REF_NAME#v}" >> "$GITHUB_OUTPUT"
+      - name: Write checksums
+        run: sha256sum target/debian/*.deb target/generate-rpm/*.rpm rlm-*.tar.gz > SHA256SUMS
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
@@ -63,10 +69,9 @@ jobs:
           draft: false
           generate_release_notes: true
           files: |
-            target/debian/rlm_${{ steps.version.outputs.version }}-1_amd64.deb
-            target/debian/rlm-gtk_${{ steps.version.outputs.version }}-1_amd64.deb
-            target/generate-rpm/rlm-${{ steps.version.outputs.version }}-1.x86_64.rpm
-            target/generate-rpm/rlm-gtk-${{ steps.version.outputs.version }}-1.x86_64.rpm
+            target/debian/*.deb
+            target/generate-rpm/*.rpm
             rlm-${{ github.ref_name }}-x86_64-linux.tar.gz
+            SHA256SUMS
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,9 @@
+#!/bin/sh
+set -e
+if [ -d /run/systemd/system ]; then
+    systemctl daemon-reload >/dev/null 2>&1 || true
+fi
+if [ "$1" = "purge" ]; then
+    echo "rlm: per-user files remain in ~/.config/rlm and ~/.local/state/rlm; remove them by hand if you want."
+fi
+exit 0

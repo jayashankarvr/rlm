@@ -1,0 +1,54 @@
+# Maintainer: Jayashankar <me.jayashankar@gmail.com>
+pkgbase=rlm
+pkgname=(rlm rlm-gtk)
+pkgver=0.2.0
+pkgrel=1
+pkgdesc='Unprivileged cgroup v2 resource limits with an optional freeze-or-cap guard'
+arch=(x86_64 aarch64)
+url='https://github.com/jayashankarvr/rlm'
+license=(Apache-2.0)
+makedepends=(cargo gtk4 libadwaita)
+source=("$pkgbase-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('SKIP') # replaced by updpkgsums at release time
+
+prepare() {
+  cd "$pkgbase-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  cd "$pkgbase-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable CARGO_TARGET_DIR=target
+  cargo build --frozen --release -p rlmctl -p rlm-gtk
+}
+
+check() {
+  cd "$pkgbase-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable CARGO_TARGET_DIR=target
+  cargo test --frozen -p rlmctl-common -p rlmctl-core -p rlmctl
+}
+
+package_rlm() {
+  pkgdesc='Unprivileged cgroup v2 resource limits (rlm) with an optional freeze-or-cap guard (rlm-guard)'
+  depends=(systemd gcc-libs glibc)
+  install=rlm.install
+  cd "$pkgbase-$pkgver"
+  install -Dm755 target/release/rlm "$pkgdir/usr/bin/rlm"
+  install -Dm755 target/release/rlm-guard "$pkgdir/usr/bin/rlm-guard"
+  install -Dm644 cli/assets/rlm-guard.service "$pkgdir/usr/lib/systemd/user/rlm-guard.service"
+  install -Dm644 dist/rlm-delegate.conf "$pkgdir/usr/lib/systemd/system/user@.service.d/rlm-delegate.conf"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/rlm/README.md"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/rlm/LICENSE"
+}
+
+package_rlm-gtk() {
+  pkgdesc='GTK4 interface for rlm'
+  depends=(rlm gtk4 libadwaita)
+  cd "$pkgbase-$pkgver"
+  install -Dm755 target/release/rlm-gtk "$pkgdir/usr/bin/rlm-gtk"
+  install -Dm644 gtk-gui/assets/io.github.rlm.gtk.desktop "$pkgdir/usr/share/applications/io.github.rlm.gtk.desktop"
+  install -Dm644 gtk-gui/assets/rlm-icon.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/io.github.rlm.gtk.svg"
+  install -Dm644 gtk-gui/assets/rlm-symbolic.svg "$pkgdir/usr/share/icons/hicolor/symbolic/apps/io.github.rlm.gtk-symbolic.svg"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/rlm-gtk/LICENSE"
+}

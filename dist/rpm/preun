@@ -1,0 +1,12 @@
+#!/bin/sh
+# rpm passes the number of installs that remain after this one; 0 means erase.
+# Stop the guard in every running user session before its binary goes away,
+# so it can undo any freeze or cap it holds (it does that on SIGTERM).
+if [ "$1" -eq 0 ] && [ -d /run/systemd/system ]; then
+    for uid in $(loginctl list-users --no-legend 2>/dev/null | awk '{print $1}'); do
+        user=$(id -nu "$uid" 2>/dev/null) || continue
+        systemctl --user -M "$user@" disable --now rlm-guard.service >/dev/null 2>&1 || true
+    done
+    systemctl --global disable rlm-guard.service >/dev/null 2>&1 || true
+fi
+exit 0

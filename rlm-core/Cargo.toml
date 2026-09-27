@@ -1,9 +1,14 @@
 [package]
-name = "rlm-core"
+name = "rlmctl-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Core cgroup operations for rlm"
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+description = "cgroup v2 limit management and the rlm-guard engine for rlmctl"
+keywords = ["cgroups", "resource-limit", "linux"]
+categories = ["os::linux-apis"]
 
 [dependencies]
 common.workspace = true
