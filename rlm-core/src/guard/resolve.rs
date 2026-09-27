@@ -1,4 +1,4 @@
-//! Pure target resolution — determines whether a victim cgroup should be frozen,
+//! Pure target resolution: determines whether a victim cgroup should be frozen,
 //! capped, or protected based on its path and membership.
 //!
 //! No syscalls, no clock reads, no filesystem access. Pure logic over paths and process names.
@@ -70,7 +70,7 @@ pub fn candidate_target(victim_cgroup: &str, uid: u32, rlm_base: &str) -> Option
         let first = rest.split('/').find(|c| !c.is_empty())?;
         // The shared "unlimit" leaf is where every `rlm unlimit`/teardown
         // dumps released processes (and where `sweep_guard_leftovers` dumps
-        // legacy `guard-<pid>` victims on upgrade) — it's a grab-bag of
+        // legacy `guard-<pid>` victims on upgrade); it's a grab-bag of
         // processes the user explicitly released from rlm's control, not a
         // valid freeze/cap target. `status.rs` already excludes it by the
         // same name; mirror that here (D3 fix).
@@ -160,7 +160,7 @@ mod tests {
 
     /// D3 fix: the shared `unlimit` leaf holds processes the user explicitly
     /// released from rlm's control (and, on upgrade, legacy `guard-<pid>`
-    /// victims swept there at startup) — it must never resolve as a
+    /// victims swept there at startup); it must never resolve as a
     /// freeze/cap target, mirroring `status.rs`'s exclusion of the same
     /// cgroup.
     #[test]

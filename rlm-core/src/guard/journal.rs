@@ -65,14 +65,14 @@ pub struct Journal {
 
 impl Journal {
     /// Read journal entries straight off disk without opening a `Journal`
-    /// handle — safe to call from a *second* process (e.g. the CLI) while
+    /// handle, safe to call from a *second* process (e.g. the CLI) while
     /// the daemon holds its own live `Journal` and may be appending.
     ///
     /// Unlike [`Journal::open`]/[`Journal::entries`], this never truncates,
     /// rewrites, or performs WAL tail recovery: `open()`'s recovery path
     /// (`set_len` from a stale read, or a boot-mismatch truncate) is a
     /// TOCTOU race against the daemon's own writes when run from an
-    /// unrelated process with no cross-process lock — a daemon `append`
+    /// unrelated process with no cross-process lock: a daemon `append`
     /// landing between this function's read and a hypothetical fix-up would
     /// be silently discarded, losing a crash-restore record. This function
     /// only ever reads: a torn trailing line or any other unparseable line
@@ -296,13 +296,13 @@ impl Journal {
     }
 
     /// Atomically swap all entries for `cgroup` with `entries` (an empty
-    /// slice removes them), in a single rewrite — every other cgroup's
+    /// slice removes them), in a single rewrite; every other cgroup's
     /// entries are preserved untouched. Unlike a separate `remove` followed
     /// by `append`, there is no window where the on-disk journal has fewer
     /// (or zero) records for `cgroup` than reality: the old and new entries
     /// for `cgroup` are swapped in one `write_entries` call under the
     /// mutation lock, so a crash either lands before (old entries intact)
-    /// or after (new entries intact) — never in between.
+    /// or after (new entries intact), never in between.
     pub fn replace(&self, cgroup: &str, entries: &[JournalEntry]) -> common::Result<()> {
         let _guard = self.mutation_lock.lock().unwrap();
 
@@ -464,7 +464,7 @@ mod tests {
     }
 
     /// Task 6 review, fix round 2: `replace` must swap only the target
-    /// cgroup's entries in one atomic rewrite — another cgroup's entry is
+    /// cgroup's entries in one atomic rewrite; another cgroup's entry is
     /// left byte-for-byte untouched, and everything survives a re-open
     /// under the same boot_id (proving it's durably on disk, not just
     /// in-memory).
@@ -543,15 +543,15 @@ mod tests {
         assert!(should_restore(&e, Some(42), Some("1000000")));
         assert!(
             !should_restore(&e, Some(43), Some("1000000")),
-            "inode mismatch → skip"
+            "inode mismatch must skip"
         );
         assert!(
             !should_restore(&e, None, Some("1000000")),
-            "cgroup gone → skip"
+            "cgroup gone must skip"
         );
         assert!(
             !should_restore(&e, Some(42), Some("999")),
-            "someone changed high → skip"
+            "someone changed high must skip"
         );
         let f = JournalEntry {
             action: JournalAction::Freeze,
@@ -637,7 +637,7 @@ mod tests {
 
     /// A boot_id mismatch means the entries are stale, but `read_entries`
     /// must never truncate the file to express that (only `open()`, which
-    /// owns the file, is allowed to do that) — it just reports nothing.
+    /// owns the file, is allowed to do that); it just reports nothing.
     #[test]
     fn read_entries_returns_empty_on_boot_mismatch_without_mutating() {
         let dir = tempfile::tempdir().unwrap();

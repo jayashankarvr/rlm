@@ -9,8 +9,10 @@ ExecStart=/usr/bin/rlm-guard
 Restart=on-failure
 RestartSec=2
 # Exit status 78 means the config file is invalid. Restarting cannot fix
-# that, so the unit stays failed until the file is corrected.
-RestartPreventExitStatus=78
+# that, so the unit stays failed until the file is corrected. Exit status
+# 75 means another rlm-guard already holds the lock; restarting every few
+# seconds would only fill the journal while that guard runs.
+RestartPreventExitStatus=78 75
 # SIGTERM makes the guard undo every freeze and cap before it exits.
 KillSignal=SIGTERM
 TimeoutStopSec=10

@@ -10,7 +10,7 @@
 //! `mpsc::Receiver::recv_timeout`. If the deadline passes first we return
 //! `Err` immediately; the spawned thread is left to finish (or never finish,
 //! if the bus is wedged) in the background and its result is dropped. This is
-//! a bounded leak — one thread per timed-out call — accepted because the
+//! a bounded leak (one thread per timed-out call), accepted because the
 //! storm path always falls back to raw cgroup writes on `Err`, so a wedged
 //! D-Bus call never blocks the daemon itself.
 
@@ -25,6 +25,10 @@ const DESTINATION: &str = "org.freedesktop.systemd1";
 const PATH: &str = "/org/freedesktop/systemd1";
 const INTERFACE: &str = "org.freedesktop.systemd1.Manager";
 
+/// Longest wait for the session-bus handshake at startup. Startup recovery
+/// runs after the connect, so a wedged bus must not hold a frozen app.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Blocking client for the systemd user-session D-Bus manager.
 pub struct SystemdUser {
     conn: Connection,
@@ -33,9 +37,12 @@ pub struct SystemdUser {
 impl SystemdUser {
     /// Connect to the session bus at daemon startup. Returns `None` if no
     /// session bus is available (e.g. headless, no `DBUS_SESSION_BUS_ADDRESS`)
-    /// — callers then fall back to raw cgroup operations everywhere.
+    /// or it does not answer within [`CONNECT_TIMEOUT`]. Callers then fall
+    /// back to raw cgroup operations everywhere.
     pub fn connect() -> Option<Self> {
-        Connection::session().ok().map(|conn| Self { conn })
+        connect_within(CONNECT_TIMEOUT, || {
+            Connection::session().map_err(|e| Error::Cgroup(format!("session bus: {e}")))
+        })
     }
 
     /// `FreezeUnit(name)`. Returns `Err` on failure OR timeout; the caller
@@ -85,12 +92,22 @@ impl SystemdUser {
     }
 }
 
+/// Run the connect `f` under `timeout`; `None` on failure or timeout.
+fn connect_within(
+    timeout: Duration,
+    f: impl FnOnce() -> Result<Connection> + Send + 'static,
+) -> Option<SystemdUser> {
+    run_with_timeout(timeout, f)
+        .ok()
+        .map(|conn| SystemdUser { conn })
+}
+
 /// Run `f` on a spawned thread and wait for it via
 /// `mpsc::Receiver::recv_timeout(timeout)` instead of trusting the callee's
 /// own notion of a deadline. On timeout, returns `Err` immediately; the
 /// spawned thread is detached and left to finish (or never finish) in the
 /// background, with its eventual result silently dropped on send. This is a
-/// bounded leak — one thread per timed-out call — accepted because callers
+/// bounded leak (one thread per timed-out call), accepted because callers
 /// always treat `Err` as "fall back to raw cgroup ops", so a wedged call
 /// never blocks the daemon itself.
 fn run_with_timeout<T: Send + 'static>(
@@ -132,6 +149,18 @@ mod tests {
     fn run_with_timeout_returns_ok_when_fast() {
         let result: Result<u32> = run_with_timeout(Duration::from_secs(2), || Ok(42));
         assert_eq!(result.unwrap(), 42);
+    }
+
+    /// A session bus that never answers must not hold up startup.
+    #[test]
+    fn connect_gives_up_on_a_slow_bus() {
+        let start = std::time::Instant::now();
+        let conn = connect_within(Duration::from_millis(50), || {
+            thread::sleep(Duration::from_secs(5));
+            Err(Error::Cgroup("never".into()))
+        });
+        assert!(conn.is_none());
+        assert!(start.elapsed() < Duration::from_secs(2));
     }
 
     #[test]

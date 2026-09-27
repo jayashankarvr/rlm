@@ -15,7 +15,7 @@ use common::GuardConfig;
 /// Samples system pressure and the user's eligible processes.
 pub struct Sampler {
     cfg: GuardConfig,
-    /// The guard's own PID — always excluded from the eligible set.
+    /// The guard's own PID, always excluded from the eligible set.
     self_pid: u32,
     /// Only processes owned by this uid are eligible.
     uid: u32,
@@ -24,7 +24,7 @@ pub struct Sampler {
     /// `CgroupManager::base_path()` minus the leading `/sys/fs/cgroup`, e.g.
     /// "/user.slice/user-1000.slice/user@1000.service/rlm". Used to resolve
     /// raw (non-systemd-unit) rlm cgroups as targets. `None` means the strip
-    /// failed (see [`strip_cgroup_root`]) — resolution assembly is disabled
+    /// failed (see [`strip_cgroup_root`]); resolution assembly is disabled
     /// entirely rather than risk a bogus permissive match (see [`Sampler::resolve`]).
     rlm_base: Option<String>,
 }
@@ -34,12 +34,12 @@ pub struct Sampler {
 /// (paths relative to the cgroupfs root). Pure string manipulation.
 ///
 /// Returns `None` if `base_path` isn't valid UTF-8 or doesn't start with
-/// `/sys/fs/cgroup` — that's a broken invariant (base_path always comes from
+/// `/sys/fs/cgroup`; that's a broken invariant (base_path always comes from
 /// `CgroupManager`, which is hardcoded to build under `/sys/fs/cgroup`), and
 /// callers must fail closed rather than substitute an empty string: an empty
 /// `rlm_base` makes `candidate_target`'s raw-cgroup prefix check `""` (i.e.
 /// "/"), which matches almost every absolute cgroup path as a bogus Raw
-/// candidate — the dangerous direction for a freeze decision.
+/// candidate, the dangerous direction for a freeze decision.
 pub fn strip_cgroup_root(base_path: &Path) -> Option<String> {
     base_path
         .to_str()?
@@ -52,7 +52,7 @@ impl Sampler {
     /// whose processes are eligible. `rlm_base` is
     /// `CgroupManager::base_path()` with the `/sys/fs/cgroup` prefix
     /// stripped (see [`strip_cgroup_root`]); `None` disables resolution
-    /// assembly entirely (fail closed — every process reports `resolution:
+    /// assembly entirely (fail closed: every process reports `resolution:
     /// None`, so the policy engine can never select an escalation victim).
     pub fn new(cfg: GuardConfig, self_pid: u32, uid: u32, rlm_base: Option<String>) -> Self {
         // Merge the baked-in protect-list with the user's additions once, up

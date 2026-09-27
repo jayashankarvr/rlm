@@ -254,7 +254,7 @@ guard:
 
 - `enabled: false` turns off freezing and capping; rlm-guard still applies persistent rules.
 - `notify` sends a plain `notify-send` warning when pressure rises.
-- Unknown keys and out-of-range values are errors. With an invalid config, rlm-guard exits with status 78 and stays stopped until you fix the file, then run `systemctl --user restart rlm-guard`. `rlm guard status` shows the error.
+- Unknown keys and out-of-range values are errors. `calm_hold_secs` and `freeze_cooldown_secs` go up to 86400 (one day), `freeze_hold_secs` up to 60, `sample_interval_ms` from 100 to 60000, and `mem_available_floor_mb` and `min_rss_mb` up to 16777216 (16 TiB). With an invalid config, rlm-guard exits with status 78 and stays stopped until you fix the file, then run `systemctl --user restart rlm-guard`. `rlm guard status` shows the error.
 
 ### How the guard stays safe
 
@@ -262,10 +262,10 @@ guard:
 No. It only freezes the app's cgroup (through systemd, with a direct `cgroup.freeze` write as fallback) or sets `memory.high`. It never sends a signal. The kernel's own OOM killer is not affected, so a hard memory limit you set can still end in an OOM kill.
 
 **What if the guard crashes while an app is frozen?**
-Every freeze and cap is written to a journal, `~/.local/state/rlm/guard-journal.jsonl`, before it is applied. On the next start, including a start that fails on a bad config, the guard replays the journal and restores the app. Entries are keyed by boot and cgroup identity, so it never touches a cgroup that was since recreated for something else. On a normal stop (SIGTERM) it undoes everything before exiting. Only one guard runs per user: a second `rlm-guard` finds `~/.local/state/rlm/rlm-guard.lock` held and exits without touching the journal.
+Every freeze and cap is written to a journal, `~/.local/state/rlm/guard-journal.jsonl`, before it is applied. On the next start, including a start that fails on a bad config, the guard replays the journal and restores the app. Entries are keyed by boot and cgroup identity, so it never touches a cgroup that was since recreated for something else. On a normal stop (SIGTERM) it undoes everything before exiting. Only one guard runs per user: a second `rlm-guard` finds `~/.local/state/rlm/rlm-guard.lock` held and exits with status 75 without touching the journal. The service does not restart on status 75; run `systemctl --user restart rlm-guard` once the other guard has stopped. When no state dir is known, the journal, lock and history go in `$XDG_RUNTIME_DIR/rlm` instead. Without either dir the guard never uses a shared dir such as `/tmp`: it does not freeze or cap, keeps applying persistent rules, and records no history.
 
 **Could it freeze my desktop or terminal?**
-Processes on the protect list are never frozen: desktop shells and compositors, Xorg and Xwayland, sshd, systemd, dbus-daemon, the audio stack, bash, zsh, fish and rlm-guard. A scope that contains a protected process, such as a terminal whose shell shares the scope with a runaway script, is capped and never frozen. Add your own names under `guard.selection.protect`.
+Processes on the protect list are never frozen: desktop shells and compositors, Xorg and Xwayland, sshd, systemd, dbus-daemon, the audio stack, bash, zsh, fish, rlm-guard, common terminal emulators (GNOME Terminal, Ptyxis, Console, Konsole, kitty, Alacritty, WezTerm, foot, Tilix, Xfce Terminal, xterm, Terminator) and the tmux and screen multiplexers. Names are matched on the executable name. A scope that contains a protected process, such as a terminal whose shell shares the scope with a runaway script, is capped and never frozen. Add your own names under `guard.selection.protect`.
 
 **Why did it not act when my machine was slow?**
 It needs apps under `app.slice` stalling on memory while available memory is below 20% of RAM. The one exception is available memory below 400 MB: then it acts even without a stall. Slowness from CPU or disk load does not count. A stall inside one cgroup that rlm limited is ignored by design: that app is hitting the limit you set, and the rest of the system is fine.
