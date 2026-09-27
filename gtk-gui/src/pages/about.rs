@@ -65,7 +65,9 @@ pub fn create() -> gtk::Widget {
 
     let license_row = adw::ActionRow::new();
     license_row.set_title("Apache License 2.0");
-    license_row.set_subtitle("SPDX: Apache-2.0. The full text is in the LICENSE file.");
+    license_row.set_subtitle(
+        "SPDX: Apache-2.0. The full text is in the LICENSE file of the source repository.",
+    );
     license_group.add(&license_row);
 
     let license_text = gtk::TextView::new();

@@ -24,7 +24,7 @@ pub fn create() -> gtk::Widget {
     // Profiles group
     let profiles_group = adw::PreferencesGroup::new();
     profiles_group.set_title("Saved Profiles");
-    profiles_group.set_description(Some("Named sets of limits. Pick one under Profile on Limit Running or Launch New, or use --profile in the CLI."));
+    profiles_group.set_description(Some("Named sets of limits. Pick one under Profile on Limit Running or Launch New, or use rlm run --profile."));
     profiles_group.set_header_suffix(Some(&add_btn));
 
     page.add(&profiles_group);

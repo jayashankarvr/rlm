@@ -389,7 +389,7 @@ pub fn create() -> gtk::Widget {
     let status_group = adw::PreferencesGroup::new();
     status_group.set_title("Status");
     status_group.set_description(Some(
-        "Service state, memory pressure and when the guard acts",
+        "Service and config state, memory pressure, and when the guard acts",
     ));
     let refresh_btn = gtk::Button::from_icon_name("view-refresh-symbolic");
     refresh_btn.add_css_class("flat");
