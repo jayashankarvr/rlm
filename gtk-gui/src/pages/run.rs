@@ -1,7 +1,7 @@
 use crate::widgets::{
     cpu_suffix_label, create_io_unit_dropdown, create_unit_dropdown, get_unit_suffix,
     limits_description, on_enter, parse_cpu_value, require_manager, set_value_with_unit,
-    setup_number_validation, setup_size_validation, with_action_bar, NO_MANAGER_HINT,
+    setup_number_validation, setup_size_validation, status_toast, with_action_bar, NO_MANAGER_HINT,
 };
 use adw::prelude::*;
 use gtk::glib;
@@ -502,8 +502,7 @@ fn run_command(state: &Rc<RefCell<RunState>>) {
             true,
         );
     }
-    let toast = adw::Toast::new(&format!("Started {} (PID {})", program, pid));
-    toast.set_timeout(3);
+    let toast = status_toast(&format!("Started {} (PID {})", program, pid), 5);
     state.toast_overlay.add_toast(toast);
 
     // Monitor process exit. glib reaps the child here; std must not wait on it.

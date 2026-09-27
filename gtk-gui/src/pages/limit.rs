@@ -1,7 +1,7 @@
 use crate::widgets::{
     cpu_suffix_label, create_io_unit_dropdown, create_unit_dropdown, get_unit_suffix,
     limits_description, on_enter, parse_cpu_value, require_manager, set_value_with_unit,
-    setup_number_validation, setup_size_validation, with_action_bar, NO_MANAGER_HINT,
+    setup_number_validation, setup_size_validation, status_toast, with_action_bar, NO_MANAGER_HINT,
 };
 use adw::prelude::*;
 use gtk::glib;
@@ -993,8 +993,7 @@ fn apply_limits(state: &Rc<RefCell<LimitState>>) {
                         }
                     }
 
-                    let toast = adw::Toast::new(&msg);
-                    toast.set_timeout(6);
+                    let toast = status_toast(&msg, 6);
                     state.toast_overlay.add_toast(toast);
                 }
                 Err(e) => show_status(&state.status_label, &format!("{e}"), true),
@@ -1027,8 +1026,7 @@ fn apply_limits(state: &Rc<RefCell<LimitState>>) {
             match manager.apply_limit(pid, &limit) {
                 Ok(warnings) => {
                     show_warnings(&state.status_label, &warnings);
-                    let toast = adw::Toast::new(&format!("Limits applied to PID {pid}"));
-                    toast.set_timeout(3);
+                    let toast = status_toast(&format!("Limits applied to PID {pid}"), 5);
                     state.toast_overlay.add_toast(toast);
                 }
                 Err(e) => show_status(&state.status_label, &format!("{e}"), true),

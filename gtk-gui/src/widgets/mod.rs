@@ -104,6 +104,16 @@ pub fn with_action_bar(
     view
 }
 
+/// A success toast whose "Open" button shows the Managed Processes page,
+/// where the new limits can be seen and removed.
+pub fn status_toast(text: &str, timeout: u32) -> adw::Toast {
+    let toast = adw::Toast::new(text);
+    toast.set_timeout(timeout);
+    toast.set_button_label(Some("Open"));
+    toast.set_action_name(Some("win.goto-status"));
+    toast
+}
+
 /// Run `action` when Enter is pressed in any of `entries`.
 pub fn on_enter(entries: &[&adw::EntryRow], action: impl Fn() + Clone + 'static) {
     for entry in entries {
