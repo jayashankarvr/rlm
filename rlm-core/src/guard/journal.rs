@@ -17,8 +17,16 @@ use common::Error;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{atomic::AtomicU64, atomic::Ordering, Mutex};
+
+/// Owner-only permissions for the journal: entries record cgroup paths and
+/// systemd unit names, so both the live file and the temp file `write_entries`
+/// atomically renames over it are created `0600` rather than inheriting the
+/// process umask. Only takes effect when a call actually creates the file
+/// (`O_CREAT`); an already-existing file's mode is left as-is.
+const JOURNAL_FILE_MODE: u32 = 0o600;
 
 // Global counter for unique temp file names per call (guards against multi-threaded stomping).
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -214,6 +222,7 @@ impl Journal {
             .write(true)
             .create(true)
             .truncate(true)
+            .mode(JOURNAL_FILE_MODE)
             .open(&self.path)?;
 
         let header = serde_json::json!({ "boot_id": self.boot_id });
@@ -323,6 +332,7 @@ impl Journal {
             .write(true)
             .create(true)
             .truncate(true)
+            .mode(JOURNAL_FILE_MODE)
             .open(&temp_path)?;
 
         // Write header.
@@ -396,6 +406,35 @@ mod tests {
         j.append(&entry("/x/b")).unwrap();
         assert_eq!(j.entries().len(), 2);
         assert_eq!(j.entries()[0].cgroup, "/x/a");
+    }
+
+    /// Fix round 1, ruling R15: the journal records cgroup paths and unit
+    /// names, so it must be owner-only (`0600`) both when first created
+    /// (`write_header`) and after any full rewrite (`write_entries`'s
+    /// temp-file-then-rename, exercised here via `remove`), never whatever
+    /// the process umask would otherwise give a newly created file.
+    #[test]
+    fn journal_file_is_owner_only_after_create_and_after_rewrite() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("j.jsonl");
+        let j = Journal::open(p.clone(), "boot-a".into()).unwrap();
+        let mode_of = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode_of(&p), 0o600, "journal file must be created 0600");
+
+        j.append(&entry("/x/a")).unwrap();
+        j.append(&entry("/x/b")).unwrap();
+        assert_eq!(
+            mode_of(&p),
+            0o600,
+            "journal file must stay 0600 after append"
+        );
+
+        // `remove` rewrites the whole file via write_entries's temp-file +
+        // atomic-rename mechanism (the same one `replace`/`clear` use).
+        j.remove("/x/a").unwrap();
+        assert_eq!(mode_of(&p), 0o600, "rewritten journal file must stay 0600");
     }
 
     #[test]

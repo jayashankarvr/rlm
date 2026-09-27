@@ -1,12 +1,90 @@
 use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
 
+/// A memory limit below this is rejected: a process cannot start, let alone
+/// make progress, in less than 8 MiB.
+pub const MIN_MEMORY_BYTES: u64 = 8 * 1024 * 1024;
+
+/// An I/O bandwidth limit below this is rejected: below 64 KiB/s a process
+/// cannot make meaningful progress.
+pub const MIN_IO_BPS: u64 = 64 * 1024;
+
+/// Parse a byte size: optional decimal fraction, optional unit K/M/G/T with
+/// an optional "B" or "iB" suffix, case-insensitive, all binary multiples.
+/// A bare number is bytes.
+pub fn parse_size(input: &str) -> Result<u64> {
+    let s = input.trim();
+    let bad = || Error::InvalidMemory(s.to_string());
+    let split = s
+        .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .unwrap_or(s.len());
+    let (num, unit) = s.split_at(split);
+    let mult: u64 = match unit.trim().to_ascii_lowercase().as_str() {
+        "" | "b" => 1,
+        "k" | "kb" | "kib" => 1 << 10,
+        "m" | "mb" | "mib" => 1 << 20,
+        "g" | "gb" | "gib" => 1 << 30,
+        "t" | "tb" | "tib" => 1 << 40,
+        _ => return Err(bad()),
+    };
+    if num.is_empty() || num.starts_with('.') || num.ends_with('.') || num.matches('.').count() > 1
+    {
+        return Err(bad());
+    }
+    let overflow = || Error::InvalidMemory("value too large (overflow)".into());
+    let bytes = match num.split_once('.') {
+        None => num
+            .parse::<u64>()
+            .map_err(|_| bad())?
+            .checked_mul(mult)
+            .ok_or_else(overflow)?,
+        Some((whole, frac)) => {
+            let whole: u64 = whole.parse().map_err(|_| bad())?;
+            let digits = frac.len().min(9);
+            let frac_val: u128 = frac[..digits].parse().map_err(|_| bad())?;
+            let frac_bytes = (frac_val * u128::from(mult) / 10u128.pow(digits as u32)) as u64;
+            whole
+                .checked_mul(mult)
+                .and_then(|w| w.checked_add(frac_bytes))
+                .ok_or_else(overflow)?
+        }
+    };
+    if bytes == 0 {
+        return Err(Error::InvalidMemory("value cannot be zero".into()));
+    }
+    Ok(bytes)
+}
+
 /// Resource limits to apply to a process
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Limit {
     pub memory: Option<MemoryLimit>,
     pub cpu: Option<CpuLimit>,
     pub io: Option<IoLimit>,
+}
+
+impl Limit {
+    /// True if none of memory, cpu or io carry a value.
+    pub fn is_empty(&self) -> bool {
+        self.memory.is_none() && self.cpu.is_none() && self.io.is_none_or(|io| io.is_empty())
+    }
+
+    /// Overlay explicit `over` values on top of `self` (e.g. a profile),
+    /// field by field; io read/write bandwidth overlay independently.
+    pub fn overlay(self, over: &Limit) -> Limit {
+        let io = match (self.io, over.io) {
+            (Some(a), Some(b)) => Some(IoLimit {
+                read_bps: b.read_bps.or(a.read_bps),
+                write_bps: b.write_bps.or(a.write_bps),
+            }),
+            (a, b) => b.or(a),
+        };
+        Limit {
+            memory: over.memory.or(self.memory),
+            cpu: over.cpu.or(self.cpu),
+            io,
+        }
+    }
 }
 
 /// I/O bandwidth limit in bytes per second
@@ -20,8 +98,14 @@ pub struct IoLimit {
 
 impl IoLimit {
     pub fn parse_bps(s: &str) -> Result<u64> {
-        // Reuse memory parsing logic - same units work for bandwidth
-        MemoryLimit::parse(s).map(|m| m.bytes())
+        let bytes = parse_size(s)?;
+        if bytes < MIN_IO_BPS {
+            return Err(Error::InvalidMemory(format!(
+                "{} per second is below the 64K minimum",
+                s.trim()
+            )));
+        }
+        Ok(bytes)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -38,34 +122,16 @@ impl MemoryLimit {
         self.0
     }
 
-    /// Parse human-readable memory string (e.g., "2G", "512M", "1024K")
+    /// Parse human-readable memory string (e.g., "2G", "512M", "1.5GiB").
+    /// Rejects values below the 8 MiB floor: a process cannot run in less.
     pub fn parse(s: &str) -> Result<Self> {
-        let s = s.trim();
-        if s.is_empty() {
-            return Err(Error::InvalidMemory("empty value".into()));
+        let bytes = parse_size(s)?;
+        if bytes < MIN_MEMORY_BYTES {
+            return Err(Error::InvalidMemory(format!(
+                "{} is below the 8M minimum; a process cannot run in less",
+                s.trim()
+            )));
         }
-
-        let (num_str, multiplier) = match s.chars().last() {
-            Some('K' | 'k') => (&s[..s.len() - 1], 1024u64),
-            Some('M' | 'm') => (&s[..s.len() - 1], 1024 * 1024),
-            Some('G' | 'g') => (&s[..s.len() - 1], 1024 * 1024 * 1024),
-            Some('T' | 't') => (&s[..s.len() - 1], 1024 * 1024 * 1024 * 1024),
-            Some(c) if c.is_ascii_digit() => (s, 1),
-            _ => return Err(Error::InvalidMemory(s.into())),
-        };
-
-        let num: u64 = num_str
-            .parse()
-            .map_err(|_| Error::InvalidMemory(s.into()))?;
-
-        if num == 0 {
-            return Err(Error::InvalidMemory("value cannot be zero".into()));
-        }
-
-        let bytes = num
-            .checked_mul(multiplier)
-            .ok_or_else(|| Error::InvalidMemory("value too large (overflow)".into()))?;
-
         Ok(Self(bytes))
     }
 }
@@ -101,37 +167,69 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_memory_units() {
-        assert_eq!(MemoryLimit::parse("1024").unwrap().bytes(), 1024);
-        assert_eq!(MemoryLimit::parse("1K").unwrap().bytes(), 1024);
-        assert_eq!(MemoryLimit::parse("1k").unwrap().bytes(), 1024);
-        assert_eq!(MemoryLimit::parse("1M").unwrap().bytes(), 1024 * 1024);
-        assert_eq!(MemoryLimit::parse("1m").unwrap().bytes(), 1024 * 1024);
-        assert_eq!(
-            MemoryLimit::parse("2G").unwrap().bytes(),
-            2 * 1024 * 1024 * 1024
-        );
-        assert_eq!(
-            MemoryLimit::parse("1T").unwrap().bytes(),
-            1024 * 1024 * 1024 * 1024
-        );
+    fn parse_size_table() {
+        let mib = 1024 * 1024u64;
+        let ok: &[(&str, u64)] = &[
+            ("4096", 4096),
+            ("1K", 1024),
+            ("512M", 512 * mib),
+            ("512MB", 512 * mib),
+            ("512 MB", 512 * mib),
+            ("512MiB", 512 * mib),
+            ("2g", 2048 * mib),
+            ("2GiB", 2048 * mib),
+            ("1.5G", 1536 * mib),
+            ("0.5g", 512 * mib),
+            ("  8m  ", 8 * mib),
+            ("1T", 1024 * 1024 * mib),
+        ];
+        for (s, want) in ok {
+            assert_eq!(parse_size(s).unwrap(), *want, "{s}");
+        }
+        for s in [
+            "",
+            "abc",
+            "-1G",
+            "1e3M",
+            "1..5G",
+            ".5G",
+            "5.G",
+            "0",
+            "0M",
+            "12X",
+            "999999999999999999T",
+        ] {
+            assert!(parse_size(s).is_err(), "{s:?} should be rejected");
+        }
     }
 
     #[test]
-    fn parse_memory_with_whitespace() {
-        assert_eq!(
-            MemoryLimit::parse("  512M  ").unwrap().bytes(),
-            512 * 1024 * 1024
-        );
+    fn memory_limits_have_a_floor() {
+        assert!(MemoryLimit::parse("1K").is_err());
+        assert!(MemoryLimit::parse("4M").is_err());
+        assert_eq!(MemoryLimit::parse("8M").unwrap().bytes(), MIN_MEMORY_BYTES);
+        let e = MemoryLimit::parse("1024").unwrap_err().to_string();
+        assert!(e.contains("8M"), "{e}");
     }
 
     #[test]
-    fn parse_memory_errors() {
-        assert!(MemoryLimit::parse("").is_err());
-        assert!(MemoryLimit::parse("abc").is_err());
-        assert!(MemoryLimit::parse("-1G").is_err());
-        assert!(MemoryLimit::parse("0M").is_err()); // zero not allowed
-        assert!(MemoryLimit::parse("0").is_err()); // zero not allowed
+    fn io_limits_have_a_floor() {
+        assert!(IoLimit::parse_bps("1K").is_err());
+        assert_eq!(IoLimit::parse_bps("64K").unwrap(), MIN_IO_BPS);
+    }
+
+    #[test]
+    fn explicit_values_override_profile_values() {
+        let profile = crate::build_limit(Some("512M"), Some("25%"), Some("10M"), None).unwrap();
+        let flags = crate::build_limit(Some("1G"), None, None, Some("5M")).unwrap();
+        let l = profile.overlay(&flags);
+        assert_eq!(l.memory.unwrap().bytes(), 1024 * 1024 * 1024);
+        assert_eq!(l.cpu.unwrap().percent(), 25);
+        let io = l.io.unwrap();
+        assert_eq!(
+            (io.read_bps, io.write_bps),
+            (Some(10 * 1024 * 1024), Some(5 * 1024 * 1024))
+        );
     }
 
     #[test]

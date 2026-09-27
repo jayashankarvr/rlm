@@ -239,9 +239,8 @@ pub fn create(manager: Option<Arc<CgroupManager>>) -> gtk::Widget {
 fn load_profile_names() -> Vec<String> {
     let mut names = vec!["(None)".to_string()];
     if let Ok(config) = common::Config::load() {
-        names.extend(config.all_profiles().keys().cloned());
+        names.extend(config.profile_names());
     }
-    names.sort();
     names
 }
 
@@ -432,8 +431,8 @@ fn run_command(state: &Rc<RefCell<RunState>>) {
     let count = RUN_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let cgroup_name = format!("gtk-{}-{}", std::process::id(), count);
 
-    let cgroup_path = match manager.prepare_cgroup(&cgroup_name, &limit) {
-        Ok(p) => p,
+    let (cgroup_path, mut warnings) = match manager.prepare_cgroup(&cgroup_name, &limit) {
+        Ok(p) => (p.path, p.warnings),
         Err(e) => {
             show_status(
                 &state.status_label,
@@ -452,7 +451,7 @@ fn run_command(state: &Rc<RefCell<RunState>>) {
     let child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
-            let _ = manager.cleanup_cgroup(&cgroup_name);
+            let _ = manager.remove_if_empty(&cgroup_name);
             show_status(&state.status_label, &format!("Error spawning: {e}"), true);
             return;
         }
@@ -460,38 +459,72 @@ fn run_command(state: &Rc<RefCell<RunState>>) {
 
     let pid = child.id();
 
+    // Pre-exec placement already ran; add_to_cgroup here is only a fallback.
+    // A failure does not mean the child is unlimited or unreaped, so it
+    // becomes a warning rather than a cleanup-and-return.
     if let Err(e) = manager.add_to_cgroup(&cgroup_path, pid) {
-        let _ = manager.cleanup_cgroup(&cgroup_name);
-        show_status(
-            &state.status_label,
-            &format!("Error adding to cgroup: {e}"),
-            true,
-        );
-        return;
+        warnings.push(format!("failed to apply limits: {e}"));
     }
 
     *state.running_pid.borrow_mut() = Some(pid);
     *state.cgroup_name.borrow_mut() = Some(cgroup_name.clone());
 
-    // Show success toast
-    state.status_label.set_text("");
+    // Show success toast; non-fatal warnings (e.g. I/O limits) go in the label.
+    if warnings.is_empty() {
+        state.status_label.set_text("");
+    } else {
+        show_status(
+            &state.status_label,
+            &format!("Warning: {}", warnings.join("; ")),
+            true,
+        );
+    }
     let toast = adw::Toast::new(&format!("Started {} (PID {})", program, pid));
     toast.set_timeout(3);
     state.toast_overlay.add_toast(toast);
 
-    // Monitor process exit
+    // Monitor process exit. glib reaps the child here; std must not wait on it.
+    drop(child);
     let manager_clone = manager.clone();
     let toast_overlay = state.toast_overlay.clone();
-    glib::timeout_add_local(std::time::Duration::from_millis(500), move || {
-        let proc_path = format!("/proc/{pid}");
-        if !std::path::Path::new(&proc_path).exists() {
-            let _ = manager_clone.cleanup_cgroup(&cgroup_name);
-            let toast = adw::Toast::new(&format!("Process {} exited", pid));
-            toast.set_timeout(2);
-            toast_overlay.add_toast(toast);
-            return glib::ControlFlow::Break;
+    let name = cgroup_name.clone();
+    glib::child_watch_add_local(glib::Pid(pid as i32), move |_, raw| {
+        use std::os::unix::process::ExitStatusExt;
+        let status = std::process::ExitStatus::from_raw(raw);
+        let oom = manager_clone.oom_kills(&name).unwrap_or(0);
+        let (_, mut lines) = rlm_core::exit::exit_report(
+            status.code(),
+            status.signal(),
+            oom,
+            manager_clone.memory_max(&name),
+        );
+        if manager_clone.is_populated(&name) == Some(true) {
+            lines.push(format!(
+                "The launcher exited; {} process(es) keep running with limits in {name}",
+                manager_clone.pids_in_cgroup(&name).len()
+            ));
+            // Remove the cgroup once the processes the launcher left behind
+            // have exited too, so it does not linger empty.
+            let manager = manager_clone.clone();
+            let name = name.clone();
+            glib::timeout_add_seconds_local(5, move || {
+                if manager.is_populated(&name) == Some(true) {
+                    return glib::ControlFlow::Continue;
+                }
+                let _ = manager.remove_if_empty(&name);
+                glib::ControlFlow::Break
+            });
+        } else {
+            let _ = manager_clone.remove_if_empty(&name);
         }
-        glib::ControlFlow::Continue
+        let text = if lines.is_empty() {
+            format!("Process {pid} exited")
+        } else {
+            lines.join("\n")
+        };
+        let toast = adw::Toast::new(&text);
+        toast.set_timeout(5);
+        toast_overlay.add_toast(toast);
     });
 }
 

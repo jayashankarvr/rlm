@@ -18,27 +18,34 @@
 //!
 //! # Mechanism: systemd unit vs. raw cgroupfs
 //! When a target resolved to a systemd unit (`Mechanism::Unit`), we prefer
-//! the D-Bus call (`FreezeUnit`/`ThawUnit`/`SetUnitProperties`) with a hard
+//! the D-Bus call (`FreezeUnit`/`ThawUnit`) with a hard
 //! 2s timeout (`systemd::SystemdUser`'s own enforced deadline); on `Err` (bus
 //! unavailable, call failed, or timed out) we fall back to the raw cgroupfs
 //! primitives in `cgfs`. Raw-mechanism targets (rlm's own rule cgroups) skip
 //! the D-Bus attempt entirely. Thawing is mechanism-independent: we always
-//! attempt `ThawUnit` best-effort *and* always perform the raw
-//! `cgroup.freeze` write afterward, unconditionally — this guarantees a
-//! cgroup is never left frozen just because the D-Bus call "succeeded" on a
-//! stale unit, and tolerates a missing cgroup (the raw write simply errors
-//! and we move on).
+//! perform the raw `cgroup.freeze` write first, unconditionally, and only
+//! then attempt `ThawUnit` best-effort so systemd's view matches. This
+//! guarantees a cgroup is never left frozen because of a stale unit or a
+//! slow bus, and tolerates a missing cgroup (the raw write simply errors and
+//! we move on). On shutdown and startup replay every raw thaw and restore
+//! finishes before the first D-Bus call. Caps are the exception: they never
+//! go through systemd (see below).
 //!
 //! # Restoring `memory.high`
 //! The kernel truncates `memory.high` writes to page multiples, so the byte
 //! count we cap to is page-aligned *before* we journal/write it
 //! ([`page_align_down`]); as a second line of defense, [`Effector::cap`]
 //! reads `memory.high` back after writing and self-corrects the journal if
-//! reality still differs (e.g. a systemd-side reformat via the D-Bus path).
-//! Restoring on `LiftCap`/replay always clears systemd's runtime
-//! `MemoryHigh` property *before* raw-writing `prev_high` back — the other
-//! order lets systemd's own `"max"` write clobber the value we just
-//! restored. If more than one journal entry ever coexists for the same
+//! reality still differs.
+//! Caps and restores are raw `memory.high` writes only, never systemd's
+//! `SetUnitProperties(MemoryHigh)`: a runtime property leaves a `/run`
+//! drop-in that outlives the cap and masks the unit's own configured
+//! `MemoryHigh` until reboot, and restoring through systemd wrote `infinity`
+//! over it. If systemd later re-applies the unit's value, that only lifts our
+//! cap early, and the journal's `our_high` check then skips the restore (the
+//! safe direction).
+//!
+//! If more than one journal entry ever coexists for the same
 //! cgroup (a leak from an incomplete prior removal), every restore path
 //! treats them as one chain: liveness is judged against the chain's `Cap`
 //! entry specifically (only a `Cap` has a `memory.high` to restore — a
@@ -56,6 +63,7 @@
 use super::cgfs;
 use super::journal::{should_restore, Journal, JournalAction, JournalEntry};
 use super::resolve::{Mechanism, Resolution};
+use super::sampler::parse_meminfo;
 use super::systemd::SystemdUser;
 use super::types::Action;
 use crate::CgroupManager;
@@ -63,10 +71,9 @@ use common::Result;
 use std::process::Command;
 use std::time::Duration;
 
-/// Fallback/floor soft-cap when a cgroup's anon+swap usage can't be read or
-/// is implausibly small. 64 MiB is low enough to apply real pressure yet
-/// high enough to avoid pinning a process into a thrash loop.
-const MIN_CAP_BYTES: u64 = 64 * 1024 * 1024;
+/// Floor for any soft cap. A cap below this is effectively a freeze for a
+/// desktop app, so small cgroups are never squeezed further than this.
+pub const MIN_CAP_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Hard deadline for every D-Bus call on the freeze-guard's storm path. On
 /// `Err` (including a timeout) callers fall back to raw cgroupfs writes.
@@ -193,42 +200,45 @@ impl<'a> Effector<'a> {
             )));
         };
         let prev_high = cgfs::read_high(&res.cgroup);
-        // rlm sets memory.swap.max=0 on every cgroup it creates (see
-        // cgroup.rs's set_memory_limit), which makes anon unreclaimable
-        // there: an anon-derived memory.high target can demand a reduction
-        // the kernel cannot satisfy, degrading the soft cap into an
-        // unbounded allocator stall (memory.high never OOM-kills). Detect
-        // that up front so `cap_target` can floor the demand to what file
-        // reclaim alone can satisfy.
-        let can_swap = cgfs::can_reclaim_anon(&res.cgroup);
-        if !can_swap {
+        // Unknown swap total counts as 0: assuming anon is pinned only makes
+        // the cap gentler.
+        let swap_total_kb = std::fs::read_to_string("/proc/meminfo")
+            .ok()
+            .and_then(|m| parse_meminfo(&m))
+            .map_or(0, |m| m.swap_total_kb);
+        let anon_ok = cgfs::anon_reclaimable(&res.cgroup, swap_total_kb);
+        let Some(target) = cap_target(
+            cgfs::current_bytes(&res.cgroup),
+            cgfs::file_bytes(&res.cgroup),
+            anon_ok,
+        ) else {
             tracing::warn!(
                 cgroup = %res.cgroup, name,
-                "memory.swap.max=0 on this cgroup; anon is unreclaimable, \
-                 flooring the soft cap to what file-page reclaim can satisfy"
+                "cannot read memory.current; refusing to cap"
             );
-        }
+            return Err(common::Error::Cgroup(
+                "cannot read memory.current; refusing to cap".into(),
+            ));
+        };
         // The kernel truncates `memory.high` writes to page multiples, so we
-        // must journal/write the value it will actually store — not the raw
-        // target — or `should_restore`'s string-equality check can never
-        // pass again and the cap becomes permanent (Task 6 review,
-        // Critical #1).
-        let our_bytes = page_align_down(
-            cap_target(
-                cgfs::anon_swap_bytes(&res.cgroup),
-                cgfs::current_bytes(&res.cgroup),
-                cgfs::file_bytes(&res.cgroup),
-                can_swap,
-            ),
-            page_size(),
-        );
+        // must journal/write the value it will actually store, not the raw
+        // target, or `should_restore`'s string-equality check can never
+        // pass again and the cap becomes permanent.
+        let our_bytes = page_align_down(target, page_size());
         // Plain decimal bytes, no separators/whitespace: this must be
         // exactly what a later `cgfs::read_high` (which only trims
-        // whitespace off the raw file contents) returns. `u64::to_string()`
-        // never inserts separators, so the round trip through `write_high`
-        // (writes verbatim) -> `read_high` (trims) is exact once the value
-        // is page-aligned. See `our_high_string_is_plain_decimal_no_separators`
-        // below, and `reconcile_our_high` for the belt-and-braces check.
+        // whitespace off the raw file contents) returns. See
+        // `our_high_string_is_plain_decimal_no_separators` below, and
+        // `reconcile_our_high` for the belt-and-braces check.
+        if !cap_tightens(prev_high.as_deref(), our_bytes) {
+            tracing::info!(
+                cgroup = %res.cgroup, name, prev_high = ?prev_high, our_bytes,
+                "existing memory.high already at or below the cap; not capping"
+            );
+            return Err(common::Error::Cgroup(
+                "existing memory.high already at or below the cap; refusing to cap".into(),
+            ));
+        }
         let our_high = our_bytes.to_string();
 
         let entry = JournalEntry {
@@ -241,26 +251,11 @@ impl<'a> Effector<'a> {
         };
         self.journal.append(&entry)?;
 
-        tracing::info!(cgroup = %res.cgroup, name, our_high = %our_high, "soft-capping cgroup");
-        let result = if res.mechanism == Mechanism::Unit {
-            match (&res.unit, self.systemd) {
-                (Some(unit), Some(systemd)) => {
-                    match systemd.set_memory_high(unit, our_bytes, DBUS_TIMEOUT) {
-                        Ok(()) => Ok(()),
-                        Err(e) => {
-                            tracing::warn!(
-                                cgroup = %res.cgroup, unit, error = %e,
-                                "SetUnitProperties(MemoryHigh) failed; falling back to raw memory.high write"
-                            );
-                            cgfs::write_high(&res.cgroup, &our_high)
-                        }
-                    }
-                }
-                _ => cgfs::write_high(&res.cgroup, &our_high),
-            }
-        } else {
-            cgfs::write_high(&res.cgroup, &our_high)
-        };
+        tracing::info!(
+            cgroup = %res.cgroup, name, our_high = %our_high, anon_reclaimable = anon_ok,
+            "soft-capping cgroup"
+        );
+        let result = cgfs::write_high(&res.cgroup, &our_high);
 
         if result.is_ok() {
             self.reconcile_our_high(&entry);
@@ -270,8 +265,7 @@ impl<'a> Effector<'a> {
 
     /// After a successful `Cap` write, read `memory.high` back; if what's
     /// actually on disk differs from what we journaled (page truncation we
-    /// didn't fully pre-empt, or a systemd-side reformat via the D-Bus
-    /// path), correct the journal to match reality — otherwise
+    /// didn't fully pre-empt), correct the journal to match reality. Otherwise
     /// `should_restore`'s string-equality check can never pass again and
     /// the cap becomes permanent (Task 6 review, Critical #1). Rebuilds
     /// only this cgroup's entries, preserving any others that might coexist
@@ -355,12 +349,28 @@ impl<'a> Effector<'a> {
         for e in self.journal.entries() {
             by_cgroup.entry(e.cgroup.clone()).or_default().push(e);
         }
+        // Pass 1: every raw thaw and memory.high restore, then clear the
+        // journal. No D-Bus call happens before this is done, so a slow
+        // session bus cannot push the undo past systemd's stop timeout.
         for (cgroup, entries) in &by_cgroup {
-            let unit = entries.last().and_then(|e| e.unit.clone());
-            let _ = self.thaw_raw(cgroup, unit.as_deref());
+            if let Err(e) = cgfs::write_freeze(cgroup, false) {
+                tracing::debug!(cgroup, error = %e, "raw thaw failed (cgroup may already be gone)");
+            }
             self.restore_high_if_any(cgroup, entries);
         }
-        self.journal.clear()
+        let cleared = self.journal.clear();
+        // Pass 2, best effort: tell systemd so its view of the units
+        // matches the kernel's. The processes already run again.
+        if let Some(systemd) = self.systemd {
+            for (cgroup, entries) in &by_cgroup {
+                if let Some(unit) = entries.last().and_then(|e| e.unit.as_deref()) {
+                    if let Err(e) = systemd.thaw_unit(unit, DBUS_TIMEOUT) {
+                        tracing::debug!(cgroup, unit, error = %e, "ThawUnit failed after raw thaw");
+                    }
+                }
+            }
+        }
+        cleared
     }
 
     /// Restore `memory.high` for one cgroup's journal `entries` (oldest-first),
@@ -376,33 +386,14 @@ impl<'a> Effector<'a> {
     /// the oldest entry's `our_high` never matches what a later Cap actually
     /// wrote. Judging liveness against `entries.last()` has the same failure
     /// for a `[Cap, Freeze]` chain (Promoted Minor B): the newest entry is
-    /// the `Freeze`, which has no `memory.high` of its own. Clears systemd's
-    /// runtime `MemoryHigh` property *before* raw-writing `prev_high` back —
-    /// the other order lets systemd's own `"max"` write clobber the value we
-    /// just restored (Critical #2, Task 6 review).
+    /// the `Freeze`, which has no `memory.high` of its own. The restore is a
+    /// raw `memory.high` write only; systemd's `MemoryHigh` property is never
+    /// touched (see module docs).
     fn restore_high_if_any(&self, cgroup: &str, entries: &[JournalEntry]) {
         let inode = cgfs::dir_inode(cgroup);
         let high = cgfs::read_high(cgroup);
         match restore_decision(entries, inode, high.as_deref()) {
             RestoreStep::ThawAndRestoreHigh { to } => {
-                // Clear systemd's runtime MemoryHigh property against the
-                // NEWEST Cap's unit — that's the entry whose write is
-                // actually live on disk right now (see `restore_decision`).
-                let unit = entries
-                    .iter()
-                    .rev()
-                    .find(|e| e.action == JournalAction::Cap)
-                    .and_then(|e| e.unit.as_deref());
-                if let Some(unit) = unit {
-                    if let Some(systemd) = self.systemd {
-                        if let Err(err) = systemd.set_memory_high(unit, u64::MAX, DBUS_TIMEOUT) {
-                            tracing::debug!(
-                                cgroup, unit, error = %err,
-                                "clearing systemd MemoryHigh runtime property failed"
-                            );
-                        }
-                    }
-                }
                 if let Err(err) = cgfs::write_high(cgroup, &to) {
                     tracing::warn!(cgroup, error = %err, "failed to restore memory.high");
                 }
@@ -421,19 +412,20 @@ impl<'a> Effector<'a> {
         }
     }
 
-    /// Mechanism-independent thaw: best-effort `ThawUnit` first (if we have a
-    /// unit and a bus), then an *unconditional* raw `cgroup.freeze` write —
-    /// this always runs, regardless of mechanism or whether `ThawUnit`
-    /// succeeded, so a cgroup is never left frozen. Tolerates a missing
-    /// cgroup: the raw write then simply returns `Err`, which every caller
-    /// here treats as non-fatal.
+    /// Mechanism-independent thaw: an *unconditional* raw `cgroup.freeze`
+    /// write first, so a cgroup is never left frozen and a slow bus cannot
+    /// delay it, then a best-effort `ThawUnit` (if we have a unit and a bus)
+    /// so systemd's view of the unit matches. Tolerates a missing cgroup:
+    /// the raw write then simply returns `Err`, which every caller here
+    /// treats as non-fatal.
     fn thaw_raw(&self, cgroup: &str, unit: Option<&str>) -> Result<()> {
+        let result = cgfs::write_freeze(cgroup, false);
         if let (Some(unit), Some(systemd)) = (unit, self.systemd) {
             if let Err(e) = systemd.thaw_unit(unit, DBUS_TIMEOUT) {
-                tracing::debug!(cgroup, unit, error = %e, "ThawUnit failed; raw thaw still runs");
+                tracing::debug!(cgroup, unit, error = %e, "ThawUnit failed after raw thaw");
             }
         }
-        cgfs::write_freeze(cgroup, false)
+        result
     }
 }
 
@@ -469,54 +461,33 @@ pub fn restore_step(e: &JournalEntry, inode: Option<u64>, high: Option<&str>) ->
     }
 }
 
-/// Pure helper: 90% of a cgroup's anon+swap usage, clamped to a
-/// [`MIN_CAP_BYTES`] floor, falling back to the floor entirely when the
-/// usage couldn't be read. `anon+swap` is the cgroup-level equivalent of a
-/// single process's RSS+swap used by the old pid-based cap; sourcing it from
-/// the whole cgroup (not one process) is correct now that we cap in place.
-pub fn cap_from_anon(anon_swap: Option<u64>) -> u64 {
-    anon_swap
-        .map(|b| (b / 10 * 9).max(MIN_CAP_BYTES))
-        .unwrap_or(MIN_CAP_BYTES)
+/// Size a soft cap that slows an app down without stalling it.
+///
+/// memory.high applies to everything charged to the cgroup, page cache
+/// included, so the cap is sized from memory.current: it never asks the
+/// kernel to reclaim more than 10% of it. When anon memory cannot go to swap,
+/// only file pages can be reclaimed, so the cap never asks for more than 80%
+/// of them. Returns `None` when memory.current is unreadable: no cap is safer
+/// than a guessed one.
+pub fn cap_target(current: Option<u64>, file: Option<u64>, anon_reclaimable: bool) -> Option<u64> {
+    let current = current?;
+    let mut target = current / 10 * 9;
+    if !anon_reclaimable {
+        let file_floor = current.saturating_sub(file.unwrap_or(0).saturating_mul(8) / 10);
+        target = target.max(file_floor);
+    }
+    Some(target.max(MIN_CAP_BYTES))
 }
 
-/// Size a soft cap so the reduction it demands is actually achievable.
-///
-/// With swap, anon is reclaimable and 90% of anon+swap is the right target.
-/// Without swap (rlm sets memory.swap.max=0 on cgroups it creates), ONLY file
-/// pages can be freed, so an anon-derived target can demand a reduction the
-/// kernel cannot satisfy — memory.high then throttles the allocator in the
-/// reclaim path indefinitely. memory.high never OOM-kills; it stalls. So when
-/// anon cannot be reclaimed, floor the cap so file reclaim alone can satisfy
-/// it, keeping the cap soft at the cost of applying less pressure.
-///
-/// `can_swap` selects the branch: `true` reproduces [`cap_from_anon`]'s
-/// figure exactly (the swap-capable case is unchanged). `false` raises that
-/// figure to at least `current - 80% of file` — i.e. never demands more than
-/// roughly 80% of file-backed pages be reclaimed — then still applies the
-/// [`MIN_CAP_BYTES`] floor. If `current` or `file` can't be read, this falls
-/// back to today's anon-derived behaviour and logs a warning, rather than
-/// guessing.
-pub fn cap_target(
-    anon_swap: Option<u64>,
-    current: Option<u64>,
-    file: Option<u64>,
-    can_swap: bool,
-) -> u64 {
-    let anon_target = cap_from_anon(anon_swap);
-    if can_swap {
-        return anon_target;
+/// Pure: whether writing `target` would tighten the existing `memory.high`.
+/// A numeric `prev_high` at or below `target` means the cap would loosen (or
+/// not change) the limit already in place, so the caller must not write it.
+/// `"max"`, or anything else that is not a byte count, is no limit at all.
+pub fn cap_tightens(prev_high: Option<&str>, target: u64) -> bool {
+    match prev_high.and_then(|s| s.trim().parse::<u64>().ok()) {
+        Some(prev) => prev > target,
+        None => true,
     }
-    let (Some(current), Some(file)) = (current, file) else {
-        tracing::warn!(
-            "cannot read memory.current/memory.stat file for no-swap cap sizing; \
-             falling back to the anon-derived target"
-        );
-        return anon_target;
-    };
-    // Never demand more than ~80% of file pages be reclaimed.
-    let file_reclaim_floor = current.saturating_sub(file.saturating_mul(8) / 10);
-    anon_target.max(file_reclaim_floor).max(MIN_CAP_BYTES)
 }
 
 /// Pure: the full restore decision for one cgroup's journal `entries`
@@ -631,84 +602,68 @@ mod tests {
     use super::super::resolve::{Coverage, Verdict};
     use super::*;
 
-    #[test]
-    fn cap_from_anon_sizes_and_floors() {
-        assert_eq!(cap_from_anon(Some(1_000_000_000)), 900_000_000);
-        assert_eq!(cap_from_anon(Some(1_000_000)), MIN_CAP_BYTES);
-        assert_eq!(cap_from_anon(None), MIN_CAP_BYTES);
-    }
+    const MIB: u64 = 1024 * 1024;
+    const GIB: u64 = 1024 * MIB;
 
-    /// Swap-capable cgroups (the common case: systemd unit scopes) must get
-    /// exactly `cap_from_anon`'s figure — this fix must not change behaviour
-    /// when anon is actually reclaimable.
     #[test]
-    fn cap_target_swap_capable_matches_cap_from_anon() {
-        let anon_swap = Some(1_000_000_000);
-        let current = Some(2_000_000_000);
-        let file = Some(1_000_000_000);
-        assert_eq!(
-            cap_target(anon_swap, current, file, true),
-            cap_from_anon(anon_swap)
-        );
-    }
-
-    /// No-swap (rlm-managed cgroup, memory.swap.max=0) with plenty of file
-    /// cache: the anon-derived target would demand an unreclaimable
-    /// reduction, so the cap must be raised above the anon figure to at most
-    /// what file reclaim can actually satisfy (current - 80% of file).
-    #[test]
-    fn cap_target_no_swap_with_file_raises_above_anon_target() {
-        // anon+swap = 1_000_000_000 -> anon_target = 900_000_000.
-        // current = 3_000_000_000, file = 2_000_000_000 (mostly cache).
-        // file_reclaim_floor = 3_000_000_000 - 2_000_000_000*0.8 = 1_400_000_000.
-        let anon_swap = Some(1_000_000_000);
-        let current = Some(3_000_000_000);
-        let file = Some(2_000_000_000);
-        let target = cap_target(anon_swap, current, file, false);
+    fn cap_never_demands_more_than_ten_percent_of_current() {
+        // Incident: Chrome scope with 1.5 GiB charged, mostly page cache, ~150 MiB anon.
+        let current = GIB * 3 / 2;
+        let cap = cap_target(Some(current), Some(GIB * 135 / 100), true).unwrap();
         assert!(
-            target > cap_from_anon(anon_swap),
-            "no-swap target ({target}) must be raised above the anon-derived figure"
-        );
-        assert_eq!(target, 1_400_000_000);
-    }
-
-    /// No-swap with almost no file cache to reclaim from (an anon-heavy
-    /// workload): the target must collapse to ~`current` (demanding no
-    /// reduction) rather than the unsatisfiable anon-derived figure — a soft
-    /// cap that can't be met just stalls the allocator forever.
-    #[test]
-    fn cap_target_no_swap_with_no_file_collapses_to_current() {
-        let current = Some(1_073_741_824);
-        let anon_swap = Some(1_073_741_824); // all anon, no file at all
-        let file = Some(0);
-        assert_eq!(cap_target(anon_swap, current, file, false), 1_073_741_824);
-    }
-
-    /// Unreadable `current`/`file` must fall back to today's anon-derived
-    /// behaviour rather than panicking or guessing.
-    #[test]
-    fn cap_target_falls_back_when_current_or_file_unreadable() {
-        let anon_swap = Some(1_000_000_000);
-        assert_eq!(
-            cap_target(anon_swap, None, Some(1_000_000_000), false),
-            cap_from_anon(anon_swap)
-        );
-        assert_eq!(
-            cap_target(anon_swap, Some(1_000_000_000), None, false),
-            cap_from_anon(anon_swap)
-        );
-        assert_eq!(
-            cap_target(anon_swap, None, None, false),
-            cap_from_anon(anon_swap)
+            cap >= current / 10 * 9,
+            "cap {cap} is below 90% of {current}"
         );
     }
 
-    /// The MIN_CAP_BYTES floor still applies in the no-swap branch even when
-    /// both the anon-derived figure and the file-reclaim floor are tiny.
     #[test]
-    fn cap_target_no_swap_still_respects_min_cap_floor() {
-        let target = cap_target(Some(1_000), Some(2_000), Some(1_000), false);
-        assert_eq!(target, MIN_CAP_BYTES);
+    fn swapless_cap_only_asks_for_reclaimable_file_pages() {
+        assert_eq!(
+            cap_target(Some(GIB), Some(0), false),
+            Some(GIB),
+            "nothing reclaimable: demand nothing"
+        );
+        assert_eq!(
+            cap_target(Some(GIB), Some(512 * MIB), false),
+            Some(GIB / 10 * 9)
+        );
+        assert_eq!(
+            cap_target(Some(GIB), None, false),
+            Some(GIB),
+            "unknown file size: demand nothing"
+        );
+    }
+
+    #[test]
+    fn cap_has_a_256_mib_floor() {
+        assert_eq!(
+            cap_target(Some(100 * MIB), Some(0), true),
+            Some(MIN_CAP_BYTES)
+        );
+    }
+
+    #[test]
+    fn cap_never_loosens_an_existing_memory_high() {
+        let floor = cap_target(Some(100 * MIB), Some(0), true).unwrap();
+        assert_eq!(floor, MIN_CAP_BYTES);
+        let prev = (200 * MIB).to_string();
+        assert!(
+            !cap_tightens(Some(&prev), floor),
+            "200 MiB unit limit must not be raised to the 256 MiB floor"
+        );
+        assert!(
+            !cap_tightens(Some(&floor.to_string()), floor),
+            "equal: no-op"
+        );
+        assert!(cap_tightens(Some("max"), floor));
+        assert!(cap_tightens(None, floor));
+        let prev = (2 * GIB).to_string();
+        assert!(cap_tightens(Some(&prev), GIB));
+    }
+
+    #[test]
+    fn unreadable_current_refuses_to_cap() {
+        assert_eq!(cap_target(None, Some(1), true), None);
     }
 
     /// Carry-forward (Task 3 review): `our_high` must be a plain decimal
@@ -716,7 +671,7 @@ mod tests {
     /// it by string equality against `cgfs::read_high` (which only trims).
     #[test]
     fn our_high_string_is_plain_decimal_no_separators() {
-        let bytes = cap_from_anon(Some(12_345_678_900));
+        let bytes = cap_target(Some(12_345_678_900), None, true).unwrap();
         let s = bytes.to_string();
         assert!(
             s.chars().all(|c| c.is_ascii_digit()),
@@ -912,7 +867,8 @@ mod tests {
 
         let abs_path = manager
             .prepare_cgroup("test-freeze-thaw", &Limit::default())
-            .expect("create test cgroup");
+            .expect("create test cgroup")
+            .path;
         let cgroup = format!(
             "/{}",
             abs_path
@@ -1049,10 +1005,10 @@ mod tests {
     /// Regression test for Task 6 review Critical #1: cap a real cgroup and
     /// assert `cgfs::read_high` matches the journaled `our_high` exactly —
     /// i.e. the value we wrote never got silently page-truncated out from
-    /// under the journal. The target process holds a chunk of random anon
-    /// memory so 90% of its usage is very unlikely to already sit on a page
-    /// boundary (MIN_CAP_BYTES, a round power of two, would pass even
-    /// without the fix, which would prove nothing). Requires cgroup v2
+    /// under the journal. The target process holds enough random anon
+    /// memory (well above the 256 MiB `MIN_CAP_BYTES` floor, a round power
+    /// of two that would pass even without the fix and prove nothing) that
+    /// the sized cap is very unlikely to already sit on a page boundary. Requires cgroup v2
     /// delegation, so it's `#[ignore]`d.
     #[test]
     #[ignore = "requires cgroup v2 delegation; run manually"]
@@ -1068,7 +1024,8 @@ mod tests {
 
         let abs_path = manager
             .prepare_cgroup("test-cap-align", &Limit::default())
-            .expect("create test cgroup");
+            .expect("create test cgroup")
+            .path;
         let cgroup = format!(
             "/{}",
             abs_path
@@ -1077,19 +1034,34 @@ mod tests {
                 .display()
         );
 
-        // Hold ~150MB of anon memory whose 90% is very unlikely to land on
-        // a page boundary, then sleep.
+        // Hold ~400MB of anon memory (above the 256 MiB floor) whose sized
+        // cap is very unlikely to land on a page boundary, then sleep.
         let mut child = Command::new("bash")
             .arg("-c")
-            .arg("a=$(head -c 150000000 /dev/urandom | base64 -w0); sleep 30")
+            .arg("a=$(head -c 300000000 /dev/urandom | base64 -w0); sleep 30")
             .spawn()
             .expect("spawn memory-holding process");
         let pid = child.id();
         manager
             .add_to_cgroup(&abs_path, pid)
             .expect("add process to test cgroup");
-        // Give the shell time to actually build up the anon allocation.
-        std::thread::sleep(Duration::from_millis(800));
+        // Wait until the shell has actually built up the allocation, or the
+        // cap would sit on the 256 MiB floor and prove nothing.
+        let want = 300 * 1024 * 1024;
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let cur = cgfs::current_bytes(&cgroup).unwrap_or(0);
+            if cur >= want {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = manager.cleanup_cgroup("test-cap-align");
+                panic!("memory.current reached only {cur} bytes, need {want}, after 10s");
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
 
         let res = test_resolution(cgroup.clone());
         effector
@@ -1123,18 +1095,24 @@ mod tests {
         let _ = manager.cleanup_cgroup("test-cap-align");
     }
 
-    /// Regression test for Task 6 review Critical #2: a real systemd unit
-    /// with a genuine prior `MemoryHigh` (so `prev_high` isn't already
-    /// `"max"`, which would pass either ordering) is capped then
-    /// lift-capped through the `Unit` mechanism. Before the fix,
-    /// `set_memory_high(unit, u64::MAX)` ran *after* the raw restore write
-    /// and clobbered it back to `"max"`; after the fix (clear the systemd
-    /// property first, restore second) the original value survives.
+    /// Cap and lift go through raw `memory.high` writes only, so the unit's
+    /// own `MemoryHigh` property (as systemd reports it) must be the same
+    /// before the cap and after the lift, and the raw `memory.high` must be
+    /// back at its pre-cap value. A runtime `SetUnitProperties` would leave
+    /// a `/run` drop-in behind that changes the reported property.
     /// Requires a session bus and cgroup v2 delegation, so it's `#[ignore]`d.
     #[test]
     #[ignore = "requires a session bus and cgroup v2 delegation; run manually"]
-    fn lift_cap_restores_prev_high_not_clobbered_by_systemd_max() {
+    fn lift_cap_leaves_unit_memory_high_property_untouched() {
         use std::process::Command;
+
+        let unit_memory_high = |unit: &str| -> String {
+            let out = Command::new("systemctl")
+                .args(["--user", "show", "-p", "MemoryHigh", "--value", unit])
+                .output()
+                .expect("systemctl --user show");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
 
         let uid_out = Command::new("id").arg("-u").output().expect("id -u");
         let uid: u32 = String::from_utf8_lossy(&uid_out.stdout)
@@ -1178,6 +1156,7 @@ mod tests {
             original_high, "max",
             "test needs a concrete prior MemoryHigh to distinguish from systemd's clear-to-max"
         );
+        let property_before = unit_memory_high(&unit);
 
         let res = Resolution {
             cgroup: cgroup.clone(),
@@ -1201,10 +1180,14 @@ mod tests {
 
         effector.apply(&Action::LiftCap { res }).expect("lift cap");
         assert_eq!(
+            unit_memory_high(&unit),
+            property_before,
+            "cap/lift must not change the unit's MemoryHigh property"
+        );
+        assert_eq!(
             cgfs::read_high(&cgroup),
             Some(original_high),
-            "lift must restore the true prior value, not be clobbered back to \"max\" \
-             by a systemd MemoryHigh clear that ran after the raw restore write"
+            "lift must restore the raw pre-cap memory.high"
         );
         assert!(
             journal.entries().is_empty(),
@@ -1241,7 +1224,8 @@ mod tests {
 
         let abs_path = manager
             .prepare_cgroup("test-chain-restore", &Limit::default())
-            .expect("create test cgroup");
+            .expect("create test cgroup")
+            .path;
         let cgroup = format!(
             "/{}",
             abs_path

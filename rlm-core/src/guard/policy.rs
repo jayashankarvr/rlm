@@ -1,16 +1,16 @@
 //! Pure policy state machine — the self-healing circuit breaker at the heart of
 //! the freeze guard.
 //!
-//! Contract: [`PolicyEngine::tick`] is pure given `(now_ms, sample, procs,
+//! Contract: [`PolicyEngine::tick`] is pure given `(now_ms, sample, targets,
 //! live_cgroups)` plus the engine's own internal state. It performs **no**
 //! syscalls and reads **no** clock — `now_ms` (monotonic milliseconds) is
 //! injected by the caller. That is what makes the whole escalation/recovery
 //! ladder unit-testable without root.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use super::resolve::{Coverage, Resolution, Verdict};
-use super::types::{Action, Intervention, Level, ProcInfo, Sample};
+use super::types::{Action, Intervention, Level, Sample, Target};
 use common::GuardConfig;
 
 /// PSI `full` avg10 (%) that, on its own, forces at least the High level. Mirrors
@@ -19,34 +19,68 @@ const FULL_HIGH_RISE: f64 = 3.0;
 /// Rate-limit window for `Notify` actions (ms): at most one notification a minute.
 const NOTIFY_INTERVAL_MS: u64 = 60_000;
 
+/// Escalation gate (ms) after an action that only partly covered its app.
+/// PSI avg10 is a 10 s average, so re-measuring after 1 s still sees the old
+/// pressure; waiting at least this long stops a partial action from
+/// cascading into several more within seconds.
+pub const PARTIAL_GATE_MS: u64 = 3_000;
+/// Most apps the guard holds (frozen or capped) at the same time.
+pub const MAX_HELD_APPS: usize = 3;
+/// Growth rate (bytes/s of `memory.current`) an app must reach to be picked
+/// as the one causing pressure. Below it, the largest app is picked instead.
+pub const MIN_GROWTH_BPS: f64 = 1_048_576.0;
+
+/// True when the host is actually short of memory: below the hard floor, or
+/// below `act_below_available_pct` percent of RAM. A stall confined to one
+/// cgroup's memory.max leaves MemAvailable high, so it never passes this gate.
+pub fn is_scarce(s: &Sample, t: &common::GuardTrigger) -> bool {
+    s.mem_available_mb < t.mem_available_floor_mb
+        || (s.mem_total_mb > 0
+            && s.mem_available_mb.saturating_mul(100)
+                < s.mem_total_mb.saturating_mul(t.act_below_available_pct))
+}
+
+/// Smoothed `memory.current` growth for one cgroup.
+struct Growth {
+    last_bytes: u64,
+    last_ms: u64,
+    /// EWMA of bytes per second (negative while shrinking).
+    rate_bps: f64,
+    /// True once a second sample has been seen, so `rate_bps` is a measured
+    /// rate and not the zero placeholder of a first sighting.
+    warm: bool,
+}
+
 /// Self-healing circuit-breaker policy engine.
 ///
 /// On a memory spike it drives the ladder *notify -> freeze (short) -> auto-thaw
 /// -> still high? soft-cap -> calm sustained -> lift*, never issuing a kill. All
 /// of that lives in [`tick`](Self::tick); the struct just holds the state needed
-/// to make decisions stable across ticks (hysteresis + cooldowns).
+/// to make decisions stable across ticks (hysteresis, cooldowns, growth).
+///
+/// The unit of choice is an app: every cgroup of the chosen app is frozen or
+/// capped together as one escalation step.
 pub struct PolicyEngine {
     cfg: GuardConfig,
     /// Current pressure level (carried across ticks so hysteresis works).
     level: Level,
-    /// Active interventions keyed by resolved cgroup path. The [`Resolution`]
-    /// is retained alongside the intervention so recovery/prune actions
-    /// (`Thaw`/`LiftCap`) can be built without re-resolving.
-    interventions: HashMap<String, (Intervention, Resolution)>,
-    /// Last time each cgroup was frozen — drives the per-cgroup freeze
-    /// cooldown that decides freeze-vs-cap, and is intentionally kept after a
-    /// thaw.
+    /// Active interventions keyed by resolved cgroup path, with the
+    /// [`Resolution`] (so `Thaw`/`LiftCap` can be built without re-resolving)
+    /// and the app the cgroup was acted on as.
+    interventions: HashMap<String, (Intervention, Resolution, String)>,
+    /// Last time each app was frozen. Drives the per-app freeze cooldown that
+    /// decides freeze-vs-cap, and is intentionally kept after a thaw.
     last_freeze_ms: HashMap<String, u64>,
+    /// Per-cgroup `memory.current` growth estimate.
+    growth: HashMap<String, Growth>,
     /// When the level last became `Calm` (None while not calm). Gates cap lifts.
     calm_since_ms: Option<u64>,
     /// When we last emitted a new freeze/cap — the global escalation gate.
     /// `None` means "never acted", so the gate is open on the first action.
     last_action_ms: Option<u64>,
-    /// Whether the most recent escalation action acted under
-    /// `Coverage::Partial`. When true, the escalation gate is reopened
-    /// immediately on the next tick instead of waiting a full freeze-hold —
-    /// partial coverage means the intervention didn't fully contain the hog,
-    /// so we must be able to re-assess right away.
+    /// Whether the most recent escalation acted under `Coverage::Partial`.
+    /// When true the gate is shortened to [`PARTIAL_GATE_MS`] (capped at the
+    /// freeze hold) so the guard can re-assess sooner, but never instantly.
     last_action_partial: bool,
     /// When we last emitted a `Notify` — drives notification rate-limiting.
     /// `None` means "never notified", so the first eligible notify fires.
@@ -60,6 +94,7 @@ impl PolicyEngine {
             level: Level::Calm,
             interventions: HashMap::new(),
             last_freeze_ms: HashMap::new(),
+            growth: HashMap::new(),
             calm_since_ms: None,
             last_action_ms: None,
             last_action_partial: false,
@@ -69,24 +104,26 @@ impl PolicyEngine {
 
     /// Advance the state machine one tick and return the actions to apply.
     ///
-    /// `live_cgroups` is the set of cgroups the Sampler currently resolves
-    /// for *any* of the user's real processes, with no min-RSS or protect
-    /// filtering applied (see `Sampler::live_cgroups`) — it is deliberately
-    /// a superset of `procs`' own resolutions. Pruning (step 3) checks
-    /// liveness against this set, not against `procs`: a successful `Cap`
-    /// sizes off anon+swap but `memory.high` also bounds file-backed pages,
-    /// so capping a mapped-file-heavy process can push its `rss_kb` below
-    /// the min-RSS floor on the very next tick, dropping it out of `procs`
-    /// even though the cgroup is very much still alive. Pruning against
-    /// `procs` there would lift the cap while pressure is still Critical and
-    /// immediately re-trigger it — a ~5s cap/lift/re-cap oscillation. Victim
-    /// *selection* (step 5) deliberately keeps using the filtered `procs`.
+    /// `targets` are the cgroups eligible for action this tick (already
+    /// filtered for uid, protect list and min RSS by the Sampler).
+    ///
+    /// `live_cgroups` is the subset of the engine's intervened cgroups that
+    /// still hold a process (see `sampler::live_cgroups`), with no min-RSS
+    /// or protect filtering applied; it is deliberately independent of
+    /// `targets`. Pruning checks liveness against
+    /// this set, not against `targets`: `memory.high` also bounds
+    /// file-backed pages, so capping
+    /// a mapped-file-heavy process can push its `rss_kb` below the min-RSS
+    /// floor on the very next tick, dropping it out of `targets` even though
+    /// the cgroup is very much still alive. Pruning against `targets` there
+    /// would lift the cap while pressure is still Critical and immediately
+    /// re-trigger it. Victim *selection* deliberately keeps using `targets`.
     pub fn tick(
         &mut self,
         now_ms: u64,
         sample: Sample,
-        procs: &[ProcInfo],
-        live_cgroups: &std::collections::HashSet<String>,
+        targets: &[Target],
+        live_cgroups: &HashSet<String>,
     ) -> Vec<Action> {
         // 1. Disabled guard is inert.
         if !self.cfg.enabled {
@@ -107,7 +144,10 @@ impl PolicyEngine {
             _ => self.calm_since_ms = None,
         }
 
-        // 3. Prune interventions whose cgroup is no longer live (see
+        // 3. Track memory.current growth per cgroup.
+        self.update_growth(now_ms, targets);
+
+        // 4. Prune interventions whose cgroup is no longer live (see
         //    `live_cgroups` doc above). LiftCap doubles as "tear down the
         //    cap", so it's the right cleanup for both frozen and capped dead
         //    cgroups; the effector's LiftCap tolerates a missing cgroup.
@@ -118,24 +158,24 @@ impl PolicyEngine {
             .cloned()
             .collect();
         for cg in dead {
-            let (_, res) = self.interventions.remove(&cg).expect("just found key");
+            let (_, res, _) = self.interventions.remove(&cg).expect("just found key");
             actions.push(Action::LiftCap { res });
         }
 
-        // 4. Recover: auto-thaw held freezes, and lift caps once calm has held.
+        // 5. Recover: auto-thaw held freezes, and lift caps once calm has held.
         let freeze_hold_ms = self.cfg.timing.freeze_hold_secs * 1000;
         let calm_hold_ms = self.cfg.timing.calm_hold_secs * 1000;
         let mut recovered = Vec::new();
-        // Cgroups thawed on this tick must not be re-targeted by escalation in
-        // the same tick — they need a re-measure first.
-        let mut thawed_now: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for (cg, (intervention, res)) in &self.interventions {
+        // Apps thawed on this tick must not be re-targeted by escalation in
+        // the same tick; they need a re-measure first.
+        let mut thawed_apps: HashSet<String> = HashSet::new();
+        for (cg, (intervention, res, app)) in &self.interventions {
             match *intervention {
                 Intervention::Frozen { since_ms } => {
                     if now_ms.saturating_sub(since_ms) >= freeze_hold_ms {
                         actions.push(Action::Thaw { res: res.clone() });
                         recovered.push(cg.clone());
-                        thawed_now.insert(cg.clone());
+                        thawed_apps.insert(app.clone());
                     }
                 }
                 Intervention::Capped { .. } => {
@@ -158,16 +198,19 @@ impl PolicyEngine {
             self.interventions.remove(&cg);
         }
 
-        // 5. Escalate, but only when pressure actually warrants action.
+        // 6. Escalate, but only when apps feel pressure, memory is actually
+        //    short (see `is_scarce`), the gate is open, and fewer than
+        //    MAX_HELD_APPS apps are already held.
         let mut victim_name: Option<String> = None;
-        if matches!(self.level, Level::High | Level::Critical) {
-            // Global gate: after acting on one hog, wait a freeze-hold before
-            // acting again so we re-measure instead of cascading freezes —
-            // *unless* the last action only achieved partial coverage (a
-            // protected process shared the cgroup), in which case the gate
-            // reopens immediately so we can re-assess right away.
+        if matches!(self.level, Level::High | Level::Critical)
+            && is_scarce(&sample, &self.cfg.trigger)
+            && self.held_apps().len() < MAX_HELD_APPS
+        {
+            // Global gate: after acting on one app, wait a freeze-hold before
+            // acting again so we re-measure instead of cascading. After a
+            // partial action wait a shorter, but never zero, interval.
             let gate_ms = if self.last_action_partial {
-                0
+                PARTIAL_GATE_MS.min(freeze_hold_ms)
             } else {
                 freeze_hold_ms
             };
@@ -176,59 +219,51 @@ impl PolicyEngine {
                 Some(last) => now_ms.saturating_sub(last) >= gate_ms,
             };
             if gate_open {
-                if let Some(victim) = self.select_victim(procs, &thawed_now) {
-                    let res = victim
-                        .resolution
-                        .clone()
-                        .expect("select_victim only returns resolved procs");
+                if let Some((app, members)) = self.select_app(targets, &thawed_apps) {
+                    let cap_only = members
+                        .iter()
+                        .any(|m| m.resolution.verdict == Verdict::CapOnly);
+                    let partial = members
+                        .iter()
+                        .any(|m| m.resolution.coverage == Coverage::Partial);
+                    let cooldown_ms = self.cfg.timing.freeze_cooldown_secs * 1000;
+                    let in_cooldown = self
+                        .last_freeze_ms
+                        .get(&app)
+                        .is_some_and(|&last| now_ms.saturating_sub(last) < cooldown_ms);
+                    // CapOnly never freezes; a recently frozen app that is
+                    // still hot escalates to a soft cap.
+                    let freeze = !cap_only && !in_cooldown;
 
-                    if res.verdict == Verdict::CapOnly {
-                        // CapOnly verdicts never freeze, regardless of cooldown.
-                        actions.push(Action::Cap {
-                            res: res.clone(),
-                            name: victim.name.clone(),
-                        });
-                        self.interventions.insert(
-                            res.cgroup.clone(),
-                            (Intervention::Capped { since_ms: now_ms }, res.clone()),
-                        );
-                    } else {
-                        let cooldown_ms = self.cfg.timing.freeze_cooldown_secs * 1000;
-                        let in_cooldown = self
-                            .last_freeze_ms
-                            .get(&res.cgroup)
-                            .is_some_and(|&last| now_ms.saturating_sub(last) < cooldown_ms);
-
-                        if in_cooldown {
-                            // Recently frozen and still hot -> escalate to a soft cap.
-                            actions.push(Action::Cap {
-                                res: res.clone(),
-                                name: victim.name.clone(),
-                            });
-                            self.interventions.insert(
-                                res.cgroup.clone(),
-                                (Intervention::Capped { since_ms: now_ms }, res.clone()),
-                            );
-                        } else {
+                    for m in members {
+                        let res = m.resolution.clone();
+                        let intervention = if freeze {
                             actions.push(Action::Freeze {
                                 res: res.clone(),
-                                name: victim.name.clone(),
+                                name: app.clone(),
                             });
-                            self.interventions.insert(
-                                res.cgroup.clone(),
-                                (Intervention::Frozen { since_ms: now_ms }, res.clone()),
-                            );
-                            self.last_freeze_ms.insert(res.cgroup.clone(), now_ms);
-                        }
+                            Intervention::Frozen { since_ms: now_ms }
+                        } else {
+                            actions.push(Action::Cap {
+                                res: res.clone(),
+                                name: app.clone(),
+                            });
+                            Intervention::Capped { since_ms: now_ms }
+                        };
+                        self.interventions
+                            .insert(res.cgroup.clone(), (intervention, res, app.clone()));
+                    }
+                    if freeze {
+                        self.last_freeze_ms.insert(app.clone(), now_ms);
                     }
                     self.last_action_ms = Some(now_ms);
-                    self.last_action_partial = res.coverage == Coverage::Partial;
-                    victim_name = Some(victim.name.clone());
+                    self.last_action_partial = partial;
+                    victim_name = Some(app);
                 }
             }
         }
 
-        // 6. Notify (rate-limited) while there's anything to report.
+        // 7. Notify (rate-limited) while there's anything to report.
         let notify_due = match self.last_notify_ms {
             None => true,
             Some(last) => now_ms.saturating_sub(last) >= NOTIFY_INTERVAL_MS,
@@ -239,7 +274,7 @@ impl PolicyEngine {
         {
             let message = match &victim_name {
                 Some(name) => format!(
-                    "rlm-guard: memory pressure {:?} — acting on {}",
+                    "rlm-guard: memory pressure {:?}, acting on {}",
                     self.level, name
                 ),
                 None => format!("rlm-guard: memory pressure {:?}", self.level),
@@ -251,13 +286,28 @@ impl PolicyEngine {
         actions
     }
 
+    /// True when the caller should gather targets for the next tick: the
+    /// level would be above Calm, or memory is already scarce. Scanning while
+    /// scarce keeps growth rates warm, so a sudden drop below the floor can
+    /// pick the app that is growing instead of the largest one. A disabled
+    /// engine never wants them.
+    pub fn wants_candidates(&self, sample: Sample) -> bool {
+        self.cfg.enabled
+            && (self.next_level(sample) != Level::Calm || is_scarce(&sample, &self.cfg.trigger))
+    }
+
+    /// The pressure level as of the last tick.
+    pub fn level(&self) -> Level {
+        self.level
+    }
+
     /// Currently active interventions (cgroup path -> intervention), sorted by
     /// cgroup path so callers get a deterministic order.
     pub fn interventions(&self) -> Vec<(String, Intervention)> {
         let mut out: Vec<(String, Intervention)> = self
             .interventions
             .iter()
-            .map(|(cg, (iv, _res))| (cg.clone(), *iv))
+            .map(|(cg, (iv, _, _))| (cg.clone(), *iv))
             .collect();
         out.sort_by(|(a, _), (b, _)| a.cmp(b));
         out
@@ -273,6 +323,14 @@ impl PolicyEngine {
     /// for the rest of the pressure episode.
     pub fn intervened_cgroups(&self) -> Vec<String> {
         self.interventions.keys().cloned().collect()
+    }
+
+    /// Distinct apps with at least one active intervention.
+    fn held_apps(&self) -> HashSet<&str> {
+        self.interventions
+            .values()
+            .map(|(_, _, app)| app.as_str())
+            .collect()
     }
 
     /// Compute the next level from the current level + a fresh sample, applying
@@ -312,37 +370,130 @@ impl PolicyEngine {
         }
     }
 
-    /// Pick the eligible victim: the largest-RSS process that is above the
-    /// min-RSS floor, actionable (resolved to a cgroup), and whose resolved
-    /// cgroup is not already under an intervention or just thawed this tick.
-    /// Protect-list and uid filtering happen upstream in the Sampler, so
-    /// anything resolved here is fair game. Two processes that resolve to the
-    /// same cgroup (e.g. a browser main process and its sandboxed children)
-    /// are naturally deduplicated: only one victim — and hence one action — is
-    /// produced per tick.
-    fn select_victim<'a>(
+    /// Update each target cgroup's `memory.current` growth rate (an EWMA
+    /// with weight 0.5 per tick) and forget cgroups no longer present.
+    fn update_growth(&mut self, now_ms: u64, targets: &[Target]) {
+        let mut seen = HashSet::new();
+        for t in targets {
+            let Some(cur) = t.current_bytes else {
+                continue;
+            };
+            let cg = &t.resolution.cgroup;
+            seen.insert(cg.clone());
+            match self.growth.get_mut(cg) {
+                Some(g) if now_ms > g.last_ms => {
+                    let dt = (now_ms - g.last_ms) as f64 / 1000.0;
+                    let inst = (cur as f64 - g.last_bytes as f64) / dt;
+                    g.rate_bps = 0.5 * g.rate_bps + 0.5 * inst;
+                    g.last_bytes = cur;
+                    g.last_ms = now_ms;
+                    g.warm = true;
+                }
+                Some(_) => {}
+                None => {
+                    self.growth.insert(
+                        cg.clone(),
+                        Growth {
+                            last_bytes: cur,
+                            last_ms: now_ms,
+                            rate_bps: 0.0,
+                            warm: false,
+                        },
+                    );
+                }
+            }
+        }
+        self.growth.retain(|cg, _| seen.contains(cg));
+    }
+
+    /// Pick the app to act on and its member targets. Eligible apps are not
+    /// held, not thawed this tick (`blocked`), have a member at or above the
+    /// min-RSS floor, and have no member cgroup under an intervention. The
+    /// app whose cgroups grow fastest wins when that growth is at least
+    /// [`MIN_GROWTH_BPS`]; otherwise the largest app. Ties go to the
+    /// lexicographically smaller app name, so the choice is deterministic.
+    ///
+    /// Cold start: when no eligible cgroup has a measured growth rate yet but
+    /// at least one was first seen this tick, nothing is picked. The next
+    /// tick (one sample interval later) has rates, so an idle large app is
+    /// not frozen in place of a smaller one that is growing. The deferral
+    /// lasts one tick at most per new cgroup; if no eligible cgroup reports
+    /// `memory.current` at all, growth can never be measured and the largest
+    /// app is picked at once.
+    fn select_app<'a>(
         &self,
-        procs: &'a [ProcInfo],
-        thawed_now: &std::collections::HashSet<String>,
-    ) -> Option<&'a ProcInfo> {
+        targets: &'a [Target],
+        blocked: &HashSet<String>,
+    ) -> Option<(String, Vec<&'a Target>)> {
         let min_rss_kb = self.cfg.selection.min_rss_mb * 1024;
-        procs
-            .iter()
-            .filter(|p| {
-                let Some(res) = p.resolution.as_ref() else {
-                    return false;
-                };
-                p.rss_kb >= min_rss_kb
-                    && !self.interventions.contains_key(&res.cgroup)
-                    && !thawed_now.contains(&res.cgroup)
+        let held = self.held_apps();
+        let mut groups: BTreeMap<&str, Vec<&Target>> = BTreeMap::new();
+        for t in targets {
+            groups.entry(t.app.as_str()).or_default().push(t);
+        }
+        let eligible: Vec<(&str, Vec<&Target>)> = groups
+            .into_iter()
+            .filter(|(app, ms)| {
+                !held.contains(app)
+                    && !blocked.contains(*app)
+                    && ms.iter().any(|m| m.rss_kb >= min_rss_kb)
+                    && ms
+                        .iter()
+                        .all(|m| !self.interventions.contains_key(&m.resolution.cgroup))
             })
-            .max_by_key(|p| p.rss_kb)
+            .collect();
+        let any_warm = eligible.iter().any(|(_, ms)| {
+            ms.iter().any(|m| {
+                self.growth
+                    .get(&m.resolution.cgroup)
+                    .is_some_and(|g| g.warm)
+            })
+        });
+        let any_cold = eligible.iter().any(|(_, ms)| {
+            ms.iter().any(|m| {
+                self.growth
+                    .get(&m.resolution.cgroup)
+                    .is_some_and(|g| !g.warm)
+            })
+        });
+        if !any_warm && any_cold {
+            return None;
+        }
+        let growth = |ms: &[&Target]| -> f64 {
+            ms.iter()
+                .map(|m| {
+                    self.growth
+                        .get(&m.resolution.cgroup)
+                        .map_or(0.0, |g| g.rate_bps.max(0.0))
+                })
+                .sum()
+        };
+        let size = |ms: &[&Target]| -> u64 {
+            ms.iter()
+                .map(|m| m.current_bytes.unwrap_or(m.rss_kb * 1024))
+                .sum()
+        };
+        let pick = eligible
+            .iter()
+            .filter(|(_, ms)| growth(ms) >= MIN_GROWTH_BPS)
+            .max_by(|a, b| {
+                growth(&a.1)
+                    .total_cmp(&growth(&b.1))
+                    .then_with(|| b.0.cmp(a.0))
+            })
+            .or_else(|| {
+                eligible
+                    .iter()
+                    .max_by(|a, b| size(&a.1).cmp(&size(&b.1)).then_with(|| b.0.cmp(a.0)))
+            })?;
+        Some((pick.0.to_string(), pick.1.clone()))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::super::resolve::Mechanism;
+    use super::super::types::PsiSource;
     use super::*;
 
     /// Default config = the documented zero-config defaults.
@@ -355,6 +506,8 @@ mod tests {
             some_avg10: some,
             full_avg10: full,
             mem_available_mb: avail_mb,
+            mem_total_mb: 16_000,
+            source: PsiSource::AppSlice,
         }
     }
 
@@ -369,28 +522,26 @@ mod tests {
         }
     }
 
-    /// Build a `ProcInfo` resolved to `cg`. Distinct pids should be given
-    /// distinct scopes (the convention below is `/app.slice/app-<name>-<pid>.scope`)
-    /// so they remain independent victims under the engine's cgroup-keyed state.
-    fn proc_at(pid: u32, name: &str, rss_mb: u64, cg: &str) -> ProcInfo {
-        ProcInfo {
-            pid,
-            name: name.into(),
-            rss_kb: rss_mb * 1024,
-            resolution: Some(res(cg)),
+    const MIB: u64 = 1024 * 1024;
+
+    /// Build a `Target` for app `app` in cgroup `cg`, with `mb` MB resident
+    /// and the same amount charged to the cgroup.
+    fn target(app: &str, cg: &str, mb: u64) -> Target {
+        Target {
+            app: app.into(),
+            resolution: res(cg),
+            rss_kb: mb * 1024,
+            current_bytes: Some(mb * MIB),
         }
     }
 
-    /// Shorthand: build a resolved `ProcInfo` whose cgroup is derived from
-    /// `name`/`pid` (`/app.slice/app-<name>-<pid>.scope`), matching how the
-    /// existing (migrated) tests keep one process == one distinct cgroup.
-    fn proc(pid: u32, name: &str, rss_mb: u64) -> ProcInfo {
-        proc_at(
-            pid,
-            name,
-            rss_mb,
-            &format!("/app.slice/app-{name}-{pid}.scope"),
-        )
+    /// Shorthand: one app per scope, `/app.slice/app-<name>-<pid>.scope`.
+    fn proc(pid: u32, name: &str, rss_mb: u64) -> Target {
+        target(name, &format!("/app.slice/app-{name}-{pid}.scope"), rss_mb)
+    }
+
+    fn proc_at(_pid: u32, name: &str, rss_mb: u64, cg: &str) -> Target {
+        target(name, cg, rss_mb)
     }
 
     /// A comfortably-calm sample (no pressure, lots of memory).
@@ -398,9 +549,40 @@ mod tests {
         sample(0.0, 0.0, 8000)
     }
 
-    /// A clearly-High sample (well above psi_some_high=30, below critical).
+    /// High PSI while only 12.5% of RAM is available: a real shortage.
     fn high() -> Sample {
-        sample(50.0, 0.0, 8000)
+        sample(50.0, 0.0, 2_000)
+    }
+
+    #[test]
+    fn high_pressure_with_plenty_of_free_memory_never_escalates() {
+        let mut e = PolicyEngine::new(cfg());
+        let procs = vec![proc(2, "chrome", 4000)];
+        // Half of RAM available: this stall is local to some memory.max, not a shortage.
+        let a = e.tick(0, sample(80.0, 20.0, 8_000), &procs, &live_from(&procs));
+        assert_eq!(e.level, Level::Critical);
+        assert!(
+            !a.iter()
+                .any(|x| matches!(x, Action::Freeze { .. } | Action::Cap { .. })),
+            "escalated without scarcity: {a:?}"
+        );
+    }
+
+    #[test]
+    fn is_scarce_uses_floor_or_percentage() {
+        let t = common::GuardTrigger::default(); // floor 400 MB, 20%
+        assert!(is_scarce(&sample(0.0, 0.0, 300), &t));
+        assert!(is_scarce(&sample(0.0, 0.0, 3_000), &t)); // 18.75%
+        assert!(!is_scarce(&sample(0.0, 0.0, 3_300), &t)); // 20.6%
+        let unknown = Sample {
+            mem_total_mb: 0,
+            mem_available_mb: u64::MAX,
+            ..sample(0.0, 0.0, 0)
+        };
+        assert!(
+            !is_scarce(&unknown, &t),
+            "unreadable meminfo must not enable actions"
+        );
     }
 
     fn freeze_targets(actions: &[Action]) -> Vec<String> {
@@ -437,15 +619,27 @@ mod tests {
             .any(|a| matches!(a, Action::LiftCap { res } if res.cgroup == cg))
     }
 
+    /// Give every target a measured (zero) growth rate, as if the engine had
+    /// already scanned them on an earlier tick. Tests of the ladder use this
+    /// so the cold-start deferral does not shift their first action.
+    fn prime(e: &mut PolicyEngine, ts: &[Target]) {
+        for t in ts {
+            e.growth.insert(
+                t.resolution.cgroup.clone(),
+                Growth {
+                    last_bytes: t.current_bytes.unwrap_or(0),
+                    last_ms: 0,
+                    rate_bps: 0.0,
+                    warm: true,
+                },
+            );
+        }
+    }
+
     /// Default `live_cgroups` for tests that aren't specifically exercising
-    /// the D2 liveness-vs-eligibility distinction: derive it straight from
-    /// `procs`, which reproduces the old (pre-fix) behavior where liveness
-    /// was just cgroup membership in the eligible set.
-    fn live_from(procs: &[ProcInfo]) -> std::collections::HashSet<String> {
-        procs
-            .iter()
-            .filter_map(|p| p.resolution.as_ref().map(|r| r.cgroup.clone()))
-            .collect()
+    /// the liveness-vs-eligibility distinction: every target's cgroup.
+    fn live_from(ts: &[Target]) -> std::collections::HashSet<String> {
+        ts.iter().map(|t| t.resolution.cgroup.clone()).collect()
     }
 
     #[test]
@@ -500,6 +694,7 @@ mod tests {
             proc(2, "biggest", 4000),
             proc(3, "medium", 1000),
         ];
+        prime(&mut e, &procs);
         let actions = e.tick(1000, high(), &procs, &live_from(&procs));
         // Only the single largest hog is frozen, not the smaller ones.
         assert_eq!(
@@ -525,6 +720,7 @@ mod tests {
     fn frozen_process_thaws_after_freeze_hold() {
         let mut e = PolicyEngine::new(cfg()); // freeze_hold = 5s
         let procs = vec![proc(2, "hog", 4000)];
+        prime(&mut e, &procs);
         let cg = "/app.slice/app-hog-2.scope";
 
         let a0 = e.tick(0, high(), &procs, &live_from(&procs));
@@ -544,6 +740,7 @@ mod tests {
     fn still_high_within_cooldown_caps_instead_of_refreezing() {
         let mut e = PolicyEngine::new(cfg()); // hold=5s, cooldown=60s
         let procs = vec![proc(2, "hog", 4000)];
+        prime(&mut e, &procs);
         let cg = "/app.slice/app-hog-2.scope";
 
         // Freeze at t=0.
@@ -600,6 +797,7 @@ mod tests {
     fn capped_process_lifted_only_after_sustained_calm() {
         let mut e = PolicyEngine::new(cfg()); // calm_hold = 30s
         let procs = vec![proc(2, "hog", 4000)];
+        prime(&mut e, &procs);
         let cg = "/app.slice/app-hog-2.scope";
 
         // Drive a freeze, thaw, then a cap (still hot within cooldown).
@@ -633,6 +831,7 @@ mod tests {
     fn cap_lift_resets_if_calm_is_interrupted() {
         let mut e = PolicyEngine::new(cfg());
         let procs = vec![proc(2, "hog", 4000)];
+        prime(&mut e, &procs);
         let cg = "/app.slice/app-hog-2.scope";
         e.tick(0, high(), &procs, &live_from(&procs));
         e.tick(5_000, high(), &procs, &live_from(&procs));
@@ -656,6 +855,7 @@ mod tests {
     fn escalation_gate_limits_to_one_freeze_per_hold_window() {
         let mut e = PolicyEngine::new(cfg());
         let procs = vec![proc(1, "hog-a", 4000), proc(2, "hog-b", 3000)];
+        prime(&mut e, &procs);
         let cg_a = "/app.slice/app-hog-a-1.scope";
         let cg_b = "/app.slice/app-hog-b-2.scope";
 
@@ -679,6 +879,7 @@ mod tests {
     fn dead_pid_is_pruned_with_liftcap() {
         let mut e = PolicyEngine::new(cfg());
         let procs = vec![proc(2, "hog", 4000)];
+        prime(&mut e, &procs);
         let cg = "/app.slice/app-hog-2.scope";
 
         // Freeze the hog's cgroup.
@@ -707,6 +908,7 @@ mod tests {
     fn intervention_survives_in_live_cgroups_but_absent_from_procs() {
         let mut e = PolicyEngine::new(cfg());
         let procs = vec![proc(2, "hog", 4000)];
+        prime(&mut e, &procs);
         let cg = "/app.slice/app-hog-2.scope";
 
         // Freeze the hog's cgroup.
@@ -748,6 +950,7 @@ mod tests {
         // ordering + content. "/app.slice/app-a-5.scope" sorts before
         // "/app.slice/app-b-3.scope" lexicographically.
         let procs = vec![proc(5, "a", 4000), proc(3, "b", 3500)];
+        prime(&mut e, &procs);
         let cg_a = "/app.slice/app-a-5.scope";
         let cg_b = "/app.slice/app-b-3.scope";
 
@@ -782,6 +985,7 @@ mod tests {
     fn critical_via_mem_floor_triggers_action() {
         let mut e = PolicyEngine::new(cfg());
         let procs = vec![proc(2, "hog", 4000)];
+        prime(&mut e, &procs);
         // No PSI pressure, but MemAvailable below the 400 MB floor -> Critical.
         let a = e.tick(0, sample(0.0, 0.0, 100), &procs, &live_from(&procs));
         assert_eq!(e.level, Level::Critical);
@@ -829,10 +1033,11 @@ mod tests {
     fn caponly_verdict_never_freezes() {
         let mut e = PolicyEngine::new(cfg());
         let mut p = proc_at(2, "script", 4000, "/app.slice/app-alacritty-9.scope");
-        let r = p.resolution.as_mut().unwrap();
+        let r = &mut p.resolution;
         r.verdict = Verdict::CapOnly;
         r.coverage = Coverage::Partial;
         let procs = [p];
+        prime(&mut e, &procs);
         let a = e.tick(0, high(), &procs, &live_from(&procs));
         assert!(
             freeze_targets(&a).is_empty(),
@@ -842,67 +1047,206 @@ mod tests {
     }
 
     #[test]
-    fn partial_coverage_shortens_escalation_gate() {
+    fn partial_action_waits_at_least_three_seconds() {
         let mut e = PolicyEngine::new(cfg());
-        let mut p1 = proc_at(1, "script", 4000, "/app.slice/a.scope");
-        {
-            let r = p1.resolution.as_mut().unwrap();
-            r.verdict = Verdict::CapOnly;
-            r.coverage = Coverage::Partial;
-        }
-        let p2 = proc_at(2, "hog", 3000, "/app.slice/b.scope");
-        let procs = [p1.clone(), p2.clone()];
-        // Partial action at t=0...
-        let a0 = e.tick(0, high(), &procs, &live_from(&procs));
-        assert!(has_cap_target(&a0, "/app.slice/a.scope"));
-        // ...gate must already be open on the very next tick (1s later, < freeze_hold).
-        let a1 = e.tick(1_000, high(), &procs, &live_from(&procs));
-        assert!(
-            has_freeze_target(&a1, "/app.slice/b.scope"),
-            "gate should be open after Partial: {a1:?}"
-        );
+        let mut term = target("python3", "/app.slice/term.scope", 4000);
+        term.resolution.verdict = Verdict::CapOnly;
+        term.resolution.coverage = Coverage::Partial;
+        let ts = vec![term, target("hog", "/app.slice/hog.scope", 3000)];
+        prime(&mut e, &ts);
+        assert!(has_cap_target(
+            &e.tick(0, high(), &ts, &live_from(&ts)),
+            "/app.slice/term.scope"
+        ));
+        assert!(freeze_targets(&e.tick(1_000, high(), &ts, &live_from(&ts))).is_empty());
+        assert!(freeze_targets(&e.tick(2_000, high(), &ts, &live_from(&ts))).is_empty());
+        assert!(has_freeze_target(
+            &e.tick(3_000, high(), &ts, &live_from(&ts)),
+            "/app.slice/hog.scope"
+        ));
     }
 
     #[test]
-    fn unresolvable_process_is_never_selected() {
+    fn two_scopes_of_one_app_are_acted_on_together() {
         let mut e = PolicyEngine::new(cfg());
-        let p = ProcInfo {
-            pid: 1,
-            name: "stray".into(),
-            rss_kb: 4_000_000,
-            resolution: None,
-        };
-        // `high()` still triggers the (unrelated) pressure Notify — that's
-        // covered elsewhere (`notify_emitted_and_rate_limited`). What this test
-        // guards is that an unresolvable process is never escalated: no
-        // Freeze/Cap is ever produced for it, and no intervention is created.
-        let procs = [p];
-        let a = e.tick(0, high(), &procs, &live_from(&procs));
-        assert!(
-            !a.iter()
-                .any(|x| matches!(x, Action::Freeze { .. } | Action::Cap { .. })),
-            "unresolvable process must never be escalated: {a:?}"
-        );
-        assert!(e.interventions().is_empty());
-    }
-
-    #[test]
-    fn two_pids_same_scope_yield_one_intervention() {
-        let mut e = PolicyEngine::new(cfg());
-        let procs = vec![
-            proc_at(10, "firefox", 4000, "/app.slice/app-firefox-1.scope"),
-            proc_at(
-                11,
-                "Isolated Web Co",
-                3000,
-                "/app.slice/app-firefox-1.scope",
-            ),
+        let ts = vec![
+            target("chrome", "/app.slice/app-chrome-1.scope", 1500),
+            target("chrome", "/app.slice/app-chrome-2.scope", 900),
+            target("hog", "/app.slice/app-hog-3.scope", 2000),
         ];
-        let a = e.tick(0, high(), &procs, &live_from(&procs));
+        prime(&mut e, &ts);
+        let mut frozen = freeze_targets(&e.tick(0, high(), &ts, &live_from(&ts)));
+        frozen.sort();
         assert_eq!(
-            freeze_targets(&a).len(),
-            1,
-            "one freeze for the shared scope: {a:?}"
+            frozen,
+            vec![
+                "/app.slice/app-chrome-1.scope",
+                "/app.slice/app-chrome-2.scope"
+            ]
+        );
+        let a1 = e.tick(1_000, high(), &ts, &live_from(&ts));
+        assert!(
+            freeze_targets(&a1).is_empty(),
+            "one app is one escalation step: {a1:?}"
+        );
+    }
+
+    #[test]
+    fn fastest_growing_app_is_chosen_over_largest() {
+        let mut e = PolicyEngine::new(cfg());
+        let warn = sample(12.0, 0.0, 2_000);
+        let t0 = vec![
+            target("firefox", "/app.slice/ff.scope", 4000),
+            target("script", "/app.slice/sh.scope", 1000),
+        ];
+        assert!(freeze_targets(&e.tick(0, warn, &t0, &live_from(&t0))).is_empty());
+        let t1 = vec![
+            target("firefox", "/app.slice/ff.scope", 4000),
+            target("script", "/app.slice/sh.scope", 1600),
+        ];
+        assert_eq!(
+            freeze_targets(&e.tick(1_000, high(), &t1, &live_from(&t1))),
+            vec!["/app.slice/sh.scope"]
+        );
+    }
+
+    #[test]
+    fn largest_app_is_the_fallback_when_nothing_grows() {
+        let mut e = PolicyEngine::new(cfg());
+        let ts = vec![
+            target("small", "/app.slice/s.scope", 300),
+            target("big", "/app.slice/b.scope", 3000),
+        ];
+        e.tick(0, sample(12.0, 0.0, 2_000), &ts, &live_from(&ts));
+        assert_eq!(
+            freeze_targets(&e.tick(1_000, high(), &ts, &live_from(&ts))),
+            vec!["/app.slice/b.scope"]
+        );
+    }
+
+    #[test]
+    fn at_most_three_apps_are_held_at_once() {
+        let mut e = PolicyEngine::new(cfg());
+        let ts: Vec<Target> = (0..5u64)
+            .map(|i| {
+                target(
+                    &format!("app{i}"),
+                    &format!("/app.slice/a{i}.scope"),
+                    1000 + i * 100,
+                )
+            })
+            .collect();
+        for step in 0..40u64 {
+            e.tick(step * 5_000, high(), &ts, &live_from(&ts));
+            assert!(
+                e.interventions().len() <= MAX_HELD_APPS,
+                "held {:?}",
+                e.interventions()
+            );
+        }
+    }
+
+    #[test]
+    fn held_limit_counts_apps_not_cgroups() {
+        let mut e = PolicyEngine::new(cfg());
+        let ts = vec![
+            target("a", "/app.slice/a1.scope", 2000),
+            target("a", "/app.slice/a2.scope", 2000),
+            target("b", "/app.slice/b.scope", 1500),
+            target("c", "/app.slice/c.scope", 1200),
+            target("d", "/app.slice/d.scope", 1100),
+        ];
+        for step in 0..40u64 {
+            e.tick(step * 5_000, high(), &ts, &live_from(&ts));
+        }
+        let held: Vec<String> = e.interventions().into_iter().map(|(cg, _)| cg).collect();
+        assert_eq!(
+            held,
+            vec![
+                "/app.slice/a1.scope",
+                "/app.slice/a2.scope",
+                "/app.slice/b.scope",
+                "/app.slice/c.scope"
+            ],
+            "4 cgroups across 3 apps are allowed, a 4th app is refused"
+        );
+    }
+
+    #[test]
+    fn candidates_are_wanted_above_calm_or_when_scarce() {
+        let e = PolicyEngine::new(cfg());
+        assert!(!e.wants_candidates(calm()));
+        assert!(e.wants_candidates(sample(12.0, 0.0, 8_000)));
+        // Calm PSI but under 20% of RAM available: scan so growth stays warm.
+        assert!(e.wants_candidates(sample(0.0, 0.0, 3_000)));
+    }
+
+    /// Regression (final review I1): available memory drops below the floor
+    /// in one step with no stall first, so the Critical tick is the first
+    /// scan. An idle 6 GB app must not be frozen in place of a 3 GB app
+    /// that is growing: the first tick defers, the next picks the grower.
+    #[test]
+    fn cold_start_defers_then_picks_grower_not_largest() {
+        let mut e = PolicyEngine::new(cfg());
+        for step in 0..5u64 {
+            e.tick(step * 1_000, calm(), &[], &HashSet::new());
+        }
+        let crit = sample(0.0, 0.0, 300);
+        let t0 = vec![
+            target("chrome", "/app.slice/chrome.scope", 6000),
+            target("hog", "/app.slice/hog.scope", 3000),
+        ];
+        let a0 = e.tick(5_000, crit, &t0, &live_from(&t0));
+        assert_eq!(e.level, Level::Critical);
+        assert!(
+            freeze_targets(&a0).is_empty(),
+            "no growth data yet, must defer: {a0:?}"
+        );
+        let t1 = vec![
+            target("chrome", "/app.slice/chrome.scope", 6000),
+            target("hog", "/app.slice/hog.scope", 3200),
+        ];
+        assert_eq!(
+            freeze_targets(&e.tick(6_000, crit, &t1, &live_from(&t1))),
+            vec!["/app.slice/hog.scope"]
+        );
+    }
+
+    /// With scarce-but-calm ticks feeding growth, the grower is picked on
+    /// the very first Critical tick.
+    #[test]
+    fn scarce_calm_ticks_warm_growth_for_first_critical_tick() {
+        let mut e = PolicyEngine::new(cfg());
+        let scarce_calm = sample(0.0, 0.0, 3_000);
+        assert!(e.wants_candidates(scarce_calm));
+        let t0 = vec![
+            target("chrome", "/app.slice/chrome.scope", 6000),
+            target("hog", "/app.slice/hog.scope", 2000),
+        ];
+        assert!(freeze_targets(&e.tick(0, scarce_calm, &t0, &live_from(&t0))).is_empty());
+        let t1 = vec![
+            target("chrome", "/app.slice/chrome.scope", 6000),
+            target("hog", "/app.slice/hog.scope", 3000),
+        ];
+        assert_eq!(
+            freeze_targets(&e.tick(1_000, sample(0.0, 0.0, 300), &t1, &live_from(&t1))),
+            vec!["/app.slice/hog.scope"]
+        );
+    }
+
+    /// Without any memory.current reading, growth can never be measured, so
+    /// the guard does not wait and falls back to the largest app.
+    #[test]
+    fn no_current_bytes_does_not_defer() {
+        let mut e = PolicyEngine::new(cfg());
+        let mut big = target("big", "/app.slice/b.scope", 3000);
+        big.current_bytes = None;
+        let mut small = target("small", "/app.slice/s.scope", 1000);
+        small.current_bytes = None;
+        let ts = vec![big, small];
+        assert_eq!(
+            freeze_targets(&e.tick(0, high(), &ts, &live_from(&ts))),
+            vec!["/app.slice/b.scope"]
         );
     }
 }

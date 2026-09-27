@@ -21,6 +21,13 @@ pub fn read_frozen(cg: &str) -> Option<bool> {
     parse_frozen(&content)
 }
 
+/// Whether the cgroup (or any descendant) holds a process, from
+/// `cgroup.events`. `None` if unreadable (e.g. the cgroup is gone).
+pub fn is_populated(cg: &str) -> Option<bool> {
+    let content = fs::read_to_string(abs(cg).join("cgroup.events")).ok()?;
+    parse_populated(&content)
+}
+
 /// Freeze or unfreeze a cgroup (write to cgroup.freeze).
 pub fn write_freeze(cg: &str, on: bool) -> Result<()> {
     let value = if on { "1" } else { "0" };
@@ -43,46 +50,11 @@ pub fn write_high(cg: &str, val: &str) -> Result<()> {
     Ok(())
 }
 
-/// Get total anonymous + swap memory (anon from memory.stat + memory.swap.current).
-/// `anon` is required — without it we have nothing to cap against. `swap` is
-/// tolerant: a merely-unreadable `memory.swap.current` (the norm when swap is
-/// disabled, or `swapaccount=0`) must not discard a perfectly good `anon`
-/// value and collapse the caller's cap to the `MIN_CAP_BYTES` floor (D4 fix)
-/// — it defaults to 0 instead.
-pub fn anon_swap_bytes(cg: &str) -> Option<u64> {
-    let stat = fs::read_to_string(abs(cg).join("memory.stat")).ok()?;
-    let anon = parse_anon(&stat)?;
-    let swap_content = fs::read_to_string(abs(cg).join("memory.swap.current")).ok();
-    Some(combine_anon_swap(anon, swap_content.as_deref()))
-}
-
-/// Pure: add a possibly-unreadable/unparseable swap reading to a required
-/// `anon` value, defaulting the swap half to 0 rather than discarding
-/// `anon` (D4 fix — only the parse used to be tolerant; the read wasn't,
-/// so a merely-absent swap file threw away a perfectly good `anon` and
-/// forced the caller's cap down to its most aggressive floor).
-fn combine_anon_swap(anon: u64, swap_content: Option<&str>) -> u64 {
-    let swap = swap_content
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        .unwrap_or(0);
-    anon + swap
-}
-
 /// Read the current memory usage (memory.current), in bytes.
 pub fn current_bytes(cg: &str) -> Option<u64> {
     fs::read_to_string(abs(cg).join("memory.current"))
         .ok()
         .and_then(|s| s.trim().parse::<u64>().ok())
-}
-
-/// Read the raw `memory.swap.max` value (verbatim, trimmed: either "max" or a
-/// byte count). `0` means the cgroup cannot swap out anon memory at all —
-/// rlm writes this on every cgroup it creates (see `cgroup.rs`'s
-/// `set_memory_limit`) to keep a hard `memory.max` a true RAM ceiling.
-pub fn swap_max(cg: &str) -> Option<String> {
-    fs::read_to_string(abs(cg).join("memory.swap.max"))
-        .ok()
-        .map(|s| s.trim().to_string())
 }
 
 /// Get the file-backed (page cache) byte count from `memory.stat`'s `file`
@@ -92,22 +64,39 @@ pub fn file_bytes(cg: &str) -> Option<u64> {
     parse_file(&stat)
 }
 
-/// Whether this cgroup's anon memory is reclaimable via swap. Delegates the
-/// decision to the pure [`parse_can_reclaim_anon`]; unreadable is treated
-/// permissively (true) since most cgroups (systemd unit scopes) have swap
-/// enabled and a missing read shouldn't wrongly floor a soft cap.
-pub fn can_reclaim_anon(cg: &str) -> bool {
-    parse_can_reclaim_anon(swap_max(cg).as_deref())
+/// Pure: whether anon memory can be reclaimed at all. It cannot when the host
+/// has no swap device (`SwapTotal` of 0) or when `memory.swap.max` is `0` on
+/// the cgroup or any ancestor (rlm writes `0` on every cgroup it creates, see
+/// `cgroup.rs`'s `set_memory_limit`). Unreadable levels (`None`) do not pin.
+pub fn anon_reclaimable_from(swap_total_kb: u64, swap_max_chain: &[Option<String>]) -> bool {
+    swap_total_kb > 0
+        && !swap_max_chain
+            .iter()
+            .any(|v| v.as_deref().map(str::trim) == Some("0"))
 }
 
-/// Pure: given the raw (already-trimmed) `memory.swap.max` content, whether
-/// anon memory in the cgroup is reclaimable via swap. `Some("0")` means
-/// swap is explicitly disabled for this cgroup — anon is pinned and only
-/// file-backed pages can be freed. `"max"`, any other positive number, or an
-/// unreadable file (`None`) all mean anon can be reclaimed (or we can't tell,
-/// so assume the common case).
-pub fn parse_can_reclaim_anon(swap_max: Option<&str>) -> bool {
-    !matches!(swap_max.and_then(|s| s.parse::<u64>().ok()), Some(0))
+/// `memory.swap.max` of `cg` and each ancestor below the cgroupfs root,
+/// nearest first. Unreadable levels are `None`.
+pub fn swap_max_chain(cg: &str) -> Vec<Option<String>> {
+    let root = Path::new(CGROUP_ROOT);
+    let mut out = Vec::new();
+    let mut p = abs(cg);
+    while p.starts_with(root) && p != root {
+        out.push(
+            fs::read_to_string(p.join("memory.swap.max"))
+                .ok()
+                .map(|s| s.trim().to_string()),
+        );
+        if !p.pop() {
+            break;
+        }
+    }
+    out
+}
+
+/// Whether `cg`'s anon memory can go to swap, given the host's `SwapTotal`.
+pub fn anon_reclaimable(cg: &str, swap_total_kb: u64) -> bool {
+    anon_reclaimable_from(swap_total_kb, &swap_max_chain(cg))
 }
 
 /// Get the inode number of the cgroup directory.
@@ -171,8 +160,14 @@ fn collect_pids_recursive(dir: &Path, out: &mut Vec<u32>) {
 
 /// Get the executable basename for a process (from /proc/<pid>/exe).
 pub fn exe_basename(pid: u32) -> Option<String> {
-    let path = std::fs::read_link(format!("/proc/{pid}/exe")).ok()?;
-    path.file_name()?.to_str().map(|s| s.to_string())
+    exe_name(&std::fs::read_link(format!("/proc/{pid}/exe")).ok()?)
+}
+
+/// Basename of an exe link target, without the ` (deleted)` suffix the
+/// kernel adds after the binary was replaced (e.g. by a package upgrade).
+fn exe_name(link: &Path) -> Option<String> {
+    let name = link.file_name()?.to_str()?;
+    Some(name.strip_suffix(" (deleted)").unwrap_or(name).to_string())
 }
 
 /// Get the boot_id from /proc/sys/kernel/random/boot_id, trimmed.
@@ -190,6 +185,28 @@ pub fn parse_frozen(events: &str) -> Option<bool> {
     events.lines().find_map(|l| {
         let rest = l.strip_prefix("frozen ")?;
         Some(rest.trim() == "1")
+    })
+}
+
+/// Pure parser: the "populated <0|1>" line of cgroup.events, or `None` if
+/// absent.
+pub fn parse_populated(events: &str) -> Option<bool> {
+    events.lines().find_map(|l| {
+        let rest = l.strip_prefix("populated ")?;
+        Some(rest.trim() == "1")
+    })
+}
+
+/// Pure parser: the value of the `key` line in a flat keyed file such as
+/// `memory.events`. The first token must equal `key` exactly, so `oom` does
+/// not match `oom_kill`.
+pub fn parse_events_field(content: &str, key: &str) -> Option<u64> {
+    content.lines().find_map(|l| {
+        let mut it = l.split_whitespace();
+        if it.next()? != key {
+            return None;
+        }
+        it.next()?.parse().ok()
     })
 }
 
@@ -213,10 +230,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn exe_name_strips_deleted_suffix() {
+        assert_eq!(
+            exe_name(Path::new("/opt/google/chrome/chrome (deleted)")).as_deref(),
+            Some("chrome")
+        );
+        assert_eq!(
+            exe_name(Path::new("/usr/bin/firefox")).as_deref(),
+            Some("firefox")
+        );
+    }
+
+    #[test]
     fn parse_frozen_reads_events() {
         assert_eq!(parse_frozen("populated 1\nfrozen 0\n"), Some(false));
         assert_eq!(parse_frozen("populated 1\nfrozen 1\n"), Some(true));
         assert_eq!(parse_frozen("populated 1\n"), None);
+    }
+
+    #[test]
+    fn parse_populated_reads_events() {
+        assert_eq!(parse_populated("populated 1\nfrozen 0\n"), Some(true));
+        assert_eq!(parse_populated("populated 0\nfrozen 1\n"), Some(false));
+        assert_eq!(parse_populated("frozen 0\n"), None);
+    }
+
+    #[test]
+    fn parse_events_field_matches_exact_key() {
+        let ev = "low 0\nhigh 3\nmax 10\noom 1\noom_kill 2\n";
+        assert_eq!(parse_events_field(ev, "oom_kill"), Some(2));
+        assert_eq!(parse_events_field(ev, "oom"), Some(1));
+        assert_eq!(parse_events_field(ev, "oom_group_kill"), None);
     }
 
     #[test]
@@ -234,41 +278,24 @@ mod tests {
     }
 
     #[test]
-    fn parse_can_reclaim_anon_reads_swap_max() {
-        assert!(
-            !parse_can_reclaim_anon(Some("0")),
-            "swap.max=0 means anon is pinned, unreclaimable"
-        );
-        assert!(
-            parse_can_reclaim_anon(Some("max")),
-            "\"max\" means unlimited swap, anon reclaimable"
-        );
-        assert!(
-            parse_can_reclaim_anon(Some("2147483648")),
-            "a positive swap budget means anon reclaimable"
-        );
-        assert!(
-            parse_can_reclaim_anon(None),
-            "unreadable file degrades permissively (assume reclaimable)"
-        );
+    fn no_swap_device_pins_anon() {
+        assert!(!anon_reclaimable_from(0, &[Some("max".into())]));
     }
 
     #[test]
-    fn combine_anon_swap_tolerates_missing_or_unparseable_swap() {
-        // The common case on the target platforms: no memory.swap.current
-        // at all (swap disabled) must NOT discard a perfectly good `anon`.
-        assert_eq!(
-            combine_anon_swap(1_000_000, None),
-            1_000_000,
-            "missing swap file must not zero out anon"
-        );
-        // Unparseable content degrades the same way: swap defaults to 0.
-        assert_eq!(
-            combine_anon_swap(1_000_000, Some("not-a-number")),
-            1_000_000
-        );
-        // A real, readable swap value is added on top of anon.
-        assert_eq!(combine_anon_swap(1_000_000, Some("500\n")), 1_000_500);
+    fn any_ancestor_with_zero_swap_max_pins_anon() {
+        assert!(!anon_reclaimable_from(
+            8_000_000,
+            &[Some("max".into()), Some("0".into()), None]
+        ));
+    }
+
+    #[test]
+    fn swap_and_no_zero_in_chain_is_reclaimable() {
+        assert!(anon_reclaimable_from(
+            8_000_000,
+            &[Some("max".into()), None, Some("2147483648".into())]
+        ));
     }
 
     #[test]
@@ -335,7 +362,8 @@ mod tests {
         let manager = CgroupManager::new().expect("create CgroupManager");
         let abs_path = manager
             .prepare_cgroup("test-pids-under", &Limit::default())
-            .expect("create test cgroup");
+            .expect("create test cgroup")
+            .path;
         let cgroup = format!(
             "/{}",
             abs_path

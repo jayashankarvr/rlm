@@ -1,0 +1,7 @@
+post_install() {
+  echo "rlm: cgroup delegation is configured. Log out and back in, then run: rlm doctor"
+  echo "rlm: to turn on the guard for your user: rlm guard enable"
+}
+post_upgrade() {
+  echo "rlm: restart the guard to use the new version: systemctl --user restart rlm-guard"
+}

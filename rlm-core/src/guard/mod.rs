@@ -1,5 +1,5 @@
 //! Freeze-guard engine: watch memory pressure and proactively freeze/soft-cap
-//! the user's biggest non-protected process before the system locks up, healing
+//! the non-protected app driving the pressure before the system locks up, healing
 //! itself once pressure clears. Pure engine + sampler live here; the daemon loop
 //! lives in the `rlm-guard` binary.
 
@@ -7,10 +7,14 @@ use std::path::PathBuf;
 
 pub mod cgfs;
 pub mod effector;
+pub mod history;
 pub mod journal;
+pub mod lock;
 pub mod policy;
+pub mod report;
 pub mod resolve;
 pub mod sampler;
+pub mod service;
 pub mod systemd;
 pub mod types;
 
@@ -19,7 +23,7 @@ pub use journal::Journal;
 pub use policy::PolicyEngine;
 pub use sampler::Sampler;
 pub use systemd::SystemdUser;
-pub use types::{Action, Intervention, Level, ProcInfo, Sample};
+pub use types::{Action, Intervention, Level, ProcInfo, PsiSource, Sample, Target};
 
 /// Default path for the guard's write-ahead restore journal.
 ///
@@ -34,4 +38,10 @@ pub fn journal_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/tmp"))
         .join("rlm")
         .join("guard-journal.jsonl")
+}
+
+/// Path of the lock file that keeps a second `rlm-guard` from running.
+/// It sits next to the journal the lock protects.
+pub fn lock_path() -> PathBuf {
+    journal_path().with_file_name("rlm-guard.lock")
 }

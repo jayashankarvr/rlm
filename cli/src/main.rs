@@ -1,24 +1,16 @@
+mod confirm;
+mod doctor;
+mod guard_unit;
+mod run;
+
 use clap::{Parser, Subcommand};
-use common::{build_limit, format_bytes, Config, Error, Result};
+use common::{build_limit, format_bytes, Config, Error, Limit, Result};
+use confirm::Confirm;
+use rlm_core::process::{self, current_uid, ProcessInfo};
 use rlm_core::CgroupManager;
-use std::io::{self, Write};
+use std::collections::HashSet;
+use std::io::{self, IsTerminal};
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-
-fn resolve_pids(pid: Option<u32>, name: Option<&str>) -> Result<Vec<u32>> {
-    match (pid, name) {
-        (Some(pid), None) => Ok(vec![pid]),
-        (None, Some(name)) => rlm_core::process::find_by_name(name),
-        (None, None) => Err(Error::InvalidArgs("specify either --pid or --name".into())),
-        (Some(_), Some(_)) => unreachable!("clap prevents this"),
-    }
-}
-
-fn resolve_application_pids(application: &str) -> Result<Vec<u32>> {
-    let processes = rlm_core::process::find_all_by_executable(application)?;
-    Ok(processes.iter().map(|p| p.pid).collect())
-}
 
 fn parse_pid_list(pids_str: &str) -> Result<Vec<u32>> {
     pids_str
@@ -31,31 +23,147 @@ fn parse_pid_list(pids_str: &str) -> Result<Vec<u32>> {
         .collect()
 }
 
-/// Prompt user for confirmation when affecting multiple processes
-fn confirm_batch(pids: &[u32], action: &str) -> bool {
-    if pids.len() <= 1 {
-        return true;
+/// Resolve `--name` to the PIDs owned by `my_uid`. Root (`my_uid == 0`) sees
+/// every match, since it can legitimately act on anyone's process. A
+/// non-root match against other users' processes is dropped with a note
+/// rather than silently limiting (or reporting on) someone else's process.
+fn resolve_name_pids(name: &str, my_uid: u32) -> Result<Vec<u32>> {
+    if my_uid == 0 {
+        return process::find_by_name(name);
     }
+    let matches = process::find_by_name_for_uid(name, my_uid)?;
+    if matches.other_users > 0 {
+        eprintln!(
+            "note: skipped {} matching process(es) owned by other users",
+            matches.other_users
+        );
+    }
+    if matches.pids.is_empty() {
+        return Err(Error::ProcessNameNotFound(name.to_string()));
+    }
+    Ok(matches.pids)
+}
 
-    println!("Found {} processes:", pids.len());
-    for pid in pids.iter().take(10) {
-        let name = std::fs::read_to_string(format!("/proc/{pid}/comm"))
-            .map(|s| s.trim().to_string())
-            .unwrap_or_else(|_| "?".to_string());
-        println!("  {pid}: {name}");
-    }
-    if pids.len() > 10 {
-        println!("  ... and {} more", pids.len() - 10);
-    }
+/// Same as [`resolve_name_pids`], but returns full [`ProcessInfo`] for each
+/// match so the caller can run [`check_target`] on it.
+fn resolve_name_targets(name: &str, my_uid: u32) -> Result<Vec<ProcessInfo>> {
+    resolve_name_pids(name, my_uid)?
+        .into_iter()
+        .map(|pid| process::read_process(pid).ok_or(Error::ProcessNotFound(pid)))
+        .collect()
+}
 
-    print!("{} all {} processes? [y/N] ", action, pids.len());
-    io::stdout().flush().ok();
-
-    let mut input = String::new();
-    if io::stdin().read_line(&mut input).is_err() {
-        return false;
+/// Keep only `all`'s processes owned by `my_uid`, printing a note about how
+/// many were dropped. Root keeps everything (see [`resolve_name_pids`]).
+fn filter_own_uid(all: Vec<ProcessInfo>, my_uid: u32) -> Vec<ProcessInfo> {
+    if my_uid == 0 {
+        return all;
     }
-    matches!(input.trim().to_lowercase().as_str(), "y" | "yes")
+    let (mine, other): (Vec<_>, Vec<_>) = all.into_iter().partition(|p| p.uid == my_uid);
+    if !other.is_empty() {
+        eprintln!(
+            "note: skipped {} matching process(es) owned by other users",
+            other.len()
+        );
+    }
+    mine
+}
+
+/// A command needs a real [`CgroupManager`] only when it reads or writes
+/// cgroup state. Constructing one fails on hosts without cgroups v2 (or
+/// without delegation), so commands that don't touch cgroups (doctor,
+/// profiles, export/import, rule, and every `guard` subcommand, which reads
+/// only the default base path) must not pay that cost or that failure mode.
+fn needs_cgroup_manager(cmd: &Commands) -> bool {
+    match cmd {
+        Commands::Status
+        | Commands::Limit { .. }
+        | Commands::Unlimit { .. }
+        | Commands::Run { .. } => true,
+        Commands::Rule { .. }
+        | Commands::Profiles
+        | Commands::Export { .. }
+        | Commands::Import { .. }
+        | Commands::Doctor
+        | Commands::Guard { .. } => false,
+    }
+}
+
+/// `--save` persists a rule keyed by the application executable; without
+/// `--application` there is nothing to key it by. clap's `requires` on
+/// `--save` does not actually enforce this (see the regression test), so it
+/// is checked explicitly here before anything else runs.
+fn validate_limit_args(save: bool, application: Option<&str>) -> Result<()> {
+    if save && application.is_none() {
+        return Err(Error::InvalidArgs(
+            "--save requires --application (there is nothing else to key the saved rule by)".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse to limit a process this invocation should not touch: one owned by
+/// another user (unless we are root), or one on the guard protect list
+/// (desktop session, shells, audio) unless `--force` was given. The uid
+/// check is never bypassed by `--force`; only the protect-list check is.
+fn check_target(
+    p: &ProcessInfo,
+    my_uid: u32,
+    protect: &HashSet<String>,
+    force: bool,
+) -> Result<()> {
+    if p.uid != my_uid && my_uid != 0 {
+        return Err(Error::InvalidArgs(format!(
+            "process {} ({}) belongs to uid {}; rlm only limits your own processes",
+            p.pid,
+            p.display_name(),
+            p.uid
+        )));
+    }
+    if !force && common::is_protected(protect, &p.name, p.exe_name()) {
+        return Err(Error::InvalidArgs(format!(
+            "process {} ({}) is on the guard protect list (desktop session, shells, audio); pass --force to limit it anyway",
+            p.pid,
+            p.display_name()
+        )));
+    }
+    Ok(())
+}
+
+/// What to actually remove for `unlimit --pid`: `found` is whatever cgroup
+/// (if any) [`CgroupManager::find_cgroup_for_pid`] reports the pid in. A pid
+/// with no cgroup was never limited (or was already unlimited), and a pid
+/// sharing a cgroup with other processes must be released as a whole group,
+/// not silently for just this one pid.
+fn unlimit_pid_target(pid: u32, found: Option<&str>) -> Result<String> {
+    match found {
+        None => Err(Error::InvalidArgs(format!("pid {pid} is not limited by rlm"))),
+        Some(cgroup) if cgroup == format!("pid-{pid}") => Ok(cgroup.to_string()),
+        Some(cgroup) => Err(Error::InvalidArgs(format!(
+            "pid {pid} shares cgroup '{cgroup}' with other processes; remove the whole group with: rlm unlimit --cgroup {cgroup}"
+        ))),
+    }
+}
+
+/// Run the batch confirmation against the real terminal/stdio, translating
+/// the result into either "keep going" (`Ok(None)`) or a final `ExitCode`
+/// (`Ok(Some(_))` for a user cancel) or error (stdin is not a terminal and
+/// `--yes` was not given).
+fn confirm_or_exit(pids: &[u32], action: &str, yes: bool) -> Result<Option<ExitCode>> {
+    let interactive = io::stdin().is_terminal();
+    let mut input = io::stdin().lock();
+    let mut out = io::stdout();
+    match confirm::confirm_batch(pids, action, yes, interactive, &mut input, &mut out) {
+        Confirm::Proceed => Ok(None),
+        Confirm::Cancelled => {
+            eprintln!("cancelled");
+            Ok(Some(ExitCode::from(1)))
+        }
+        Confirm::NeedsYes => Err(Error::InvalidArgs(format!(
+            "refusing to change {} processes without confirmation because stdin is not a terminal; pass --yes",
+            pids.len()
+        ))),
+    }
 }
 
 #[derive(Parser)]
@@ -117,6 +225,16 @@ enum Commands {
         /// is re-applied across reboots and to future instances by rlm-guard.
         #[arg(long, requires = "application")]
         save: bool,
+
+        /// Skip the confirmation prompt for a batch (--name, --application,
+        /// --all-pids). Required when stdin is not a terminal.
+        #[arg(long, short = 'y')]
+        yes: bool,
+
+        /// Limit a process on the guard protect list (desktop session,
+        /// shells, audio) anyway. Never bypasses the other-user refusal.
+        #[arg(long)]
+        force: bool,
     },
 
     /// Remove resource limits from a process
@@ -141,6 +259,11 @@ enum Commands {
         /// unlimit drops the live limit but keeps the saved rule.
         #[arg(long)]
         forget: bool,
+
+        /// Skip the confirmation prompt when unlimiting by --name and more
+        /// than one process matches. Required when stdin is not a terminal.
+        #[arg(long, short = 'y')]
+        yes: bool,
     },
 
     /// Manage persistent application rules (enforced by rlm-guard)
@@ -212,7 +335,8 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum GuardAction {
-    /// Show current memory pressure and active guard interventions
+    /// Show whether the guard is running and its current memory pressure and
+    /// active interventions
     Status,
     /// Enable and start the guard user service
     Enable,
@@ -220,6 +344,12 @@ enum GuardAction {
     Disable,
     /// Dry-run: print what the guard would do right now, without acting
     Test,
+    /// Show recent guard interventions (freeze, thaw, cap, lift, and failures)
+    History {
+        /// Number of most recent entries to show
+        #[arg(short = 'n', long, default_value_t = 20)]
+        lines: usize,
+    },
 }
 
 #[derive(Subcommand)]
@@ -234,12 +364,7 @@ enum RuleAction {
 }
 
 fn main() -> ExitCode {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive(tracing::Level::INFO.into()),
-        )
-        .init();
+    rlm_core::logging::init(tracing::Level::WARN);
 
     match run() {
         Ok(code) => code,
@@ -252,7 +377,15 @@ fn main() -> ExitCode {
 
 fn run() -> Result<ExitCode> {
     let cli = Cli::parse();
-    let manager = CgroupManager::new()?;
+    // Constructing a CgroupManager fails outright on a host without cgroups
+    // v2 (or delegation), so it is only built for commands that actually
+    // need one; doctor/profiles/export/import/rule/guard must keep working
+    // to diagnose or fix exactly that situation.
+    let manager = if needs_cgroup_manager(&cli.command) {
+        Some(CgroupManager::new()?)
+    } else {
+        None
+    };
 
     match cli.command {
         Commands::Limit {
@@ -266,7 +399,12 @@ fn run() -> Result<ExitCode> {
             io_write,
             dry_run,
             save,
+            yes,
+            force,
         } => {
+            let manager = manager.as_ref().expect("checked by needs_cgroup_manager");
+            validate_limit_args(save, application.as_deref())?;
+
             let limit = build_limit(
                 memory.as_deref(),
                 cpu.as_deref(),
@@ -281,50 +419,67 @@ fn run() -> Result<ExitCode> {
             }
 
             // Remember the application name for persisting a rule after apply.
-            // clap's `requires` guarantees --save is only set with --application.
+            // validate_limit_args guarantees --save is only set with --application.
             let save_app = if save { application.clone() } else { None };
 
+            let my_uid = current_uid();
+            let config = Config::load().unwrap_or_default();
+            let protect = common::protect_set(&config.guard.selection.protect);
+
             // Determine which mode we're in
-            let (pids, cgroup_name, is_shared) = if let Some(app_name) = application {
+            let (targets, cgroup_name, is_shared) = if let Some(app_name) = application {
                 // Application mode: all processes share limits
-                let pids = resolve_application_pids(&app_name)?;
-                if pids.is_empty() {
+                let all = process::find_all_by_executable(&app_name)?;
+                let targets = filter_own_uid(all, my_uid);
+                if targets.is_empty() {
                     return Err(Error::ProcessNameNotFound(app_name));
                 }
                 let cgroup_name = format!("app-{}", app_name.replace(['/', ' '], "_"));
                 println!(
                     "Found {} process(es) for application '{}'",
-                    pids.len(),
+                    targets.len(),
                     app_name
                 );
-                (pids, cgroup_name, true)
+                (targets, cgroup_name, true)
             } else if let Some(pids_str) = all_pids {
                 // Multiple PIDs mode: all share limits
                 let pids = parse_pid_list(&pids_str)?;
                 if pids.is_empty() {
                     return Err(Error::InvalidArgs("no valid PIDs specified".into()));
                 }
+                let targets: Vec<ProcessInfo> = pids
+                    .iter()
+                    .map(|&pid| process::read_process(pid).ok_or(Error::ProcessNotFound(pid)))
+                    .collect::<Result<_>>()?;
                 let cgroup_name = format!("multi-{}", pids[0]);
-                (pids, cgroup_name, true)
+                (targets, cgroup_name, true)
+            } else if let Some(name) = name {
+                let targets = resolve_name_targets(&name, my_uid)?;
+                (targets, String::new(), false)
+            } else if let Some(pid) = pid {
+                let p = process::read_process(pid).ok_or(Error::ProcessNotFound(pid))?;
+                (vec![p], String::new(), false)
             } else {
-                // Individual mode: each process gets its own limits
-                let pids = resolve_pids(pid, name.as_deref())?;
-                (pids, String::new(), false)
+                return Err(Error::InvalidArgs(
+                    "specify --pid, --name, --application, or --all-pids".into(),
+                ));
             };
+
+            for p in &targets {
+                check_target(p, my_uid, &protect, force)?;
+            }
+            let pids: Vec<u32> = targets.iter().map(|p| p.pid).collect();
 
             if dry_run {
                 println!(
                     "Dry run - would apply limits to {} process(es):",
-                    pids.len()
+                    targets.len()
                 );
-                for pid in &pids {
-                    let name = std::fs::read_to_string(format!("/proc/{pid}/comm"))
-                        .map(|s| s.trim().to_string())
-                        .unwrap_or_else(|_| "?".to_string());
-                    println!("  {pid}: {name}");
+                for p in &targets {
+                    println!("  {}: {}", p.pid, p.display_name());
                 }
                 if is_shared {
-                    println!("\n⚠️  All processes will SHARE these limits (combined pool):");
+                    println!("\nnote: all processes share these limits (one combined pool)");
                 } else {
                     println!("\nLimits (per process):");
                 }
@@ -345,20 +500,21 @@ fn run() -> Result<ExitCode> {
                 return Ok(ExitCode::SUCCESS);
             }
 
-            if !confirm_batch(&pids, "Limit") {
-                println!("cancelled");
-                return Ok(ExitCode::SUCCESS);
+            if let Some(code) = confirm_or_exit(&pids, "Limit", yes)? {
+                return Ok(code);
             }
 
             if is_shared {
                 // Apply shared limits to all processes
-                manager.apply_limit_to_multiple(&pids, &limit, &cgroup_name)?;
+                for w in manager.apply_limit_to_multiple(&pids, &limit, &cgroup_name)? {
+                    eprintln!("warning: {w}");
+                }
                 println!(
                     "Applied shared limits to {} process(es) in cgroup '{}'",
                     pids.len(),
                     cgroup_name
                 );
-                println!("⚠️  Note: All processes share these limits (combined pool)");
+                println!("note: all processes share these limits (one combined pool)");
 
                 // Persist as a rule so it survives reboot and applies to future
                 // instances (enforced by rlm-guard).
@@ -389,7 +545,9 @@ fn run() -> Result<ExitCode> {
             } else {
                 // Apply individual limits to each process
                 for pid in &pids {
-                    manager.apply_limit(*pid, &limit)?;
+                    for w in manager.apply_limit(*pid, &limit)? {
+                        eprintln!("warning: {w}");
+                    }
                     println!("applied limits to pid {pid}");
                 }
             }
@@ -401,14 +559,26 @@ fn run() -> Result<ExitCode> {
             application,
             cgroup,
             forget,
+            yes,
         } => {
+            let manager = manager.as_ref().expect("checked by needs_cgroup_manager");
             if let Some(cgroup_name) = cgroup {
                 // Remove by cgroup name
+                if !manager.cgroup_exists(&cgroup_name) {
+                    return Err(Error::InvalidArgs(format!(
+                        "no rlm cgroup named '{cgroup_name}' (see: rlm status)"
+                    )));
+                }
                 manager.remove_application_limit(&cgroup_name)?;
                 println!("removed limits from cgroup '{}'", cgroup_name);
             } else if let Some(app_name) = application {
                 // Remove application cgroup
                 let cgroup_name = format!("app-{}", app_name.replace(['/', ' '], "_"));
+                if !manager.cgroup_exists(&cgroup_name) {
+                    return Err(Error::InvalidArgs(format!(
+                        "no rlm cgroup named '{cgroup_name}' (see: rlm status)"
+                    )));
+                }
                 manager.remove_application_limit(&cgroup_name)?;
                 println!("removed limits from application '{}'", app_name);
 
@@ -429,19 +599,41 @@ fn run() -> Result<ExitCode> {
                         );
                     }
                 }
-            } else {
-                // Remove individual processes
-                let pids = resolve_pids(pid, name.as_deref())?;
+            } else if let Some(name) = name {
+                // Remove all matching processes by name
+                let my_uid = current_uid();
+                let pids = resolve_name_pids(&name, my_uid)?;
 
-                if !confirm_batch(&pids, "Unlimit") {
-                    println!("cancelled");
-                    return Ok(ExitCode::SUCCESS);
+                if let Some(code) = confirm_or_exit(&pids, "Unlimit", yes)? {
+                    return Ok(code);
                 }
 
+                let mut removed = 0usize;
                 for pid in &pids {
-                    manager.remove_limit(*pid)?;
-                    println!("removed limits from pid {pid}");
+                    match unlimit_pid_target(*pid, manager.find_cgroup_for_pid(*pid).as_deref()) {
+                        Ok(cgroup_name) => {
+                            manager.remove_application_limit(&cgroup_name)?;
+                            println!("removed limits from pid {pid}");
+                            removed += 1;
+                        }
+                        Err(e) => eprintln!("warning: {e}"),
+                    }
                 }
+                if removed == 0 {
+                    return Err(Error::InvalidArgs(format!(
+                        "no process matching '{name}' is limited by rlm"
+                    )));
+                }
+            } else if let Some(pid) = pid {
+                // Remove a single process
+                let cgroup_name =
+                    unlimit_pid_target(pid, manager.find_cgroup_for_pid(pid).as_deref())?;
+                manager.remove_application_limit(&cgroup_name)?;
+                println!("removed limits from pid {pid}");
+            } else {
+                return Err(Error::InvalidArgs(
+                    "specify --pid, --name, --application, or --cgroup".into(),
+                ));
             }
         }
 
@@ -453,28 +645,33 @@ fn run() -> Result<ExitCode> {
             io_write,
             command,
         } => {
-            let limit = if let Some(profile_name) = profile {
-                let config = Config::load()?;
-                let Some(p) = config.get_profile(&profile_name) else {
-                    return Err(Error::Config(format!("profile '{profile_name}' not found")));
-                };
-                p.to_limit()?
-            } else {
-                let limit = build_limit(
-                    memory.as_deref(),
-                    cpu.as_deref(),
-                    io_read.as_deref(),
-                    io_write.as_deref(),
-                )?;
-                if limit.memory.is_none() && limit.cpu.is_none() && limit.io.is_none() {
-                    return Err(Error::InvalidArgs(
-                        "specify --profile or at least one limit".into(),
-                    ));
+            let manager = manager.as_ref().expect("checked by needs_cgroup_manager");
+            let base = match profile {
+                Some(profile_name) => {
+                    let config = Config::load()?;
+                    let p = config.get_profile(&profile_name).ok_or_else(|| {
+                        Error::Config(format!(
+                            "profile '{profile_name}' not found (see: rlm profiles)"
+                        ))
+                    })?;
+                    p.to_limit()?
                 }
-                limit
+                None => Limit::default(),
             };
+            let flags = build_limit(
+                memory.as_deref(),
+                cpu.as_deref(),
+                io_read.as_deref(),
+                io_write.as_deref(),
+            )?;
+            let limit = base.overlay(&flags);
+            if limit.is_empty() {
+                return Err(Error::InvalidArgs(
+                    "specify --profile or at least one limit".into(),
+                ));
+            }
 
-            return run_with_limits(&manager, &limit, &command);
+            return run::run_with_limits(manager, &limit, &command);
         }
 
         Commands::Profiles => {
@@ -540,6 +737,8 @@ fn run() -> Result<ExitCode> {
                 serde_yaml_ng::from_str(&content)
                     .map_err(|e| Error::Config(format!("Failed to parse profiles: {e}")))?;
 
+            validate_import(&imported)?;
+
             if imported.is_empty() {
                 println!("no profiles in file");
             } else {
@@ -564,7 +763,8 @@ fn run() -> Result<ExitCode> {
         }
 
         Commands::Status => {
-            let processes = rlm_core::status::get_managed_processes(&manager)?;
+            let manager = manager.as_ref().expect("checked by needs_cgroup_manager");
+            let processes = rlm_core::status::get_managed_processes(manager)?;
 
             if processes.is_empty() {
                 println!("no processes currently managed");
@@ -602,14 +802,23 @@ fn run() -> Result<ExitCode> {
                 }
                 println!("\nNote: 'shared' means multiple processes share the same limit pool");
             }
+
+            let empty = rlm_core::status::empty_cgroups(manager);
+            if !empty.is_empty() {
+                println!(
+                    "note: {} empty rlm cgroup(s): {}. Remove with: rlm unlimit --cgroup <name>",
+                    empty.len(),
+                    empty.join(", ")
+                );
+            }
         }
 
         Commands::Doctor => {
-            run_doctor();
+            return Ok(doctor::run());
         }
 
         Commands::Guard { action } => {
-            return run_guard(&manager, action);
+            return run_guard(action);
         }
 
         Commands::Rule { action } => {
@@ -672,19 +881,102 @@ fn run_rule(action: RuleAction) -> Result<ExitCode> {
     }
 }
 
-fn run_guard(manager: &CgroupManager, action: GuardAction) -> Result<ExitCode> {
+fn run_guard(action: GuardAction) -> Result<ExitCode> {
     match action {
-        GuardAction::Enable => systemctl(&["enable", "--now", "rlm-guard"]),
+        GuardAction::Enable => guard_enable(),
         GuardAction::Disable => systemctl(&["disable", "--now", "rlm-guard"]),
-        GuardAction::Status => {
-            guard_status(manager);
-            Ok(ExitCode::SUCCESS)
-        }
-        GuardAction::Test => {
-            guard_test(manager);
+        GuardAction::Status => Ok(guard_status()),
+        GuardAction::Test => Ok(guard_test()),
+        GuardAction::History { lines } => {
+            guard_history(lines);
             Ok(ExitCode::SUCCESS)
         }
     }
+}
+
+/// Validate every imported profile before any of them are written. On
+/// failure nothing is saved: the whole import is rejected, naming every
+/// invalid profile (sorted by name), so `rlm import` can't leave a config
+/// with limits that only fail at use.
+fn validate_import(profiles: &std::collections::HashMap<String, common::Profile>) -> Result<()> {
+    let mut errors: Vec<(String, String)> = profiles
+        .iter()
+        .filter_map(|(name, p)| p.validate().err().map(|e| (name.clone(), e.to_string())))
+        .collect();
+    if errors.is_empty() {
+        return Ok(());
+    }
+    errors.sort_by(|a, b| a.0.cmp(&b.0));
+    let list: Vec<String> = errors
+        .into_iter()
+        .map(|(name, e)| format!("'{name}': {e}"))
+        .collect();
+    Err(Error::Config(format!(
+        "import rejected, nothing was written. Fix these profiles: {}",
+        list.join("; ")
+    )))
+}
+
+/// Install a user unit pointing at the real `rlm-guard` when no packaged
+/// unit exists (or refresh one this command wrote earlier), then enable and
+/// start the service.
+fn guard_enable() -> Result<ExitCode> {
+    let config_dir = dirs::config_dir()
+        .ok_or_else(|| Error::InvalidArgs("cannot find the user config directory".into()))?;
+    let unit_path = guard_unit::user_unit_path(&config_dir);
+    let existing = std::fs::read_to_string(&unit_path).ok();
+    let current_exe = std::env::current_exe().ok();
+    let path_env = std::env::var_os("PATH");
+    let guard_bin = guard_unit::find_guard_binary(current_exe.as_deref(), path_env.as_deref());
+    let system_dirs: Vec<&std::path::Path> = guard_unit::SYSTEM_UNIT_DIRS
+        .iter()
+        .map(std::path::Path::new)
+        .collect();
+    let plan = guard_unit::plan_enable(
+        guard_unit::system_unit_installed(&system_dirs),
+        existing.as_deref(),
+        guard_bin.as_deref(),
+        &unit_path,
+    );
+    // Read before `enable --now`, which starts a stopped service.
+    let was_active = rlm_core::guard::service::query().active == "active";
+    let mut unit_written = false;
+    match plan {
+        guard_unit::EnablePlan::NoBinary => {
+            return Err(Error::InvalidArgs(
+                "rlm-guard was not found next to rlm or on PATH. Install it with: cargo install --path cli (from a source checkout) or: cargo install rlmctl".into(),
+            ));
+        }
+        guard_unit::EnablePlan::WriteUserUnit { path, contents } => {
+            if let Some(dir) = path.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            // A 0.1 unit may carry the user's edits; keep a copy before replacing it.
+            if let Ok(old) = std::fs::read_to_string(&path) {
+                if !old.starts_with(guard_unit::GENERATED_MARKER) {
+                    let backup = path.with_extension("service.bak");
+                    std::fs::write(&backup, old)?;
+                    println!("saved the previous unit as {}", backup.display());
+                }
+            }
+            std::fs::write(&path, contents)?;
+            println!("wrote {}", path.display());
+            unit_written = true;
+            let reload = systemctl(&["daemon-reload"])?;
+            if reload != ExitCode::SUCCESS {
+                return Ok(reload);
+            }
+        }
+        guard_unit::EnablePlan::UserUnitCustom => {
+            println!("note: keeping your own {}", unit_path.display());
+        }
+        guard_unit::EnablePlan::UseSystemUnit | guard_unit::EnablePlan::UserUnitCurrent => {}
+    }
+    let code = systemctl(&["enable", "--now", "rlm-guard"])?;
+    if let Some(note) = guard_unit::restart_note(was_active, unit_written) {
+        println!("{note}");
+    }
+    Ok(code)
 }
 
 fn systemctl(args: &[&str]) -> Result<ExitCode> {
@@ -700,31 +992,49 @@ fn systemctl(args: &[&str]) -> Result<ExitCode> {
     })
 }
 
-/// Current real UID from the kernel.
-fn current_uid() -> u32 {
-    // SAFETY: getuid() is always safe; it only reads our real UID.
-    unsafe { libc::getuid() }
-}
+/// Print the guard's service state, config validity, current pressure,
+/// policy, active interventions, and recent history. Does not need a
+/// [`CgroupManager`]: unlike `guard test`, it never resolves escalation
+/// targets (`rlm_base = None`), only reads pressure.
+///
+/// Returns [`ExitCode::FAILURE`] when the config is invalid: everything
+/// still prints (using a best-effort fallback config for the pressure/policy
+/// lines) so the output stays informative, but scripts checking the exit
+/// code see the failure instead of it being silently swallowed.
+fn guard_status() -> ExitCode {
+    let (cfg, config_err) = match Config::load_validated() {
+        Ok(c) => (c, None),
+        Err(e) => (Config::load().unwrap_or_default(), Some(e)),
+    };
 
-fn guard_status(manager: &CgroupManager) {
-    let cfg = Config::load().unwrap_or_default();
-    let rlm_base = rlm_core::guard::sampler::strip_cgroup_root(manager.base_path());
-    if rlm_base.is_none() {
-        tracing::error!(
-            "base_path {:?} isn't under /sys/fs/cgroup; escalation target resolution disabled",
-            manager.base_path()
-        );
-    }
-    let sampler =
-        rlm_core::guard::Sampler::new(cfg.guard, std::process::id(), current_uid(), rlm_base);
-
-    match sampler.sample() {
-        Some(s) => println!(
-            "Memory pressure: some(avg10)={:.1}%  full(avg10)={:.1}%  available={} MB",
-            s.some_avg10, s.full_avg10, s.mem_available_mb
+    println!(
+        "Service:  {}",
+        rlm_core::guard::service::describe(&rlm_core::guard::service::query())
+    );
+    match &config_err {
+        None => println!("Config:   ok"),
+        Some(e) => println!(
+            "Config:   {}",
+            rlm_core::guard::report::config_error_line(
+                &rlm_core::guard::report::config_error_path(),
+                e
+            )
         ),
-        None => println!("Memory pressure: PSI unavailable (/proc/pressure/memory)"),
     }
+
+    let sampler =
+        rlm_core::guard::Sampler::new(cfg.guard.clone(), std::process::id(), current_uid(), None);
+    match sampler.sample() {
+        Some(s) => println!("Pressure: {}", rlm_core::guard::report::pressure_line(&s)),
+        None => println!(
+            "Pressure: {}",
+            rlm_core::guard::report::pressure_unavailable()
+        ),
+    }
+    println!(
+        "Policy:   {}",
+        rlm_core::guard::report::trigger_line(&cfg.guard.trigger)
+    );
 
     // Active interventions come from the guard's own write-ahead journal.
     // We use `Journal::read_entries` rather than `Journal::open` here
@@ -741,33 +1051,60 @@ fn guard_status(manager: &CgroupManager) {
         &rlm_core::guard::cgfs::boot_id(),
     );
     if entries.is_empty() {
-        println!("\nNo active guard interventions.");
-        return;
+        println!("Interventions: none");
+    } else {
+        println!("Interventions:");
+        for e in &entries {
+            println!("  {}", rlm_core::guard::report::intervention_line(e));
+        }
     }
 
-    println!("\nActive guard interventions:");
-    for e in &entries {
-        let state = match e.action {
-            rlm_core::guard::journal::JournalAction::Freeze => "frozen".to_string(),
-            rlm_core::guard::journal::JournalAction::Cap => {
-                format!("capped our_high={}", e.our_high.as_deref().unwrap_or("?"))
-            }
-        };
-        println!("  {} [{state}]", e.cgroup);
+    let recent =
+        rlm_core::guard::history::read_recent(&rlm_core::guard::history::history_path(), 5);
+    if recent.is_empty() {
+        println!("History:  none recorded yet");
+    } else {
+        println!("History:");
+        let now = rlm_core::guard::history::unix_now();
+        for e in &recent {
+            println!("  {}", rlm_core::guard::report::history_line(e, now));
+        }
+    }
+
+    println!("Full history: rlm guard history (also: journalctl --user -u rlm-guard)");
+
+    if config_err.is_some() {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
     }
 }
 
-fn guard_test(manager: &CgroupManager) {
+fn guard_test() -> ExitCode {
     // Single-shot preview: ticks a FRESH engine once at now_ms=0, so it shows
     // what the guard's *first* action would be right now (the escalation gate is
     // open and no prior interventions exist). It does not simulate recovery or
-    // cooldown behavior, and applies nothing.
-    let cfg = Config::load().unwrap_or_default();
-    let rlm_base = rlm_core::guard::sampler::strip_cgroup_root(manager.base_path());
+    // cooldown behavior, and applies nothing. Uses the default base path (not a
+    // live CgroupManager) so this still works on a host without cgroups v2.
+    let cfg = match Config::load_validated() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!(
+                "error: {}",
+                rlm_core::guard::report::config_error_line(
+                    &rlm_core::guard::report::config_error_path(),
+                    &e
+                )
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+    let base_path = CgroupManager::default_base_path();
+    let rlm_base = rlm_core::guard::sampler::strip_cgroup_root(&base_path);
     if rlm_base.is_none() {
         tracing::error!(
             "base_path {:?} isn't under /sys/fs/cgroup; escalation target resolution disabled",
-            manager.base_path()
+            base_path
         );
     }
     let sampler = rlm_core::guard::Sampler::new(
@@ -779,20 +1116,25 @@ fn guard_test(manager: &CgroupManager) {
     let mut engine = rlm_core::guard::PolicyEngine::new(cfg.guard);
 
     let Some(sample) = sampler.sample() else {
-        println!("PSI unavailable; cannot evaluate guard actions.");
-        return;
+        println!(
+            "Pressure: {}; cannot evaluate guard actions.",
+            rlm_core::guard::report::pressure_unavailable()
+        );
+        return ExitCode::SUCCESS;
     };
-    let procs = sampler.eligible();
-    let live = sampler.live_cgroups();
+    let snapshot = rlm_core::process::list_for_uid(current_uid()).unwrap_or_default();
+    let procs = sampler.candidates(&snapshot);
+    let targets =
+        rlm_core::guard::sampler::targets_from_procs(&procs, &rlm_core::guard::cgfs::current_bytes);
+    // A fresh engine holds no interventions, so nothing needs a liveness check.
+    let live = std::collections::HashSet::new();
     println!(
-        "Pressure: some={:.1}%  full={:.1}%  available={} MB  |  {} eligible process(es)",
-        sample.some_avg10,
-        sample.full_avg10,
-        sample.mem_available_mb,
+        "{}  |  {} eligible process(es)",
+        rlm_core::guard::report::pressure_line(&sample),
         procs.len()
     );
 
-    let actions = engine.tick(0, sample, &procs, &live);
+    let actions = engine.tick(0, sample, &targets, &live);
     if actions.is_empty() {
         println!("No action would be taken right now.");
     } else {
@@ -801,183 +1143,47 @@ fn guard_test(manager: &CgroupManager) {
             println!("  {a:?}");
         }
     }
+    ExitCode::SUCCESS
 }
 
-fn run_doctor() {
-    println!("rlm doctor - checking system requirements\n");
-
-    let mut all_ok = true;
-
-    // Check cgroups v2
-    let cgroup_check = std::path::Path::new("/sys/fs/cgroup/cgroup.controllers").exists();
-    print_check("cgroups v2 available", cgroup_check);
-    if !cgroup_check {
-        println!("  -> ensure kernel supports cgroups v2 and unified hierarchy is mounted");
-        all_ok = false;
+/// Print up to `lines` most recent guard interventions, newest last.
+fn guard_history(lines: usize) {
+    let events =
+        rlm_core::guard::history::read_recent(&rlm_core::guard::history::history_path(), lines);
+    if events.is_empty() {
+        println!("no guard interventions recorded yet");
+        return;
     }
-
-    // Check available controllers
-    if cgroup_check {
-        if let Ok(controllers) = std::fs::read_to_string("/sys/fs/cgroup/cgroup.controllers") {
-            let has_memory = controllers.contains("memory");
-            let has_cpu = controllers.contains("cpu");
-            let has_io = controllers.contains("io");
-
-            print_check("memory controller", has_memory);
-            print_check("cpu controller", has_cpu);
-            print_check("io controller", has_io);
-
-            if !has_memory || !has_cpu || !has_io {
-                all_ok = false;
-            }
-        }
+    let now = rlm_core::guard::history::unix_now();
+    for e in &events {
+        println!("{}", rlm_core::guard::report::history_line(e, now));
     }
-
-    // Check user cgroup delegation (for non-root)
-    let uid = std::fs::read_to_string("/proc/self/status")
-        .ok()
-        .and_then(|s| {
-            s.lines()
-                .find(|l| l.starts_with("Uid:"))
-                .and_then(|l| l.split_whitespace().nth(1))
-                .and_then(|u| u.parse::<u32>().ok())
-        });
-
-    if let Some(uid) = uid {
-        if uid != 0 {
-            let user_slice =
-                format!("/sys/fs/cgroup/user.slice/user-{uid}.slice/user@{uid}.service");
-            let delegation_ok = std::path::Path::new(&user_slice).exists();
-            print_check("user cgroup delegation", delegation_ok);
-            if !delegation_ok {
-                println!("  -> run these commands to enable delegation:");
-                println!("     sudo mkdir -p /etc/systemd/system/user@.service.d");
-                println!("     echo '[Service]' | sudo tee /etc/systemd/system/user@.service.d/delegate.conf");
-                println!("     echo 'Delegate=cpu memory io' | sudo tee -a /etc/systemd/system/user@.service.d/delegate.conf");
-                println!("     sudo systemctl daemon-reload");
-                println!("     # then log out and back in");
-                all_ok = false;
-            }
-        } else {
-            print_check("running as root", true);
-        }
-    }
-
-    // Check config file
-    let config_path = dirs::config_dir()
-        .map(|p| p.join("rlm/config.yaml"))
-        .unwrap_or_default();
-    let config_exists = config_path.exists();
-    print_check(
-        &format!("config file ({})", config_path.display()),
-        config_exists,
-    );
-    if !config_exists {
-        println!("  -> optional: create config for profiles");
-    }
-
-    // Check PSI availability (required by the freeze guard, rlm-guard)
-    let psi_ok = std::path::Path::new("/proc/pressure/memory").exists();
-    print_check("memory pressure info (PSI, for rlm-guard)", psi_ok);
-    if !psi_ok {
-        println!("  -> the freeze guard needs PSI; boot with `psi=1` if your kernel disables it");
-    }
-
-    println!();
-    if all_ok {
-        println!("all checks passed - rlm is ready to use");
-    } else {
-        println!("some checks failed - see hints above");
-    }
-}
-
-fn print_check(name: &str, ok: bool) {
-    let status = if ok { "[ok]" } else { "[FAIL]" };
-    println!("{:>8} {}", status, name);
-}
-
-fn run_with_limits(
-    manager: &CgroupManager,
-    limit: &common::Limit,
-    command: &[String],
-) -> Result<ExitCode> {
-    let (program, args) = command
-        .split_first()
-        .ok_or_else(|| common::Error::InvalidArgs("command is required".into()))?;
-
-    // Generate a collision-resistant cgroup name. Using only the PID risks
-    // reusing a stale leaked `run-<pid>` cgroup after PID reuse; the timestamp
-    // suffix makes that effectively impossible.
-    let uniq = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let cgroup_name = format!("run-{}-{}", std::process::id(), uniq);
-
-    // Create cgroup and set limits BEFORE spawning the process
-    let cgroup_path = manager.prepare_cgroup(&cgroup_name, limit)?;
-
-    // Set up signal handler
-    let terminated = Arc::new(AtomicBool::new(false));
-    let terminated_clone = Arc::clone(&terminated);
-
-    ctrlc::set_handler(move || {
-        terminated_clone.store(true, Ordering::SeqCst);
-    })
-    .ok();
-
-    // Place the child into the cgroup BEFORE it execs, so it is constrained from
-    // its first instruction (see CgroupManager::placement_command).
-    let mut cmd = manager.placement_command(&cgroup_path, program);
-    cmd.args(args);
-    let mut child = cmd.spawn()?;
-
-    let pid = child.id();
-
-    // Fallback: ensure the process is in the cgroup even if pre-exec placement
-    // failed. Idempotent if it's already there.
-    if let Err(e) = manager.add_to_cgroup(&cgroup_path, pid) {
-        eprintln!("warning: failed to apply limits: {e}");
-    }
-
-    // Track if we've sent SIGTERM
-    let mut sigterm_sent = false;
-
-    // Wait for process, checking for signals
-    let status = loop {
-        if terminated.load(Ordering::SeqCst) && !sigterm_sent {
-            // Forward signal to child (only once)
-            // SAFETY: pid is a valid process ID obtained from child.id() of a process
-            // we just spawned. libc::kill with SIGTERM is safe for any PID - worst case
-            // the process already exited and kill returns an error (which we ignore).
-            unsafe {
-                libc::kill(pid as i32, libc::SIGTERM);
-            }
-            sigterm_sent = true;
-        }
-
-        match child.try_wait()? {
-            Some(status) => break status,
-            None => std::thread::sleep(std::time::Duration::from_millis(100)),
-        }
-    };
-
-    // Clean up our ephemeral cgroup. Don't propagate a cleanup error here: cgroup
-    // v2 can briefly return EBUSY on rmdir right after the last process exits, and
-    // we must not let that mask the child program's real exit code.
-    if let Err(e) = manager.cleanup_cgroup(&cgroup_name) {
-        eprintln!("warning: failed to remove cgroup: {e}");
-    }
-
-    Ok(status
-        .code()
-        .map(|c| ExitCode::from(c as u8))
-        .unwrap_or(ExitCode::FAILURE))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn packaging_metadata_is_consistent() {
+        const MANIFEST: &str = include_str!("../Cargo.toml");
+        assert!(
+            MANIFEST.contains("name = \"rlmctl\""),
+            "crates.io package name"
+        );
+        assert!(
+            MANIFEST.contains("name = \"rlm\"\npath = \"src/main.rs\""),
+            "binary stays rlm"
+        );
+        assert!(
+            MANIFEST.contains("name = \"rlm-guard\""),
+            "guard ships in the same package"
+        );
+        assert!(MANIFEST.contains("rlm-delegate.conf"));
+        assert!(!MANIFEST.contains("dist/delegate.conf"));
+        assert!(MANIFEST.contains("maintainer-scripts = \"../dist/deb\""));
+        assert_eq!(env!("CARGO_PKG_VERSION"), "0.2.0");
+    }
 
     #[test]
     fn parse_pid_list_basic() {
@@ -999,5 +1205,93 @@ mod tests {
         assert!(parse_pid_list("1,abc,3").is_err());
         assert!(parse_pid_list("1,,3").is_err()); // empty element
         assert!(parse_pid_list("-1").is_err()); // negative
+    }
+
+    #[test]
+    fn commands_that_need_the_cgroup_manager() {
+        let needs =
+            |args: &[&str]| needs_cgroup_manager(&Cli::try_parse_from(args).unwrap().command);
+        assert!(!needs(&["rlm", "doctor"]));
+        assert!(!needs(&["rlm", "profiles"]));
+        assert!(!needs(&["rlm", "export", "x.yaml"]));
+        assert!(!needs(&["rlm", "import", "x.yaml"]));
+        assert!(!needs(&["rlm", "guard", "status"]));
+        assert!(!needs(&["rlm", "rule", "list"]));
+        assert!(needs(&["rlm", "status"]));
+        assert!(needs(&["rlm", "limit", "--pid", "5", "--memory", "1G"]));
+        assert!(needs(&["rlm", "unlimit", "--pid", "5"]));
+        assert!(needs(&["rlm", "run", "--memory", "1G", "--", "true"]));
+    }
+
+    #[test]
+    fn save_without_application_is_rejected() {
+        // clap's `requires` did not enforce this in 0.1; the check is explicit now.
+        assert!(validate_limit_args(true, None).is_err());
+        assert!(validate_limit_args(true, Some("firefox")).is_ok());
+        assert!(validate_limit_args(false, None).is_ok());
+    }
+
+    #[test]
+    fn other_users_and_protected_processes_are_refused() {
+        let protect = common::protect_set(&[]);
+        let p = |uid: u32, comm: &str, exe: &str| rlm_core::process::ProcessInfo {
+            pid: 42,
+            uid,
+            name: comm.into(),
+            executable: Some(exe.into()),
+            ..Default::default()
+        };
+        assert!(check_target(
+            &p(1000, "firefox", "/usr/bin/firefox"),
+            1000,
+            &protect,
+            false
+        )
+        .is_ok());
+        let e = check_target(&p(0, "sshd", "/usr/sbin/sshd"), 1000, &protect, true)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("belongs to uid 0"), "{e}");
+        let e = check_target(&p(1000, "bash", "/usr/bin/bash"), 1000, &protect, false)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("--force"), "{e}");
+        assert!(check_target(&p(1000, "bash", "/usr/bin/bash"), 1000, &protect, true).is_ok());
+        assert!(
+            check_target(&p(1000, "bash", "/usr/bin/bash"), 0, &protect, false).is_err(),
+            "root still respects the protect list"
+        );
+    }
+
+    #[test]
+    fn unlimit_pid_reports_what_it_would_touch() {
+        assert_eq!(unlimit_pid_target(5, Some("pid-5")).unwrap(), "pid-5");
+        let e = unlimit_pid_target(5, None).unwrap_err().to_string();
+        assert!(e.contains("not limited by rlm"), "{e}");
+        let e = unlimit_pid_target(5, Some("app-firefox"))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("rlm unlimit --cgroup app-firefox"), "{e}");
+    }
+
+    #[test]
+    fn import_rejects_the_whole_file_if_any_profile_is_invalid() {
+        let mut m = std::collections::HashMap::new();
+        m.insert(
+            "good".to_string(),
+            common::Profile {
+                cpu: Some("50%".into()),
+                ..Default::default()
+            },
+        );
+        m.insert(
+            "bad".to_string(),
+            common::Profile {
+                memory: Some("1K".into()),
+                ..Default::default()
+            },
+        );
+        let e = validate_import(&m).unwrap_err().to_string();
+        assert!(e.contains("bad") && !e.contains("good"), "{e}");
     }
 }

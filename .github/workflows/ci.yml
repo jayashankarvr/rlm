@@ -31,16 +31,34 @@ jobs:
           key: ${{ runner.os }}-cargo-cli-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Build CLI
-        run: cargo build --release -p rlm -p rlm-guard -p rlm-core -p common
+        run: cargo build --release -p rlmctl -p rlmctl-core -p rlmctl-common
 
       - name: Run tests
-        run: cargo test -p rlm -p rlm-guard -p rlm-core -p common
+        run: cargo test -p rlmctl -p rlmctl-core -p rlmctl-common
 
       - name: Run clippy
-        run: cargo clippy -p rlm -p rlm-guard -p rlm-core -p common -- -D warnings
+        run: cargo clippy -p rlmctl -p rlmctl-core -p rlmctl-common --all-targets -- -D warnings
 
       - name: Check formatting
-        run: cargo fmt --check
+        run: cargo fmt --all --check
+
+      - name: Check docs against the code
+        run: scripts/check-docs.sh
+
+  msrv:
+    name: MSRV (Rust 1.87)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust 1.87
+        uses: dtolnay/rust-toolchain@1.87
+
+      - name: Build CLI and core
+        run: cargo build --locked -p rlmctl -p rlmctl-core -p rlmctl-common
+
+      - name: Run tests
+        run: cargo test --locked -p rlmctl -p rlmctl-core -p rlmctl-common
 
   build-gui:
     name: Build GUI
@@ -74,7 +92,7 @@ jobs:
         run: cargo build --release -p rlm-gtk
 
       - name: Run clippy on GUI
-        run: cargo clippy -p rlm-gtk -- -D warnings
+        run: cargo clippy -p rlm-gtk --all-targets -- -D warnings
 
   security-audit:
     name: Security Audit

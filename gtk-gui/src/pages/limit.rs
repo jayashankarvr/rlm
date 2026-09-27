@@ -43,7 +43,7 @@ pub fn create(manager: Option<Arc<CgroupManager>>) -> gtk::Widget {
 
     let page = adw::PreferencesPage::new();
     page.set_title("Limit");
-    page.set_icon_name(Some("speedometer-symbolic"));
+    page.set_icon_name(Some("power-profile-balanced-symbolic"));
 
     // Main heading group
     let header_group = adw::PreferencesGroup::new();
@@ -364,9 +364,8 @@ fn setup_pid_validation(entry: &adw::EntryRow) {
 fn load_profile_names() -> Vec<String> {
     let mut names = vec!["(None)".to_string()];
     if let Ok(config) = common::Config::load() {
-        names.extend(config.all_profiles().keys().cloned());
+        names.extend(config.profile_names());
     }
-    names.sort();
     names
 }
 
@@ -398,7 +397,22 @@ fn apply_profile(state: &Rc<RefCell<LimitState>>, index: usize) {
 }
 
 fn load_all_processes(state: &Rc<RefCell<LimitState>>) {
-    if let Ok(processes) = rlm_core::process::list_all() {
+    let uid = rlm_core::process::current_uid();
+    let processes = if uid == 0 {
+        rlm_core::process::list_all()
+    } else {
+        rlm_core::process::list_for_uid(uid)
+    };
+    if let Ok(processes) = processes {
+        let protect = common::protect_set(
+            &common::Config::load()
+                .map(|c| c.guard.selection.protect)
+                .unwrap_or_default(),
+        );
+        let processes: Vec<_> = processes
+            .into_iter()
+            .filter(|p| !common::is_protected(&protect, &p.name, p.exe_name()))
+            .collect();
         state.borrow().all_processes.replace(processes);
     }
 }
@@ -720,8 +734,8 @@ fn apply_limits(state: &Rc<RefCell<LimitState>>) {
             };
 
             match manager.apply_limit_to_multiple(&pids, &limit, &cgroup_name) {
-                Ok(()) => {
-                    state.status_label.set_text("");
+                Ok(warnings) => {
+                    show_warnings(&state.status_label, &warnings);
                     let mut msg = if pids.len() == 1 {
                         format!("Limits applied to PID {}", pids[0])
                     } else {
@@ -776,8 +790,8 @@ fn apply_limits(state: &Rc<RefCell<LimitState>>) {
             };
 
             match manager.apply_limit(pid, &limit) {
-                Ok(()) => {
-                    state.status_label.set_text("");
+                Ok(warnings) => {
+                    show_warnings(&state.status_label, &warnings);
                     let toast = adw::Toast::new(&format!("Limits applied to PID {pid}"));
                     toast.set_timeout(3);
                     state.toast_overlay.add_toast(toast);
@@ -785,6 +799,15 @@ fn apply_limits(state: &Rc<RefCell<LimitState>>) {
                 Err(e) => show_status(&state.status_label, &format!("{e}"), true),
             }
         }
+    }
+}
+
+/// Clear the status label, or show non-fatal warnings from a limit call.
+fn show_warnings(label: &gtk::Label, warnings: &[String]) {
+    if warnings.is_empty() {
+        label.set_text("");
+    } else {
+        show_status(label, &format!("Warning: {}", warnings.join("; ")), true);
     }
 }
 

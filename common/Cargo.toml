@@ -1,12 +1,20 @@
 [package]
-name = "common"
+name = "rlmctl-common"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Shared types for rlm"
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+description = "Shared limit, profile and config types for rlmctl (the rlm resource limit manager)"
+keywords = ["cgroups", "resource-limit", "linux"]
+categories = ["os::linux-apis"]
 
 [dependencies]
 thiserror.workspace = true
 serde.workspace = true
 serde_yaml_ng.workspace = true
 dirs.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

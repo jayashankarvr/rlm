@@ -330,16 +330,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b05b61dc5112cbb17e4b6cd61790d9845d13888356391624cbe7e41efeac1e75"
 
 [[package]]
-name = "common"
-version = "0.1.0"
-dependencies = [
- "dirs",
- "serde",
- "serde_yaml_ng",
- "thiserror",
-]
-
-[[package]]
 name = "concurrent-queue"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -825,7 +815,7 @@ dependencies = [
 
 [[package]]
 name = "harness"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clap",
  "ctrlc",
@@ -1216,58 +1206,57 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7a2d987857b319362043e95f5353c0535c1f58eec5336fdfcf626430af7def58"
 
 [[package]]
-name = "rlm"
-version = "0.1.0"
+name = "rlm-gtk"
+version = "0.2.0"
 dependencies = [
- "clap",
- "common",
- "ctrlc",
- "dirs",
- "libc",
- "rlm-core",
- "serde_yaml_ng",
+ "gtk4",
+ "libadwaita",
+ "open",
+ "rlmctl-common",
+ "rlmctl-core",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
-name = "rlm-core"
-version = "0.1.0"
+name = "rlmctl"
+version = "0.2.0"
 dependencies = [
- "common",
+ "clap",
+ "ctrlc",
  "dirs",
  "libc",
+ "rlmctl-common",
+ "rlmctl-core",
+ "serde_yaml_ng",
+ "tempfile",
+ "tracing",
+]
+
+[[package]]
+name = "rlmctl-common"
+version = "0.2.0"
+dependencies = [
+ "dirs",
+ "serde",
+ "serde_yaml_ng",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
+name = "rlmctl-core"
+version = "0.2.0"
+dependencies = [
+ "dirs",
+ "libc",
+ "rlmctl-common",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror",
  "tracing",
+ "tracing-subscriber",
  "zbus",
-]
-
-[[package]]
-name = "rlm-gtk"
-version = "0.1.0"
-dependencies = [
- "common",
- "gtk4",
- "libadwaita",
- "open",
- "rlm-core",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "rlm-guard"
-version = "0.1.0"
-dependencies = [
- "common",
- "ctrlc",
- "libc",
- "rlm-core",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]

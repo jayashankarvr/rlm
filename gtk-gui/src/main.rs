@@ -1,3 +1,4 @@
+mod icons;
 mod pages;
 mod widgets;
 mod window;
@@ -9,7 +10,7 @@ use std::sync::Arc;
 const APP_ID: &str = "io.github.rlm.gtk";
 
 fn main() -> gtk::glib::ExitCode {
-    tracing_subscriber::fmt::init();
+    rlm_core::logging::init(tracing::Level::WARN);
 
     let app = adw::Application::builder().application_id(APP_ID).build();
 
