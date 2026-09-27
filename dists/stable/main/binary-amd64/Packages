@@ -1,0 +1,479 @@
+Package: rlm-gtk
+Architecture: amd64
+Version: 0.2.3-1
+Priority: optional
+Section: admin
+Maintainer: Jayashankar <me.jayashankar@gmail.com>
+Installed-Size: 2725
+Depends: libadwaita-1-0 (>= 1.4), libadwaita-1-0 (>= 1.4~beta), libc6 (>= 2.39), libglib2.0-0t64 (>= 2.54.0), libgtk-4-1 (>= 4.0.0), libgtk-4-1 (>= 4.6), rlm (>= 0.2.0)
+Filename: pool/main/rlm-gtk_0.2.3-1_amd64.deb
+Size: 955304
+MD5sum: 40a20b968a3f8a069f9335ae51394ef2
+SHA1: 3e0f110cd39c958d1eb1f736c473ebbfe474de50
+SHA256: b6b97ae856b145d7ab6518fc6c1a175550ac8242a34089faf39091c6a5163533
+SHA512: 53c0d062cd2c0c01ebd1f6930aa715c655d0bf2e4755d6758c092b417ed3565c9ccf7fd189020ff256b5e3fc43b5d2eaf275ebbe00691be62ae7a055287d9faa
+Homepage: https://github.com/jayashankarvr/rlm
+Description: GTK4/Libadwaita GUI for Resource Limit Manager
+ # rlm
+ .
+ rlm sets memory, CPU and I/O limits on your own Linux processes without root,
+ from a CLI or a GTK app, and can run a small guard that freezes or caps a
+ runaway app under memory pressure instead of killing it.
+ .
+ ![rlm run, rlm status and rlm guard status in a
+ terminal](https://raw.githubusercontent.com/jayashankarvr/rlm/main/docs/assets/hero.svg)
+ .
+ ## What it does today
+ .
+ **Limits.** rlm uses cgroup v2 under systemd user delegation, so it needs no
+ root for your own processes.
+ .
+ - `rlm run` starts a command inside a new limited cgroup.
+ - `rlm limit` limits processes that are already running, by PID, by name, by
+ application (one shared pool) or by a list of PIDs.
+ - `rlm unlimit` removes limits.
+ - Profiles are named sets of limits: four built-in presets plus your own in
+ `~/.config/rlm/config.yaml`.
+ - Persistent rules (`rlm limit --application <exe> ... --save`) are applied by
+ rlm-guard to running and future instances of an app.
+ .
+ **The guard (rlm-guard).** This is an optional per-user service.
+ .
+ - It acts only on your own apps under systemd's `app.slice` and on the cgroups
+ rlm itself created.
+ - It acts when apps are stalling on memory (PSI) and available memory is below
+ 20% of RAM, or at once when available memory drops below 400 MB, stall or not.
+ - It freezes the app for 5 seconds, then applies a soft `memory.high` cap if
+ pressure stays high.
+ - A freeze always ends after those 5 seconds; a cap is lifted after 30 seconds
+ of calm.
+ - It never sends a signal to any process.
+ - It holds at most 3 apps at a time.
+ .
+ ### Not yet
+ .
+ - Protecting the desktop session's own memory (a `memory.min` chain for the
+ session).
+ - Event-driven PSI triggers. The guard samples once per second.
+ - Notifications with Resume or Keep paused actions. Today the guard can send a
+ plain `notify-send` warning when pressure rises.
+ - A system-wide mode for other users or system services.
+ .
+ ### What it is not
+ .
+ - Not a replacement for systemd-oomd or earlyoom. Those kill processes; rlm
+ pauses and slows them. You can run both.
+ - Run as your user, it has no effect on processes of other users or of root.
+ .
+ ## Supported distros
+ .
+ The CLI and the guard run on any Linux with cgroup v2, PSI and systemd. The GUI
+ (rlm-gtk) also needs GTK 4 and libadwaita 1.4 or newer.
+ .
+ The release packages and the tarball for the CLI and guard are built on Ubuntu
+ 22.04 and need glibc 2.35 or newer. The GUI packages are built on Ubuntu 24.04
+ and need glibc 2.39 or newer. The table lists where the release packages
+ install:
+ .
+ | Distro              | CLI and guard | GUI     |
+ |---------------------|---------------|---------|
+ | Ubuntu              | 22.04+        | 24.04+  |
+ | Debian              | 12+           | 13+     |
+ | Fedora              | 36+           | 40+     |
+ | RHEL / Rocky / Alma | 10+           | 10+     |
+ | Arch (AUR)          | current       | current |
+ | openSUSE Tumbleweed | current       | current |
+ .
+ The GUI needs libadwaita 1.4, which Ubuntu 22.04, Debian 12 and RHEL 9 do not
+ ship; use the CLI there. On a distro with cgroup v2 but an older glibc (RHEL 9,
+ Fedora 31 to 35), build the CLI and guard with `cargo install rlmctl` instead
+ of using the packages. A distro that still boots with cgroup v1 may work with
+ the `systemd.unified_cgroup_hierarchy=1` kernel boot parameter.
+ .
+ ## Install
+ .
+ ### From packages
+ .
+ Download from [Releases](https://github.com/jayashankarvr/rlm/releases)
+ (packages are available from 0.2.0 on):
+ .
+ ```bash
+ # Debian/Ubuntu
+ sudo apt install ./rlm_*.deb ./rlm-gtk_*.deb   # rlm-gtk: Ubuntu 24.04+, Debian
+ 13+
+ .
+ # Fedora/RHEL
+ sudo dnf install ./rlm-0*.rpm ./rlm-gtk-0*.rpm   # rlm-gtk: Fedora 40+, RHEL
+ 10+
+ ```
+ .
+ The `rlm` package ships `rlm`, `rlm-guard`, a systemd user unit for the guard
+ and the delegation drop-in `rlm-delegate.conf`. `rlm-gtk` is the GUI.
+ .
+ ### Arch Linux (AUR)
+ .
+ The AUR packages are `rlm` and `rlm-gtk` (from 0.2.0 on):
+ .
+ ```bash
+ yay -S rlm rlm-gtk
+ ```
+ .
+ ### crates.io
+ .
+ From 0.2.0 on:
+ .
+ ```bash
+ cargo install rlmctl
+ ```
+ .
+ This installs `rlm` and `rlm-guard` and needs Rust 1.87 or newer. The GUI is
+ not on crates.io because it needs the GTK4 and libadwaita development headers
+ to build; install it from source.
+ .
+ ### Upgrading a 0.1 cargo install
+ .
+ In 0.1, `rlm` and `rlm-guard` were installed by cargo packages named `rlm` and
+ `rlm-guard`. From 0.2 on both binaries belong to the package `rlmctl`, and
+ cargo refuses to overwrite a binary another package owns ("binary `rlm` already
+ exists in destination as part of `rlm v0.1.0`"). Remove the old packages first:
+ .
+ ```bash
+ cargo uninstall rlm rlm-guard     # it is fine if one of them is reported as
+ not installed
+ cargo install rlmctl              # or: cargo install --path cli
+ systemctl --user restart rlm-guard   # only if you enabled the guard
+ ```
+ .
+ Skipping the restart leaves the 0.1 guard running until you log out.
+ .
+ ### From source
+ .
+ ```bash
+ cargo install --path cli        # rlm and rlm-guard
+ cargo install --path gtk-gui    # rlm-gtk (needs GTK4 and libadwaita headers)
+ ./install-desktop.sh            # desktop entry and icon
+ ```
+ .
+ ### After installing
+ .
+ 1. Enable cgroup delegation. The packages do this for you. For crates.io and
+ source installs:
+ .
+    ```bash
+    sudo mkdir -p /etc/systemd/system/user@.service.d
+    printf '[Service]\nDelegate=cpu memory io\n' | sudo tee
+ /etc/systemd/system/user@.service.d/rlm-delegate.conf
+    sudo systemctl daemon-reload
+    ```
+ .
+ 2. Log out and back in.
+ 3. Run `rlm doctor`. It checks cgroup v2, delegated controllers, PSI, your
+ config file and the guard binary, unit and service.
+ 4. Optional: run `rlm guard enable`. When no packaged unit exists (crates.io
+ and source installs), it writes `~/.config/systemd/user/rlm-guard.service`
+ pointing at your `rlm-guard`, then enables and starts it with `systemctl
+ --user`.
+ .
+ After you upgrade the binary, restart the guard so the new version runs:
+ .
+ ```bash
+ systemctl --user restart rlm-guard
+ ```
+ .
+ ## CLI usage
+ .
+ ### Limit a running process
+ .
+ ```bash
+ # By PID (individual limit)
+ rlm limit --pid 1234 --memory 512M --cpu 50%
+ .
+ # By name (limits all matching processes individually)
+ rlm limit --name firefox --memory 2G
+ .
+ # By application (all processes share one limit pool)
+ rlm limit --application firefox --memory 4G --cpu 75%
+ .
+ # Several PIDs sharing one pool
+ rlm limit --all-pids 1234,5678,9012 --memory 2G --cpu 50%
+ .
+ # With I/O limits
+ rlm limit --pid 1234 --memory 1G --io-read 50M --io-write 20M
+ .
+ # Preview without applying
+ rlm limit --pid 1234 --memory 512M --dry-run
+ ```
+ .
+ With `--application` or `--all-pids`, the processes share the limits: 10
+ processes with a 4G limit get 4G in total, not 4G each. See
+ [APPLICATION_LIMITING.md](https://github.com/jayashankarvr/rlm/blob/main/APPLICATION_LIMITING.md).
+ .
+ - Sizes use binary units and accept decimals and `B`/`iB` suffixes: `512M`,
+ `1.5G`, `2GiB`, `512MB` are all valid. Memory limits below 8M and I/O limits
+ below 64K/s are rejected.
+ - CPU is a percentage of one core: `50%` is half a core, `200%` is two cores.
+ - Batch operations (`--name`, `--application`, `--all-pids`) ask for
+ confirmation. Pass `--yes` to skip it. When 2 or more processes match and stdin
+ is not a terminal, for example in scripts, `--yes` is required.
+ - Processes on the guard protect list (desktop session, shells, audio) are
+ refused unless you pass `--force`. `rlm limit` reads that list from your
+ config, so it refuses to run while the config file is invalid; fix the file, or
+ pass `--force` to skip the protect list.
+ - Processes owned by other users are always refused (unless you run rlm as
+ root). `--force` does not change that.
+ .
+ ### Persistent rules
+ .
+ ```bash
+ rlm limit --application firefox --memory 4G --save   # limit now and keep the
+ rule
+ rlm rule list
+ rlm rule remove firefox
+ ```
+ .
+ A saved rule is applied by rlm-guard, so the guard service must be running for
+ it to cover future instances. `rlm unlimit --application firefox` drops the
+ live limit but keeps the rule; add `--forget` to delete the rule too.
+ .
+ ### Run a command with limits
+ .
+ ```bash
+ rlm run --memory 1G --cpu 100% -- ./my-program arg1 arg2
+ .
+ # Using a profile (names are case-insensitive); explicit flags override the
+ profile
+ rlm run --profile browser -- firefox
+ rlm run --profile browser --memory 6G -- firefox
+ ```
+ .
+ ### Remove limits
+ .
+ ```bash
+ rlm unlimit --pid 1234
+ rlm unlimit --name firefox
+ rlm unlimit --application firefox  # shared application limit
+ rlm unlimit --cgroup app-firefox   # by cgroup name
+ ```
+ .
+ `rlm unlimit` says so when there was nothing to remove. A released process can
+ be limited again.
+ .
+ ### Other commands
+ .
+ ```bash
+ rlm status                           # managed processes and their limits
+ (read-only)
+ rlm profiles                         # built-in presets and your profiles
+ rlm doctor                           # diagnose setup problems
+ rlm export profiles.yaml             # export your profiles
+ rlm import profiles.yaml             # import profiles
+ rlm import profiles.yaml --overwrite # replace profiles with the same name
+ ```
+ .
+ ## How limits behave
+ .
+ - `--memory` sets `memory.max`, plus `memory.high` at 90% of it so reclaim
+ starts before the hard limit, and `memory.swap.max=0` so the limited app cannot
+ spill into swap. The limit is a real RAM ceiling.
+ - Memory a process allocated before you limited it stays charged to its
+ previous cgroup. Only new allocations count against the limit. To cap an app's
+ whole footprint, start it with `rlm run`.
+ - `rlm run` keeps limits applied to everything the command started. If a
+ launcher forks and exits, its children stay limited in the `run-*` cgroup and
+ rlm prints the cgroup name. `rlm status` lists that cgroup, and `rlm unlimit
+ --cgroup <name>` removes it.
+ - `rlm run` exits with the command's exit code, or with 128+N if signal N
+ killed it (137 for SIGKILL). When the memory limit caused the kernel to kill a
+ process, rlm says so.
+ .
+ ## GUI
+ .
+ Launch with `rlm-gtk`. Pages:
+ .
+ - **Managed Processes**: what rlm is limiting now
+ - **Limit Running**: limit running processes, either whole apps under one
+ shared limit ("Whole app (shared limit)") or one process on its own ("Single
+ process")
+ - **Launch New**: start a command with limits
+ - **Profiles**: the built-in presets and your own profiles; create, edit and
+ delete profiles, and Restore an edited preset to its built-in limits
+ - **Guard**: service state, pressure, active interventions and history
+ .
+ The menu button in the sidebar opens Keyboard Shortcuts and About (version and
+ license). Ctrl+1 to Ctrl+5 switch pages. Ctrl+Q quits. The GUI hides processes
+ on the protect list; use the CLI with `--force` if you really need to limit
+ one.
+ .
+ ## Freeze guard
+ .
+ ```bash
+ rlm guard enable    # install the user unit if needed, enable and start the
+ service
+ rlm guard status    # service state, config, pressure, active interventions,
+ recent history
+ rlm guard test      # dry run: what it would do right now, without acting
+ rlm guard history   # recent freezes, thaws, caps, lifts and failures
+ rlm guard disable   # stop and disable the service
+ ```
+ .
+ Configure it under `guard:` in `~/.config/rlm/config.yaml`. Every key is
+ optional; these are the defaults:
+ .
+ ```yaml
+ guard:
+   enabled: true
+   trigger:
+     psi_some_warn: 10
+     psi_some_high: 30
+     psi_full_critical: 10
+     mem_available_floor_mb: 400
+     act_below_available_pct: 20
+   timing:
+     freeze_hold_secs: 5
+     calm_hold_secs: 30
+     freeze_cooldown_secs: 60
+     sample_interval_ms: 1000
+   selection:
+     min_rss_mb: 200
+     protect: []   # names here are added to the built-in protect list
+   notify: true
+ ```
+ .
+ - `enabled: false` turns off freezing and capping; rlm-guard still applies
+ persistent rules.
+ - `notify` sends a plain `notify-send` warning when pressure rises.
+ - Unknown keys and out-of-range values are errors. `calm_hold_secs` and
+ `freeze_cooldown_secs` go up to 86400 (one day), `freeze_hold_secs` up to 60,
+ `sample_interval_ms` from 100 to 60000, and `mem_available_floor_mb` and
+ `min_rss_mb` up to 16777216 (16 TiB). With an invalid config, rlm-guard exits
+ with status 78 and stays stopped until you fix the file, then run `systemctl
+ --user restart rlm-guard`. `rlm guard status` shows the error.
+ .
+ ### How the guard stays safe
+ .
+ **Can it kill my app?**
+ No. It only freezes the app's cgroup (through systemd, with a direct
+ `cgroup.freeze` write as fallback) or sets `memory.high`. It never sends a
+ signal. The kernel's own OOM killer is not affected, so a hard memory limit you
+ set can still end in an OOM kill.
+ .
+ **What if the guard crashes while an app is frozen?**
+ Every freeze and cap is written to a journal,
+ `~/.local/state/rlm/guard-journal.jsonl`, before it is applied. On the next
+ start, including a start that fails on a bad config, the guard replays the
+ journal and restores the app. Entries are keyed by boot and cgroup identity, so
+ it never touches a cgroup that was since recreated for something else. On a
+ normal stop (SIGTERM) it undoes everything before exiting. Only one guard runs
+ per user: a second `rlm-guard` finds `~/.local/state/rlm/rlm-guard.lock` held
+ and exits with status 75 without touching the journal. The service does not
+ restart on status 75; run `systemctl --user restart rlm-guard` once the other
+ guard has stopped. When no state dir is known, the journal, lock and history go
+ in `$XDG_RUNTIME_DIR/rlm` instead. Without either dir the guard never uses a
+ shared dir such as `/tmp`: it does not freeze or cap, keeps applying persistent
+ rules, and records no history.
+ .
+ **Could it freeze my desktop or terminal?**
+ Processes on the protect list are never frozen: desktop shells and compositors,
+ Xorg and Xwayland, sshd, systemd, dbus-daemon, the audio stack, bash, zsh,
+ fish, rlm-guard, common terminal emulators (GNOME Terminal, Ptyxis, Console,
+ Konsole, kitty, Alacritty, WezTerm, foot, Tilix, Xfce Terminal, xterm,
+ Terminator) and the tmux and screen multiplexers. Names are matched on the
+ executable name, or on the process name when the executable is a script
+ interpreter (Terminator runs as python3) or renames itself (the tmux server). A
+ scope that contains a protected process, such as a terminal whose shell shares
+ the scope with a runaway script, is capped and never frozen. Add your own names
+ under `guard.selection.protect`.
+ .
+ **Why did it not act when my machine was slow?**
+ It needs apps under `app.slice` stalling on memory while available memory is
+ below 20% of RAM. The one exception is available memory below 400 MB: then it
+ acts even without a stall. Slowness from CPU or disk load does not count. A
+ stall inside one cgroup that rlm limited is ignored by design: that app is
+ hitting the limit you set, and the rest of the system is fine.
+ .
+ **How hard is a cap?**
+ Soft. A cap never goes below 90% of the app's current memory or below 256 MiB.
+ On hosts without swap it never asks for more than the app's file cache can give
+ back. The app slows down while the kernel reclaims; it is not killed. A cap
+ never loosens a lower `memory.high` that was already in place.
+ .
+ ### Seeing what the guard did
+ .
+ - `rlm guard status`: current state and the last few events
+ - `rlm guard history`: the recorded history
+ (`~/.local/state/rlm/guard-history.jsonl`)
+ - The GUI Guard page, which also has a switch that runs `rlm guard enable` or
+ `rlm guard disable`
+ - `journalctl --user -u rlm-guard` for the full log
+ .
+ ## Configuration
+ .
+ Create `~/.config/rlm/config.yaml`:
+ .
+ ```yaml
+ profiles:
+   browser:
+     memory: "4G"
+     cpu: "200%"
+   dev:
+     memory: "8G"
+     cpu: "400%"
+     io_read: "100M"
+     io_write: "50M"
+ ```
+ .
+ A system-wide file at `/etc/rlm/config.yaml` is read first; your file overrides
+ it.
+ .
+ ### Built-in presets
+ .
+ | Preset  | Memory | CPU  | I/O read/write |
+ |---------|--------|------|----------------|
+ | Light   | 512M   | 25%  | -              |
+ | Medium  | 2G     | 50%  | 50M/25M        |
+ | Heavy   | 4G     | 100% | 100M/50M       |
+ | Browser | 4G     | 75%  | -              |
+ .
+ Profile names are case-insensitive: `rlm run --profile medium -- ./command`.
+ .
+ ## Cgroup delegation (non-root usage)
+ .
+ rlm writes to cgroups your systemd user manager owns, so the memory, cpu and io
+ controllers must be delegated to it. The .deb, .rpm and AUR packages install
+ the drop-in `rlm-delegate.conf`; log out and back in after installing.
+ .
+ For crates.io and source installs:
+ .
+ ```bash
+ sudo mkdir -p /etc/systemd/system/user@.service.d
+ printf '[Service]\nDelegate=cpu memory io\n' | sudo tee
+ /etc/systemd/system/user@.service.d/rlm-delegate.conf
+ sudo systemctl daemon-reload
+ ```
+ .
+ Then log out and back in, and run `rlm doctor` to verify.
+ .
+ ## License
+ .
+ Apache 2.0
+
+Package: rlm
+Architecture: amd64
+Version: 0.2.3-1
+Priority: optional
+Section: admin
+Maintainer: Jayashankar <me.jayashankar@gmail.com>
+Installed-Size: 6759
+Depends: libc6 (>= 2.34), systemd
+Filename: pool/main/rlm_0.2.3-1_amd64.deb
+Size: 1581380
+MD5sum: 3c7ee53bbad5d615aaa7d1dba3401065
+SHA1: ae1f1f77979f4e2698bbc5a4ed5b7978a2f4eed1
+SHA256: c7350305e507302c28623b89f3385bcde7eb09177cb1721ffaaee5f7fd7fb897
+SHA512: 296b03c7b845d80f4d8ffccb57ed98f888345257082292f43c8f2e841a975a4fc27ccddce61fbadbdc8162c032119f01addbd23ff467fb6f55fb10109ffb97c4
+Homepage: https://github.com/jayashankarvr/rlm
+Description: Unprivileged cgroup v2 limits and a freeze guard for your own Linux processes
+ rlm sets unprivileged cgroup v2 memory, CPU and I/O limits on your own
+ processes through systemd user delegation. rlm-guard is a per-user daemon that
+ freezes or caps a runaway app under memory pressure instead of killing it.
+
