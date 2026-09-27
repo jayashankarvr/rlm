@@ -959,7 +959,7 @@ fn guard_enable() -> Result<ExitCode> {
                     println!("saved the previous unit as {}", backup.display());
                 }
             }
-            std::fs::write(&path, contents)?;
+            guard_unit::write_atomically(&path, &contents)?;
             println!("wrote {}", path.display());
             unit_written = true;
             let reload = systemctl(&["daemon-reload"])?;

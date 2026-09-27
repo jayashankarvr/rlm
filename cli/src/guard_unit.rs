@@ -159,6 +159,30 @@ pub fn plan_enable(
     }
 }
 
+/// Write `contents` to `path` through a temporary file in the same
+/// directory and a rename, so an interrupted write never leaves a truncated
+/// unit behind. The temporary name does not end in `.service`, so systemd
+/// ignores it if it is left over.
+pub fn write_atomically(path: &Path, contents: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let dir = path.parent().unwrap_or(Path::new("."));
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let tmp = dir.join(format!(".{name}.tmp-{}", std::process::id()));
+    let result = std::fs::File::create(&tmp)
+        .and_then(|mut f| {
+            f.write_all(contents.as_bytes())?;
+            f.sync_all()
+        })
+        .and_then(|()| std::fs::rename(&tmp, path));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
 /// Note for `rlm guard enable` when the service was already running before
 /// the command. `systemctl enable --now` does not restart a running unit,
 /// so the old process keeps going until the user restarts it.
@@ -189,6 +213,21 @@ mod tests {
         assert!(restart_note(true, false)
             .unwrap()
             .contains("systemctl --user restart rlm-guard"));
+    }
+
+    #[test]
+    fn write_atomically_replaces_the_file_and_leaves_no_temp() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("rlm-guard.service");
+        std::fs::write(&p, "old contents that are longer than the new ones\n").unwrap();
+        write_atomically(&p, "new\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "new\n");
+        let names: Vec<_> = std::fs::read_dir(d.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("rlm-guard.service")]);
+        assert!(write_atomically(&d.path().join("missing/rlm-guard.service"), "x").is_err());
     }
 
     #[test]
