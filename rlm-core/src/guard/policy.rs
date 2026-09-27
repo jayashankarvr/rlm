@@ -29,6 +29,10 @@ pub const MAX_HELD_APPS: usize = 3;
 /// Growth rate (bytes/s of `memory.current`) an app must reach to be picked
 /// as the one causing pressure. Below it, the largest app is picked instead.
 pub const MIN_GROWTH_BPS: f64 = 1_048_576.0;
+/// Most consecutive ticks victim selection waits for growth data when every
+/// eligible cgroup is newly seen. After that the largest app is picked, so a
+/// stream of short-lived cgroups cannot keep the guard from acting.
+pub const MAX_COLD_DEFER_TICKS: u32 = 3;
 
 /// True when the host is actually short of memory: below the hard floor, or
 /// below `act_below_available_pct` percent of RAM. A stall confined to one
@@ -85,6 +89,9 @@ pub struct PolicyEngine {
     /// When we last emitted a `Notify` — drives notification rate-limiting.
     /// `None` means "never notified", so the first eligible notify fires.
     last_notify_ms: Option<u64>,
+    /// Consecutive ticks on which selection deferred for lack of growth
+    /// data. Bounded by [`MAX_COLD_DEFER_TICKS`].
+    cold_defer_ticks: u32,
 }
 
 impl PolicyEngine {
@@ -99,6 +106,7 @@ impl PolicyEngine {
             last_action_ms: None,
             last_action_partial: false,
             last_notify_ms: None,
+            cold_defer_ticks: 0,
         }
     }
 
@@ -140,6 +148,7 @@ impl PolicyEngine {
                 if self.calm_since_ms.is_none() {
                     self.calm_since_ms = Some(now_ms);
                 }
+                self.cold_defer_ticks = 0;
             }
             _ => self.calm_since_ms = None,
         }
@@ -417,11 +426,12 @@ impl PolicyEngine {
     /// at least one was first seen this tick, nothing is picked. The next
     /// tick (one sample interval later) has rates, so an idle large app is
     /// not frozen in place of a smaller one that is growing. The deferral
-    /// lasts one tick at most per new cgroup; if no eligible cgroup reports
-    /// `memory.current` at all, growth can never be measured and the largest
-    /// app is picked at once.
+    /// lasts one tick at most per new cgroup, and at most
+    /// [`MAX_COLD_DEFER_TICKS`] ticks in a row; after that the largest app is
+    /// picked. If no eligible cgroup reports `memory.current` at all, growth
+    /// can never be measured and the largest app is picked at once.
     fn select_app<'a>(
-        &self,
+        &mut self,
         targets: &'a [Target],
         blocked: &HashSet<String>,
     ) -> Option<(String, Vec<&'a Target>)> {
@@ -456,9 +466,11 @@ impl PolicyEngine {
                     .is_some_and(|g| !g.warm)
             })
         });
-        if !any_warm && any_cold {
+        if !any_warm && any_cold && self.cold_defer_ticks < MAX_COLD_DEFER_TICKS {
+            self.cold_defer_ticks += 1;
             return None;
         }
+        self.cold_defer_ticks = 0;
         let growth = |ms: &[&Target]| -> f64 {
             ms.iter()
                 .map(|m| {
@@ -1232,6 +1244,35 @@ mod tests {
             freeze_targets(&e.tick(1_000, sample(0.0, 0.0, 300), &t1, &live_from(&t1))),
             vec!["/app.slice/hog.scope"]
         );
+    }
+
+    /// A new cgroup on every tick never gets a measured growth rate. The
+    /// deferral is bounded, so the guard still acts by the fourth tick and
+    /// falls back to the largest eligible app.
+    #[test]
+    fn cold_start_deferral_is_bounded_when_cgroups_keep_changing() {
+        let mut e = PolicyEngine::new(cfg());
+        let crit = sample(0.0, 0.0, 300);
+        for tick in 0..4u64 {
+            let ts = vec![
+                target(
+                    &format!("big{tick}"),
+                    &format!("/app.slice/b{tick}.scope"),
+                    3000,
+                ),
+                target(
+                    &format!("small{tick}"),
+                    &format!("/app.slice/s{tick}.scope"),
+                    1000,
+                ),
+            ];
+            let frozen = freeze_targets(&e.tick(tick * 1_000, crit, &ts, &live_from(&ts)));
+            if tick < u64::from(MAX_COLD_DEFER_TICKS) {
+                assert!(frozen.is_empty(), "tick {tick} should defer: {frozen:?}");
+            } else {
+                assert_eq!(frozen, vec![format!("/app.slice/b{tick}.scope")]);
+            }
+        }
     }
 
     /// Without any memory.current reading, growth can never be measured, so
