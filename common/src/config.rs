@@ -286,6 +286,16 @@ pub struct Profile {
 }
 
 impl Profile {
+    /// Validate that this profile's limit values parse and that it sets at
+    /// least one limit (an all-empty profile is never useful).
+    pub fn validate(&self) -> Result<()> {
+        let l = self.to_limit()?;
+        if l.is_empty() {
+            return Err(Error::Config("profile sets no limits".into()));
+        }
+        Ok(())
+    }
+
     pub fn to_limit(&self) -> Result<Limit> {
         use crate::{CpuLimit, IoLimit, MemoryLimit};
 
@@ -454,13 +464,41 @@ impl Config {
         dirs::config_dir().map(|d| d.join("rlm").join("config.yaml"))
     }
 
-    /// Find a profile by name (includes built-in presets)
+    /// Find a profile by name (includes built-in presets): an exact match
+    /// wins, otherwise a case-insensitive match is used if exactly one
+    /// profile name matches.
     pub fn get_profile(&self, name: &str) -> Option<Profile> {
-        // User profiles override built-in presets
-        if let Some(p) = self.profiles.get(name) {
-            return Some(p.clone());
+        let resolved = self.resolve_profile_name(name)?;
+        self.all_profiles().get(&resolved).cloned()
+    }
+
+    /// Resolve `name` to a real profile name: an exact match wins, otherwise
+    /// the single case-insensitive match, or `None` if there is no match or
+    /// more than one.
+    pub fn resolve_profile_name(&self, name: &str) -> Option<String> {
+        let all = self.all_profiles();
+        if all.contains_key(name) {
+            return Some(name.to_string());
         }
-        builtin_presets().get(name).cloned()
+        let mut matches = all.keys().filter(|k| k.eq_ignore_ascii_case(name));
+        let first = matches.next()?.clone();
+        if matches.next().is_some() {
+            None
+        } else {
+            Some(first)
+        }
+    }
+
+    /// All profile names (user profiles plus built-in presets), sorted
+    /// case-insensitively (ties broken by the name itself).
+    pub fn profile_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.all_profiles().into_keys().collect();
+        names.sort_by(|a, b| {
+            a.to_lowercase()
+                .cmp(&b.to_lowercase())
+                .then_with(|| a.cmp(b))
+        });
+        names
     }
 
     /// Get all profiles including built-in presets (user profiles override)
@@ -653,6 +691,71 @@ mod tests {
             f(&mut c);
             assert!(c.validate().is_err(), "case {i} should be rejected");
         }
+    }
+
+    #[test]
+    fn profile_lookup_is_case_insensitive_when_unique() {
+        let cfg = Config::default();
+        assert!(cfg.get_profile("browser").is_some());
+        assert!(cfg.get_profile("MEDIUM").is_some());
+        assert!(cfg.get_profile("nope").is_none());
+    }
+
+    #[test]
+    fn exact_profile_name_wins_and_ambiguity_is_refused() {
+        let mut cfg = Config::default();
+        cfg.profiles.insert(
+            "browser".into(),
+            Profile {
+                memory: Some("1G".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            cfg.get_profile("browser").unwrap().memory.as_deref(),
+            Some("1G")
+        );
+        assert_eq!(
+            cfg.get_profile("Browser").unwrap().memory.as_deref(),
+            Some("4G")
+        );
+        assert!(
+            cfg.get_profile("BROWSER").is_none(),
+            "two case-insensitive matches"
+        );
+    }
+
+    #[test]
+    fn profile_names_are_sorted_case_insensitively() {
+        let mut cfg = Config::default();
+        cfg.profiles.insert(
+            "aaa".into(),
+            Profile {
+                cpu: Some("10%".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            cfg.profile_names(),
+            vec!["aaa", "Browser", "Heavy", "Light", "Medium"]
+        );
+    }
+
+    #[test]
+    fn profile_validate_rejects_empty_and_invalid() {
+        assert!(Profile::default().validate().is_err());
+        assert!(Profile {
+            memory: Some("lots".into()),
+            ..Default::default()
+        }
+        .validate()
+        .is_err());
+        assert!(Profile {
+            cpu: Some("50%".into()),
+            ..Default::default()
+        }
+        .validate()
+        .is_ok());
     }
 
     #[test]

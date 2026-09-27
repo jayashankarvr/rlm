@@ -551,6 +551,8 @@ fn run() -> Result<ExitCode> {
                 serde_yaml_ng::from_str(&content)
                     .map_err(|e| Error::Config(format!("Failed to parse profiles: {e}")))?;
 
+            validate_import(&imported)?;
+
             if imported.is_empty() {
                 println!("no profiles in file");
             } else {
@@ -731,6 +733,29 @@ fn config_error_path() -> String {
 /// without touching the real filesystem.
 fn config_error_line(path: &str, e: &Error) -> String {
     format!("invalid ({path}): {e}")
+}
+
+/// Validate every imported profile before any of them are written. On
+/// failure nothing is saved: the whole import is rejected, naming every
+/// invalid profile (sorted by name), so `rlm import` can't leave a config
+/// with limits that only fail at use.
+fn validate_import(profiles: &std::collections::HashMap<String, common::Profile>) -> Result<()> {
+    let mut errors: Vec<(String, String)> = profiles
+        .iter()
+        .filter_map(|(name, p)| p.validate().err().map(|e| (name.clone(), e.to_string())))
+        .collect();
+    if errors.is_empty() {
+        return Ok(());
+    }
+    errors.sort_by(|a, b| a.0.cmp(&b.0));
+    let list: Vec<String> = errors
+        .into_iter()
+        .map(|(name, e)| format!("'{name}': {e}"))
+        .collect();
+    Err(Error::Config(format!(
+        "import rejected, nothing was written. Fix these profiles: {}",
+        list.join("; ")
+    )))
 }
 
 fn systemctl(args: &[&str]) -> Result<ExitCode> {
@@ -1120,5 +1145,26 @@ mod tests {
             config_error_line("/x/config.yaml", &e),
             "invalid (/x/config.yaml): config error: guard: bad value"
         );
+    }
+
+    #[test]
+    fn import_rejects_the_whole_file_if_any_profile_is_invalid() {
+        let mut m = std::collections::HashMap::new();
+        m.insert(
+            "good".to_string(),
+            common::Profile {
+                cpu: Some("50%".into()),
+                ..Default::default()
+            },
+        );
+        m.insert(
+            "bad".to_string(),
+            common::Profile {
+                memory: Some("1K".into()),
+                ..Default::default()
+            },
+        );
+        let e = validate_import(&m).unwrap_err().to_string();
+        assert!(e.contains("bad") && !e.contains("good"), "{e}");
     }
 }
