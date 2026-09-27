@@ -86,6 +86,18 @@ cargo install rlmctl
 
 This installs `rlm` and `rlm-guard` and needs Rust 1.87 or newer. The GUI is not on crates.io because it needs the GTK4 and libadwaita development headers to build; install it from source.
 
+### Upgrading a 0.1 cargo install
+
+In 0.1, `rlm` and `rlm-guard` were installed by cargo packages named `rlm` and `rlm-guard`. From 0.2 on both binaries belong to the package `rlmctl`, and cargo refuses to overwrite a binary another package owns ("binary `rlm` already exists in destination as part of `rlm v0.1.0`"). Remove the old packages first:
+
+```bash
+cargo uninstall rlm rlm-guard     # it is fine if one of them is reported as not installed
+cargo install rlmctl              # or: cargo install --path cli
+systemctl --user restart rlm-guard   # only if you enabled the guard
+```
+
+Skipping the restart leaves the 0.1 guard running until you log out.
+
 ### From source
 
 ```bash

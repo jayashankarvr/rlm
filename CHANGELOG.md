@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Upgrading from 0.1
 
 - rlm-guard 0.1 applied caps as runtime systemd unit properties. The drop-ins it left under `/run` (a cap value, or `infinity` after a restore) can be re-applied by a `systemctl --user daemon-reload` or `set-property` until the next reboot. Reboot once after upgrading to clear them.
+- cargo installs: 0.1 installed `rlm` and `rlm-guard` from cargo packages of the same names; in 0.2 both binaries belong to `rlmctl`, and cargo refuses to overwrite a binary owned by another package. Run `cargo uninstall rlm rlm-guard` first, then `cargo install rlmctl` (or `cargo install --path cli`).
 - After upgrading the binaries, restart the guard so the new version runs: `systemctl --user restart rlm-guard`.
 - The 0.1 .deb installed `/etc/systemd/system/user@.service.d/delegate.conf`; 0.2 installs `rlm-delegate.conf` with the same content. The old file may remain after the upgrade and is safe to delete (then run `sudo systemctl daemon-reload`).
 - Config files are now parsed strictly. A config that 0.1 accepted with unknown keys or out-of-range guard values is now an error; `rlm doctor` and `rlm guard status` name the problem.
