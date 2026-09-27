@@ -6,6 +6,11 @@ if [ -d /run/systemd/system ]; then
     systemctl daemon-reload || true
     echo "rlm: cgroup delegation configured. Log out and back in to apply."
     echo "rlm: to enable the freeze guard, run: rlm guard enable"
+    # Upgrade: a running guard keeps the old binary until restarted. Root
+    # does not restart user services; tell each user to do it.
+    if [ "${1:-1}" -ge 2 ]; then
+        echo "rlm: upgraded. If the guard runs in your session, restart it: systemctl --user restart rlm-guard"
+    fi
 else
     echo "rlm: systemd not detected. Manual cgroup setup may be required."
 fi

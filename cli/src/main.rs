@@ -938,6 +938,9 @@ fn guard_enable() -> Result<ExitCode> {
         guard_bin.as_deref(),
         &unit_path,
     );
+    // Read before `enable --now`, which starts a stopped service.
+    let was_active = rlm_core::guard::service::query().active == "active";
+    let mut unit_written = false;
     match plan {
         guard_unit::EnablePlan::NoBinary => {
             return Err(Error::InvalidArgs(
@@ -950,6 +953,7 @@ fn guard_enable() -> Result<ExitCode> {
             }
             std::fs::write(&path, contents)?;
             println!("wrote {}", path.display());
+            unit_written = true;
             let reload = systemctl(&["daemon-reload"])?;
             if reload != ExitCode::SUCCESS {
                 return Ok(reload);
@@ -960,7 +964,11 @@ fn guard_enable() -> Result<ExitCode> {
         }
         guard_unit::EnablePlan::UseSystemUnit | guard_unit::EnablePlan::UserUnitCurrent => {}
     }
-    systemctl(&["enable", "--now", "rlm-guard"])
+    let code = systemctl(&["enable", "--now", "rlm-guard"])?;
+    if let Some(note) = guard_unit::restart_note(was_active, unit_written) {
+        println!("{note}");
+    }
+    Ok(code)
 }
 
 fn systemctl(args: &[&str]) -> Result<ExitCode> {

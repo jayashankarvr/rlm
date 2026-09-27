@@ -131,10 +131,37 @@ pub fn plan_enable(
     }
 }
 
+/// Note for `rlm guard enable` when the service was already running before
+/// the command. `systemctl enable --now` does not restart a running unit,
+/// so the old process keeps going until the user restarts it.
+pub fn restart_note(was_active: bool, unit_written: bool) -> Option<&'static str> {
+    match (was_active, unit_written) {
+        (false, _) => None,
+        (true, true) => Some(
+            "note: rlm-guard is still running with the old unit. Restart it to use the new one: systemctl --user restart rlm-guard",
+        ),
+        (true, false) => Some(
+            "note: rlm-guard was already running. If you upgraded rlm, restart it so the new version runs: systemctl --user restart rlm-guard",
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn restart_note_only_when_already_running() {
+        assert_eq!(restart_note(false, true), None);
+        assert_eq!(restart_note(false, false), None);
+        let written = restart_note(true, true).unwrap();
+        assert!(written.contains("systemctl --user restart rlm-guard"));
+        assert!(written.contains("old unit"));
+        assert!(restart_note(true, false)
+            .unwrap()
+            .contains("systemctl --user restart rlm-guard"));
+    }
 
     #[test]
     fn render_replaces_only_exec_start_and_marks_the_file() {
