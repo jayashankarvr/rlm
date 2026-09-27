@@ -38,22 +38,31 @@ const SERVICE_QUERY_INTERVAL: Duration = Duration::from_secs(10);
 static SERVICE_CACHE: Mutex<Option<(Instant, ServiceState)>> = Mutex::new(None);
 
 /// The guard's systemd state, re-read at most once every
-/// [`SERVICE_QUERY_INTERVAL`]; a cached value is returned in between.
+/// [`SERVICE_QUERY_INTERVAL`]; a cached value is returned in between. The
+/// lock is not held while `query` runs, so a slow systemctl never blocks
+/// [`invalidate_service_cache`].
 fn cached_service_state() -> ServiceState {
-    let mut cache = SERVICE_CACHE.lock().unwrap();
-    if let Some((last, state)) = cache.as_ref() {
+    if let Some((last, state)) = service_cache().as_ref() {
         if last.elapsed() < SERVICE_QUERY_INTERVAL {
             return state.clone();
         }
     }
     let state = query();
-    *cache = Some((Instant::now(), state.clone()));
+    *service_cache() = Some((Instant::now(), state.clone()));
     state
+}
+
+/// The cache, recovered rather than panicking if a previous holder panicked:
+/// it only ever holds a complete value, so a poisoned lock is still usable.
+fn service_cache() -> std::sync::MutexGuard<'static, Option<(Instant, ServiceState)>> {
+    SERVICE_CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Drop the cached service state so the next read queries systemd.
 fn invalidate_service_cache() {
-    *SERVICE_CACHE.lock().unwrap() = None;
+    *service_cache() = None;
 }
 
 /// Whether the switch should show the guard as on, or `None` when systemd
@@ -490,6 +499,18 @@ mod tests {
         let mut cmd = std::process::Command::new("sh");
         cmd.args(["-c", script]);
         cmd
+    }
+
+    #[test]
+    fn a_poisoned_service_cache_is_recovered() {
+        let _ = std::thread::spawn(|| {
+            let _guard = SERVICE_CACHE.lock().unwrap();
+            panic!("poison the cache");
+        })
+        .join();
+        assert!(SERVICE_CACHE.is_poisoned());
+        invalidate_service_cache();
+        assert!(service_cache().is_none());
     }
 
     #[test]
