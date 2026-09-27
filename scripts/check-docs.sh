@@ -4,7 +4,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 fail() { echo "check-docs: $*" >&2; exit 1; }
 
-grep -qi "prevents system freezes" README.md CLAUDE.md gtk-gui/src/pages/about.rs && fail "overclaim still present"
+grep -qis "prevents system freezes" README.md CLAUDE.md gtk-gui/src/pages/about.rs && fail "overclaim still present"
 grep -n $'\xe2\x80\x94\|\xe2\x86\x92' README.md APPLICATION_LIMITING.md && fail "em-dash or arrow in user docs"
 grep -q "rlm guard history" README.md || fail "README must show rlm guard history"
 grep -q "journalctl --user -u rlm-guard" README.md || fail "README must show journalctl"
