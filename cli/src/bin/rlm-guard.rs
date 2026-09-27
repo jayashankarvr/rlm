@@ -185,9 +185,12 @@ fn run(config: Config) -> common::Result<()> {
         Err(e) => return Err(e),
     };
 
-    // No session bus (e.g. headless) -> every action below falls back to raw
-    // cgroupfs writes; SystemdUser::connect() already encodes that.
+    // Without a session bus (headless, or no answer within 2 s) every action
+    // below falls back to raw cgroupfs writes.
     let systemd = SystemdUser::connect();
+    if systemd.is_none() {
+        tracing::warn!("systemd user bus unavailable; using raw cgroupfs writes");
+    }
     let effector = journal
         .as_ref()
         .map(|j| Effector::new(&manager, j, systemd.as_ref()));
