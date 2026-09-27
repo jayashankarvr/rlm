@@ -485,7 +485,7 @@ fn update_mode_info(label: &gtk::Label, mode: LimitMode) {
             label.set_text("Select one process. It gets its own limits.");
         }
         LimitMode::Application => {
-            label.set_text("Select an application or several processes. They share one set of limits: 4G for 10 processes is 4G in total.");
+            label.set_text("Select one or more applications. They share one set of limits: 4G for 10 processes is 4G in total.");
         }
     }
 }
@@ -528,7 +528,7 @@ fn filter_processes(state: &Rc<RefCell<LimitState>>, query: &str) {
         if filtered_groups.is_empty() {
             let row = adw::ActionRow::new();
             row.set_title(if query.is_empty() {
-                "No application groups found"
+                "No applications found"
             } else {
                 "No matching applications"
             });

@@ -48,9 +48,9 @@ pub struct StatusFields {
 ///
 /// - `Uid:` line is `Uid:\t<real>\t<effective>\t<saved>\t<fs>`; we take the
 ///   first (real) field.
-/// - `Name:` is the comm, truncated to 15 chars by the kernel — that's fine,
+/// - `Name:` is the comm, truncated to 15 chars by the kernel; that is fine:
 ///   it matches the protect-list which also compares against comm.
-/// - `VmSwap:` may be absent (e.g. kernel thread / no swap) — treated as 0.
+/// - `VmSwap:` may be absent (e.g. kernel thread / no swap) and then counts as 0.
 ///
 /// Returns `None` only if the required `Uid:` or `Name:` lines are missing.
 pub fn parse_status(status: &str) -> Option<StatusFields> {
@@ -312,7 +312,8 @@ pub fn find_by_name_for_uid(name: &str, uid: u32) -> Result<NameMatches> {
     Ok(NameMatches { pids, other_users })
 }
 
-/// Group processes by executable path (same application)
+/// Group processes by executable basename (same application). Apps with a
+/// single process get a group of their own.
 pub fn group_by_executable(processes: &[ProcessInfo]) -> Vec<ProcessGroup> {
     let mut groups: HashMap<String, Vec<ProcessInfo>> = HashMap::new();
 
@@ -338,7 +339,6 @@ pub fn group_by_executable(processes: &[ProcessInfo]) -> Vec<ProcessGroup> {
                 processes: procs,
             }
         })
-        .filter(|group| group.processes.len() > 1) // Only groups with multiple processes
         .collect();
     groups.sort_by(|a, b| {
         b.processes
@@ -514,11 +514,13 @@ mod tests {
             p(5, "c"),
             p(6, "c"),
             p(7, "c"),
+            p(8, "d"),
         ];
         let names: Vec<String> = group_by_executable(&procs)
             .into_iter()
             .map(|g| g.name)
             .collect();
-        assert_eq!(names, vec!["c", "a", "b"]);
+        // Single-process apps are listed too.
+        assert_eq!(names, vec!["c", "a", "b", "d"]);
     }
 }
