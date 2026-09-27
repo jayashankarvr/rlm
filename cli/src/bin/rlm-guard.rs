@@ -8,7 +8,9 @@
 use common::Config;
 use rlm_core::guard::history;
 use rlm_core::guard::sampler::{live_cgroups, strip_cgroup_root, targets_from_procs};
-use rlm_core::guard::{cgfs, journal_path, Effector, Journal, PolicyEngine, Sampler, SystemdUser};
+use rlm_core::guard::{
+    cgfs, try_journal_path, Effector, Journal, PolicyEngine, Sampler, SystemdUser,
+};
 use rlm_core::rules::RulesEnforcer;
 use rlm_core::CgroupManager;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -119,7 +121,10 @@ fn recover_only() {
     let Ok(manager) = CgroupManager::new() else {
         return;
     };
-    let Ok(journal) = Journal::open(journal_path(), cgfs::boot_id()) else {
+    let Some(path) = try_journal_path() else {
+        return;
+    };
+    let Ok(journal) = Journal::open(path, cgfs::boot_id()) else {
         return;
     };
     let systemd = SystemdUser::connect();
@@ -164,7 +169,17 @@ fn run(config: Config) -> common::Result<()> {
     // itself (nothing this process does can fix an unwritable
     // $XDG_STATE_HOME, and there's no escalation or rules work to attempt
     // either way).
-    let journal = match Journal::open(journal_path(), cgfs::boot_id()) {
+    // With no per-user state or runtime dir there is nowhere safe for the
+    // journal (never a shared dir such as /tmp), so treat it as a journal
+    // that failed to open: no freeze or cap this run, rules still apply.
+    let opened = match try_journal_path() {
+        Some(path) => Journal::open(path, cgfs::boot_id()),
+        None => Err(common::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no per-user state dir or XDG_RUNTIME_DIR for the guard journal",
+        ))),
+    };
+    let journal = match opened {
         Ok(j) => Some(j),
         Err(e) if enforcer.rule_count() > 0 => {
             tracing::error!(
@@ -235,7 +250,10 @@ fn run(config: Config) -> common::Result<()> {
     let start = Instant::now();
     let mut warned_no_psi = false;
     let mut last_rules_ms: Option<u64> = None;
-    let hist = history::history_path();
+    let hist = history::try_history_path();
+    if hist.is_none() {
+        tracing::warn!("no per-user state dir or XDG_RUNTIME_DIR; guard history is not recorded");
+    }
 
     tracing::info!(
         uid,
@@ -281,8 +299,9 @@ fn run(config: Config) -> common::Result<()> {
                     if let Err(e) = &result {
                         tracing::warn!(?action, "action failed: {e}");
                     }
-                    if let Some(ev) = history::event_for(&action, &result, history::unix_now()) {
-                        if let Err(e) = history::append(&hist, &ev) {
+                    let event = history::event_for(&action, &result, history::unix_now());
+                    if let (Some(hist), Some(ev)) = (&hist, event) {
+                        if let Err(e) = history::append(hist, &ev) {
                             tracing::debug!("history write failed: {e}");
                         }
                     }
