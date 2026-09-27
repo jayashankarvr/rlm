@@ -70,6 +70,16 @@ pub fn create_io_unit_dropdown() -> gtk::DropDown {
     unit_dropdown(IO_UNITS)
 }
 
+/// A flat button showing only `icon`, with `label` as both its tooltip and
+/// the name screen readers announce.
+pub fn icon_button(icon: &str, label: &str) -> gtk::Button {
+    let button = gtk::Button::from_icon_name(icon);
+    button.add_css_class("flat");
+    button.set_tooltip_text(Some(label));
+    button.update_property(&[gtk::accessible::Property::Label(label)]);
+    button
+}
+
 /// Shown when rlm has no cgroup manager, so nothing can be limited.
 pub const NO_MANAGER_HINT: &str =
     "Cannot set up cgroups for your user. Run rlm doctor in a terminal to see why.";

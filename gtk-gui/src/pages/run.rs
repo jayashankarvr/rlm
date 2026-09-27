@@ -1,8 +1,8 @@
 use crate::widgets::{
     cpu_suffix_label, create_io_unit_dropdown, create_unit_dropdown, fit_list_height,
-    get_unit_suffix, limits_description, list_scroller, on_enter, parse_cpu_value, require_manager,
-    set_value_with_unit, setup_number_validation, setup_size_validation, status_toast,
-    with_action_bar, NO_MANAGER_HINT,
+    get_unit_suffix, icon_button, limits_description, list_scroller, on_enter, parse_cpu_value,
+    require_manager, set_value_with_unit, setup_number_validation, setup_size_validation,
+    status_toast, with_action_bar, NO_MANAGER_HINT,
 };
 use adw::prelude::*;
 use gtk::glib;
@@ -78,9 +78,7 @@ pub fn create(manager: Option<Arc<CgroupManager>>) -> gtk::Widget {
     apps_group.set_description(Some("Installed apps. Selecting one fills in its command."));
 
     // Refresh button in header
-    let refresh_btn = gtk::Button::from_icon_name("view-refresh-symbolic");
-    refresh_btn.add_css_class("flat");
-    refresh_btn.set_tooltip_text(Some("Refresh application list"));
+    let refresh_btn = icon_button("view-refresh-symbolic", "Refresh application list");
     apps_group.set_header_suffix(Some(&refresh_btn));
 
     // Search entry

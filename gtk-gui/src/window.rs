@@ -177,11 +177,12 @@ impl Window {
     fn primary_menu() -> gtk::MenuButton {
         let menu = gio::Menu::new();
         menu.append(Some("Keyboard Shortcuts"), Some("win.show-help-overlay"));
-        menu.append(Some("About rlm"), Some("win.about"));
+        menu.append(Some("About Resource Limit Manager"), Some("win.about"));
         let button = gtk::MenuButton::new();
         button.set_icon_name("open-menu-symbolic");
         button.set_menu_model(Some(&menu));
         button.set_tooltip_text(Some("Main Menu"));
+        button.update_property(&[gtk::accessible::Property::Label("Main Menu")]);
         button
     }
 

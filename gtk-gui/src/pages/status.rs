@@ -6,6 +6,7 @@
 
 use crate::pages::guard::guard_running;
 use crate::pages::{gui_error, plain_toast, show_toast};
+use crate::widgets::icon_button;
 use adw::prelude::*;
 use common::{build_limit, format_bytes, AppRule, Config, Limit};
 use gtk::glib;
@@ -243,9 +244,7 @@ impl StatusPage {
         group.set_description(Some(
             "Processes rlm has limited and their limits. The trash button removes a limit.",
         ));
-        let refresh_btn = gtk::Button::from_icon_name("view-refresh-symbolic");
-        refresh_btn.add_css_class("flat");
-        refresh_btn.set_tooltip_text(Some("Refresh process list"));
+        let refresh_btn = icon_button("view-refresh-symbolic", "Refresh process list");
         group.set_header_suffix(Some(&refresh_btn));
         let list_box = gtk::ListBox::new();
         list_box.set_selection_mode(gtk::SelectionMode::None);

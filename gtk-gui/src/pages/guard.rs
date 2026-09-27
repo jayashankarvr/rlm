@@ -9,6 +9,7 @@
 //! CLI. Everything else is read from systemd state, the config, a pressure
 //! sample, the write-ahead journal and the intervention history log.
 
+use crate::widgets::icon_button;
 use adw::prelude::*;
 use common::{Config, GuardConfig, GuardTrigger, BUILTIN_PROTECT};
 use gtk::glib;
@@ -432,9 +433,7 @@ impl GuardPage {
         status_group.set_description(Some(
             "Service and config state, memory pressure, and when the guard acts",
         ));
-        let refresh_btn = gtk::Button::from_icon_name("view-refresh-symbolic");
-        refresh_btn.add_css_class("flat");
-        refresh_btn.set_tooltip_text(Some("Refresh guard status"));
+        let refresh_btn = icon_button("view-refresh-symbolic", "Refresh guard status");
         status_group.set_header_suffix(Some(&refresh_btn));
         let status_list = new_list_box(None);
         let service_row = status_row(&status_list, "Service");

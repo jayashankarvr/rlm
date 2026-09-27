@@ -4,7 +4,7 @@
 
 use crate::pages::{plain_toast, show_toast};
 use crate::widgets::{
-    cpu_suffix_label, create_io_unit_dropdown, create_unit_dropdown, get_unit_suffix,
+    cpu_suffix_label, create_io_unit_dropdown, create_unit_dropdown, get_unit_suffix, icon_button,
     parse_cpu_value, set_value_with_unit, setup_number_validation, setup_size_validation,
 };
 use adw::prelude::*;
@@ -80,6 +80,20 @@ pub fn check_form(name: &str, profile: &Profile) -> Result<(), FormProblem> {
         return Err(FormProblem::NoLimits);
     }
     Ok(())
+}
+
+/// The existing profile name that `name` would clash with, ignoring case:
+/// an exact match first, otherwise the first that differs only in case.
+fn existing_name(names: &[String], name: &str) -> Option<String> {
+    names
+        .iter()
+        .find(|n| n.as_str() == name)
+        .or_else(|| {
+            names
+                .iter()
+                .find(|n| n.to_lowercase() == name.to_lowercase())
+        })
+        .cloned()
 }
 
 /// Whether two profiles set the same limits and match the same executables.
@@ -179,9 +193,7 @@ impl ProfilesPage {
     pub fn new() -> Rc<Self> {
         let page = adw::PreferencesPage::new();
 
-        let add_btn = gtk::Button::from_icon_name("list-add-symbolic");
-        add_btn.add_css_class("flat");
-        add_btn.set_tooltip_text(Some("Create new profile"));
+        let add_btn = icon_button("list-add-symbolic", "Create new profile");
 
         let group = adw::PreferencesGroup::new();
         group.set_title("Saved Profiles");
@@ -538,14 +550,20 @@ impl ProfilesPage {
                 }
             };
 
-            let taken = is_new
-                && Config::load()
-                    .map(|c| c.all_profiles().contains_key(&name))
-                    .unwrap_or(false);
-            if !taken {
+            // Profile names are looked up case-insensitively (see
+            // Config::resolve_profile_name), so "browser" would clash with
+            // "Browser". Replacing keeps the existing name.
+            let taken = if is_new {
+                Config::load()
+                    .ok()
+                    .and_then(|c| existing_name(&c.profile_names(), &name))
+            } else {
+                None
+            };
+            let Some(name) = taken else {
                 finish(&name, profile);
                 return;
-            }
+            };
             let confirm = adw::MessageDialog::new(
                 Some(&dialog_clone),
                 Some(&format!("Replace \u{201c}{name}\u{201d}?")),
@@ -654,6 +672,15 @@ mod tests {
         assert_eq!(light.1.memory.as_deref(), Some("1G"));
         let names: Vec<&str> = listed.iter().map(|(n, _, _)| n.as_str()).collect();
         assert_eq!(names, ["Browser", "Heavy", "Light", "Medium", "mine"]);
+    }
+
+    #[test]
+    fn a_new_name_clashes_whatever_its_case() {
+        let names = vec!["Browser".to_string(), "mine".to_string()];
+        assert_eq!(existing_name(&names, "Browser"), Some("Browser".into()));
+        assert_eq!(existing_name(&names, "browser"), Some("Browser".into()));
+        assert_eq!(existing_name(&names, "MINE"), Some("mine".into()));
+        assert_eq!(existing_name(&names, "Web"), None);
     }
 
     #[test]
