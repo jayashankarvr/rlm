@@ -1258,7 +1258,7 @@ mod tests {
         assert!(MANIFEST.contains("rlm-delegate.conf"));
         assert!(!MANIFEST.contains("dist/delegate.conf"));
         assert!(MANIFEST.contains("maintainer-scripts = \"../dist/deb\""));
-        assert_eq!(env!("CARGO_PKG_VERSION"), "0.2.1");
+        assert_eq!(env!("CARGO_PKG_VERSION"), "0.2.2");
     }
 
     #[test]
