@@ -34,6 +34,24 @@ pub const MIN_GROWTH_BPS: f64 = 1_048_576.0;
 /// stream of short-lived cgroups cannot keep the guard from acting.
 pub const MAX_COLD_DEFER_TICKS: u32 = 3;
 
+/// The level a sample reaches on its own, from the rise thresholds alone
+/// (no hysteresis): Critical when PSI `full` reaches `psi_full_critical` or
+/// free memory is below `mem_available_floor_mb`, High when `some` reaches
+/// `psi_some_high` or `full` reaches [`FULL_HIGH_RISE`], Warn when `some`
+/// reaches `psi_some_warn`. The engine enters a level on exactly these rules;
+/// callers that only show the pressure (the GUI) use this to agree with it.
+pub fn rise_level(s: &Sample, t: &common::GuardTrigger) -> Level {
+    if s.full_avg10 >= t.psi_full_critical || s.mem_available_mb < t.mem_available_floor_mb {
+        Level::Critical
+    } else if s.some_avg10 >= t.psi_some_high || s.full_avg10 >= FULL_HIGH_RISE {
+        Level::High
+    } else if s.some_avg10 >= t.psi_some_warn {
+        Level::Warn
+    } else {
+        Level::Calm
+    }
+}
+
 /// True when the host is actually short of memory: below the hard floor, or
 /// below `act_below_available_pct` percent of RAM. A stall confined to one
 /// cgroup's memory.max leaves MemAvailable high, so it never passes this gate.
@@ -351,9 +369,10 @@ impl PolicyEngine {
         let floor = t.mem_available_floor_mb;
 
         // Rise predicates (cross the upper threshold to enter a level).
-        let warn_rise = s.some_avg10 >= t.psi_some_warn;
-        let high_rise = s.some_avg10 >= t.psi_some_high || s.full_avg10 >= FULL_HIGH_RISE;
-        let crit_rise = s.full_avg10 >= t.psi_full_critical || s.mem_available_mb < floor;
+        let rise = rise_level(&s, t);
+        let crit_rise = rise == Level::Critical;
+        let high_rise = crit_rise || rise == Level::High;
+        let warn_rise = high_rise || rise == Level::Warn;
 
         // Stay predicates (above the lower/fall threshold: keep the level).
         let warn_stay = s.some_avg10 >= t.psi_some_warn / 2.0;
@@ -652,6 +671,29 @@ mod tests {
     /// the liveness-vs-eligibility distinction: every target's cgroup.
     fn live_from(ts: &[Target]) -> std::collections::HashSet<String> {
         ts.iter().map(|t| t.resolution.cgroup.clone()).collect()
+    }
+
+    #[test]
+    fn rise_level_follows_the_engine_rise_rules() {
+        let t = common::GuardTrigger::default();
+        assert_eq!(rise_level(&sample(0.0, 0.0, 8000), &t), Level::Calm);
+        assert_eq!(rise_level(&sample(12.0, 0.0, 8000), &t), Level::Warn);
+        assert_eq!(rise_level(&sample(5.0, 4.0, 2000), &t), Level::High);
+        assert_eq!(rise_level(&sample(31.0, 0.0, 8000), &t), Level::High);
+        assert_eq!(rise_level(&sample(0.0, 10.0, 8000), &t), Level::Critical);
+        // Below the free-memory floor is Critical whatever PSI says.
+        assert_eq!(rise_level(&sample(0.0, 0.0, 300), &t), Level::Critical);
+        // An unreadable MemAvailable is never below the floor.
+        assert_eq!(rise_level(&sample(0.0, 0.0, u64::MAX), &t), Level::Calm);
+        // From Calm, one tick lands on the same level.
+        for s in [
+            sample(5.0, 4.0, 2000),
+            sample(0.0, 0.0, 300),
+            sample(12.0, 0.0, 8000),
+        ] {
+            let e = PolicyEngine::new(cfg());
+            assert_eq!(e.next_level(s), rise_level(&s, &t), "{s:?}");
+        }
     }
 
     #[test]

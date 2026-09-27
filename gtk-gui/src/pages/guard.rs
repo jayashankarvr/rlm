@@ -14,12 +14,13 @@ use common::{Config, GuardConfig, GuardTrigger, BUILTIN_PROTECT};
 use gtk::glib;
 use rlm_core::guard::history::{history_path, read_recent, unix_now, HistoryEvent};
 use rlm_core::guard::journal::JournalEntry;
+use rlm_core::guard::policy::rise_level;
 use rlm_core::guard::report::{
     config_error_line, config_error_path, history_line, intervention_line, pressure_line,
     pressure_unavailable,
 };
 use rlm_core::guard::service::{describe, query, ServiceState};
-use rlm_core::guard::{cgfs, journal_path, Journal, Sample, Sampler};
+use rlm_core::guard::{cgfs, journal_path, Journal, Level, Sample, Sampler};
 use rlm_core::process::current_uid;
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
@@ -187,15 +188,14 @@ fn mb_text(mb: u64) -> String {
     }
 }
 
-/// How much memory pressure a sample shows, judged against the guard's own
-/// trigger thresholds.
+/// How much memory pressure a sample shows, judged by the level the guard
+/// itself would enter for it ([`rise_level`]), so the page never says "no
+/// memory pressure" while the guard acts.
 pub fn pressure_words(s: &Sample, t: &GuardTrigger) -> &'static str {
-    if s.some_avg10 >= t.psi_some_high || s.full_avg10 >= t.psi_full_critical {
-        "high memory pressure"
-    } else if s.some_avg10 >= t.psi_some_warn {
-        "some memory pressure"
-    } else {
-        "no memory pressure"
+    match rise_level(s, t) {
+        Level::Critical | Level::High => "high memory pressure",
+        Level::Warn => "some memory pressure",
+        Level::Calm => "no memory pressure",
     }
 }
 
@@ -782,6 +782,25 @@ mod tests {
     }
 
     #[test]
+    fn pressure_words_agree_with_the_guard() {
+        let t = GuardTrigger::default();
+        // PSI full at 4 enters High in the guard even with low `some`.
+        assert_ne!(
+            pressure_summary(Some(&sample(5.0, 4.0, 2000, 15155)), &t),
+            "2.0 GB of 14.8 GB free, no memory pressure"
+        );
+        assert_ne!(
+            pressure_words(&sample(5.0, 4.0, 2000, 15155), &t),
+            "no memory pressure"
+        );
+        // Below the free-memory floor the guard is Critical with no PSI at all.
+        assert_eq!(
+            pressure_words(&sample(0.0, 0.0, 300, 15155), &t),
+            "high memory pressure"
+        );
+    }
+
+    #[test]
     fn pressure_follows_the_configured_thresholds() {
         let t = GuardTrigger {
             psi_some_warn: 1.0,
@@ -789,11 +808,11 @@ mod tests {
             ..GuardTrigger::default()
         };
         assert_eq!(
-            pressure_words(&sample(1.5, 0.0, 1, 1), &t),
+            pressure_words(&sample(1.5, 0.0, 8000, 16000), &t),
             "some memory pressure"
         );
         assert_eq!(
-            pressure_words(&sample(2.0, 0.0, 1, 1), &t),
+            pressure_words(&sample(2.0, 0.0, 8000, 16000), &t),
             "high memory pressure"
         );
     }
