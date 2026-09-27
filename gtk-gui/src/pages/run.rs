@@ -508,13 +508,26 @@ fn run_command(state: &Rc<RefCell<RunState>>) {
             // Remove the cgroup once the processes the launcher left behind
             // have exited too, so it does not linger empty. Keep polling
             // while the directory exists, even if cgroup.events is unreadable.
+            // Give up after a minute of failed removals (e.g. a child
+            // cgroup or a permission error) instead of retrying forever.
             let manager = manager_clone.clone();
             let name = name.clone();
+            let mut failed_removals = 0u32;
             glib::timeout_add_seconds_local(5, move || {
-                if cleanup_once(&manager, &name) {
-                    glib::ControlFlow::Break
-                } else {
-                    glib::ControlFlow::Continue
+                match cleanup_step(manager.cgroup_exists(&name), manager.is_populated(&name)) {
+                    CleanupStep::Done => glib::ControlFlow::Break,
+                    CleanupStep::Wait => glib::ControlFlow::Continue,
+                    CleanupStep::TryRemove => {
+                        if matches!(manager.remove_if_empty(&name), Ok(true)) {
+                            return glib::ControlFlow::Break;
+                        }
+                        failed_removals += 1;
+                        if failed_removals >= 12 {
+                            glib::ControlFlow::Break
+                        } else {
+                            glib::ControlFlow::Continue
+                        }
+                    }
                 }
             });
         }

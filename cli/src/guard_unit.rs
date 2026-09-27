@@ -21,17 +21,17 @@ pub const SYSTEM_UNIT_DIRS: &[&str] = &[
     "/lib/systemd/user",
 ];
 
-/// `path` as an `ExecStart` argument. systemd expands `%` specifiers and
-/// `$` variables and processes C-style escapes in `ExecStart=`, so `%` and
-/// `$` are doubled and `\`, `"` and `'` are backslash-escaped. The result is
-/// double-quoted when the path has whitespace or quotes.
+/// `path` as the program of an `ExecStart` line. systemd expands `%`
+/// specifiers there, so `%` is doubled. `$` is left alone: systemd does not
+/// expand variables in the program path. The result is double-quoted when the
+/// path has whitespace. Paths systemd refuses as a program (see
+/// [`unit_path_problem`]) must be rejected before calling this.
 pub fn exec_arg(path: &Path) -> String {
     let s = path.display().to_string();
     let mut out = String::with_capacity(s.len() + 2);
     for c in s.chars() {
         match c {
             '%' => out.push_str("%%"),
-            '$' => out.push_str("$$"),
             '\\' => out.push_str("\\\\"),
             '"' => out.push_str("\\\""),
             '\'' => out.push_str("\\'"),
@@ -45,6 +45,22 @@ pub fn exec_arg(path: &Path) -> String {
     } else {
         out
     }
+}
+
+/// Why systemd would refuse `path` as an `ExecStart` program, if it would:
+/// it rejects quotes and backslashes in the executable path, control
+/// characters would split the unit line, and the unit file must be UTF-8.
+pub fn unit_path_problem(path: &Path) -> Option<&'static str> {
+    let Some(s) = path.to_str() else {
+        return Some("it is not valid UTF-8");
+    };
+    if s.chars().any(|c| c.is_control()) {
+        return Some("it contains a control character");
+    }
+    if s.contains(['"', '\'', '\\']) {
+        return Some("systemd does not accept quotes or backslashes in an ExecStart path");
+    }
+    None
 }
 
 /// `template` with its `ExecStart=` line pointing at `exec`, prefixed by
@@ -292,7 +308,16 @@ mod tests {
         );
         assert_eq!(
             exec_arg(Path::new("/opt/a$b/rlm-guard")),
-            "/opt/a$$b/rlm-guard"
+            "/opt/a$b/rlm-guard"
+        );
+        assert_eq!(
+            unit_path_problem(Path::new("/opt/it's/rlm-guard")),
+            Some("systemd does not accept quotes or backslashes in an ExecStart path")
+        );
+        assert!(unit_path_problem(Path::new("/opt/a\nb/rlm-guard")).is_some());
+        assert_eq!(
+            unit_path_problem(Path::new("/opt/100% sure/rlm-guard")),
+            None
         );
         assert_eq!(
             exec_arg(Path::new(r"/opt/a\b/rlm-guard")),

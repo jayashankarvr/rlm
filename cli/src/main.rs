@@ -102,10 +102,6 @@ fn validate_limit_args(save: bool, application: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-/// Refuse to limit a process this invocation should not touch: one owned by
-/// another user (unless we are root), or one on the guard protect list
-/// (desktop session, shells, audio) unless `--force` was given. The uid
-/// check is never bypassed by `--force`; only the protect-list check is.
 /// The config `rlm limit` uses, given the result of loading it. `limit`
 /// reads the guard protect list from the config, so an invalid config is an
 /// error (with the file and the parse error) rather than a silent fallback
@@ -137,6 +133,10 @@ fn config_for_limit(
     }
 }
 
+/// Refuse to limit a process this invocation should not touch: one owned by
+/// another user (unless we are root), or one on the guard protect list
+/// (desktop session, shells, audio) unless `--force` was given. The uid
+/// check is never bypassed by `--force`; only the protect-list check is.
 fn check_target(
     p: &ProcessInfo,
     my_uid: u32,
@@ -981,6 +981,15 @@ fn guard_enable() -> Result<ExitCode> {
     let current_exe = std::env::current_exe().ok();
     let path_env = std::env::var_os("PATH");
     let guard_bin = guard_unit::find_guard_binary(current_exe.as_deref(), path_env.as_deref());
+    if let Some(bin) = &guard_bin {
+        if let Some(problem) = guard_unit::unit_path_problem(bin) {
+            eprintln!(
+                "error: cannot write a unit for {}: {problem}. Install rlm-guard under a plain path and rerun: rlm guard enable",
+                bin.display()
+            );
+            return Ok(ExitCode::FAILURE);
+        }
+    }
     let system_dirs: Vec<&std::path::Path> = guard_unit::SYSTEM_UNIT_DIRS
         .iter()
         .map(std::path::Path::new)
@@ -1249,7 +1258,7 @@ mod tests {
         assert!(MANIFEST.contains("rlm-delegate.conf"));
         assert!(!MANIFEST.contains("dist/delegate.conf"));
         assert!(MANIFEST.contains("maintainer-scripts = \"../dist/deb\""));
-        assert_eq!(env!("CARGO_PKG_VERSION"), "0.2.0");
+        assert_eq!(env!("CARGO_PKG_VERSION"), "0.2.1");
     }
 
     #[test]

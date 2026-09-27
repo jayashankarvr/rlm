@@ -1,7 +1,7 @@
 # Maintainer: Jayashankar <me.jayashankar@gmail.com>
 pkgbase=rlm
 pkgname=(rlm rlm-gtk)
-pkgver=0.2.0
+pkgver=0.2.1
 pkgrel=1
 pkgdesc='Unprivileged cgroup v2 resource limits with an optional freeze-or-cap guard'
 arch=(x86_64 aarch64)

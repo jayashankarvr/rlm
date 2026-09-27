@@ -172,6 +172,13 @@ fn run(config: Config) -> common::Result<()> {
     // With no per-user state or runtime dir there is nowhere safe for the
     // journal (never a shared dir such as /tmp), so treat it as a journal
     // that failed to open: no freeze or cap this run, rules still apply.
+    if try_journal_path().is_none() && enforcer.rule_count() == 0 {
+        tracing::warn!(
+            "no per-user state dir or XDG_RUNTIME_DIR for the guard journal and no rules \
+             configured; nothing to do, exiting"
+        );
+        return Ok(());
+    }
     let opened = match try_journal_path() {
         Some(path) => Journal::open(path, cgfs::boot_id()),
         None => Err(common::Error::Io(std::io::Error::new(
