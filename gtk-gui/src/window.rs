@@ -4,6 +4,7 @@ use adw::subclass::prelude::*;
 use gtk::{gio, glib};
 use rlm_core::CgroupManager;
 use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::Arc;
 
 /// The sidebar pages, in display order: (id, title, icon). Ctrl+1 opens the
@@ -190,13 +191,13 @@ impl Window {
         content_stack.set_transition_type(gtk::StackTransitionType::Crossfade);
 
         // Add pages
-        let status_page = pages::status::create(self.manager());
+        let status_page = pages::status::StatusPage::new(self.manager());
         let limit_page = pages::limit::create(self.manager());
         let run_page = pages::run::create(self.manager());
         let profiles_page = pages::profiles::create();
         let guard_page = pages::guard::create();
 
-        content_stack.add_named(&status_page, Some("status"));
+        content_stack.add_named(&status_page.widget(), Some("status"));
         content_stack.add_named(&limit_page, Some("limit"));
         content_stack.add_named(&run_page, Some("run"));
         content_stack.add_named(&profiles_page, Some("profiles"));
@@ -239,7 +240,6 @@ impl Window {
         let limit_page_clone = limit_page.clone();
         let run_page_clone = run_page.clone();
         let guard_page_clone = guard_page.clone();
-        let manager_clone = self.manager();
         sidebar_list.connect_row_selected(move |_, row| {
             let Some(row) = row else { return };
             let Some(id) = row
@@ -255,11 +255,7 @@ impl Window {
                 content_page_clone.set_title(NAV_PAGES[i].1);
             }
             match id.as_str() {
-                "status" => {
-                    if let Some(ref mgr) = manager_clone {
-                        pages::status::refresh(&status_page_clone, mgr.clone());
-                    }
-                }
+                "status" => status_page_clone.refresh(),
                 "limit" => {
                     pages::limit::refresh_profiles(&limit_page_clone);
                 }
@@ -339,20 +335,18 @@ impl Window {
     fn setup_auto_refresh(
         &self,
         stack: &gtk::Stack,
-        status_page: &gtk::Widget,
+        status_page: &Rc<pages::status::StatusPage>,
         guard_page: &gtk::Widget,
     ) {
         let stack_clone = stack.clone();
         let status_page_clone = status_page.clone();
         let guard_page_clone = guard_page.clone();
-        let manager = self.manager();
+        let status_widget = status_page.widget();
 
         glib::timeout_add_local(std::time::Duration::from_secs(2), move || {
             let visible = stack_clone.visible_child();
-            if visible.as_ref() == Some(&status_page_clone) {
-                if let Some(ref mgr) = manager {
-                    pages::status::refresh(&status_page_clone, mgr.clone());
-                }
+            if visible.as_ref() == Some(&status_widget) {
+                status_page_clone.refresh();
             } else if visible.as_ref() == Some(&guard_page_clone) {
                 pages::guard::refresh(&guard_page_clone);
             }
