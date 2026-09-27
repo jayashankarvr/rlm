@@ -20,6 +20,11 @@ use std::time::{Duration, Instant};
 /// cannot fix itself.
 const EX_CONFIG: i32 = 78;
 
+/// Exit status when another rlm-guard holds the single-instance lock
+/// (`EX_TEMPFAIL`). Also in `RestartPreventExitStatus`: restarting every
+/// few seconds cannot help while the other guard runs.
+const EX_LOCKED: i32 = 75;
+
 /// How often persistent rules are reconciled. New matching processes are
 /// absorbed within this delay.
 const RULES_INTERVAL_MS: u64 = 5_000;
@@ -62,10 +67,12 @@ fn main() {
             Ok(Some(file)) => Some(file),
             Ok(None) => {
                 tracing::error!(
-                    "another rlm-guard is already running (lock {} is held); exiting",
+                    "another rlm-guard is already running (lock {} is held); exiting with \
+                     status {EX_LOCKED}. systemd will not restart this unit; once the other \
+                     guard stops, run: systemctl --user restart rlm-guard",
                     lock_path.display()
                 );
-                std::process::exit(1);
+                std::process::exit(EX_LOCKED);
             }
             // The state dir is unusable, so the journal cannot open either and
             // no second guard can share it. Keep running so persistent rules
@@ -363,9 +370,22 @@ mod tests {
         );
     }
 
+    fn restart_prevent_codes() -> Vec<i32> {
+        UNIT.lines()
+            .filter_map(|l| l.strip_prefix("RestartPreventExitStatus="))
+            .flat_map(|v| v.split_whitespace())
+            .map(|c| c.parse().expect("numeric exit status"))
+            .collect()
+    }
+
     #[test]
     fn unit_does_not_restart_on_config_errors() {
-        assert!(UNIT.contains(&format!("RestartPreventExitStatus={}", super::EX_CONFIG)));
+        assert!(restart_prevent_codes().contains(&super::EX_CONFIG));
+    }
+
+    #[test]
+    fn unit_does_not_restart_while_another_guard_holds_the_lock() {
+        assert!(restart_prevent_codes().contains(&super::EX_LOCKED));
     }
 
     #[test]
