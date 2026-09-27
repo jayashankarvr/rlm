@@ -277,7 +277,7 @@ Soft. A cap never goes below 90% of the app's current memory or below 256 MiB. O
 
 - `rlm guard status`: current state and the last few events
 - `rlm guard history`: the recorded history (`~/.local/state/rlm/guard-history.jsonl`)
-- The GUI Guard page
+- The GUI Guard page, which also has a switch that runs `rlm guard enable` or `rlm guard disable`
 - `journalctl --user -u rlm-guard` for the full log
 
 ## Configuration

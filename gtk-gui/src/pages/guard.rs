@@ -1,13 +1,15 @@
-//! GTK4/libadwaita Guard page: a read-only view of the `rlm-guard` freeze
-//! guard's state, reusing `rlm_core::guard::report`'s text so the CLI
-//! (`rlm guard status`/`rlm guard history`) and this page never disagree.
+//! GTK4/libadwaita Guard page: the `rlm-guard` freeze guard's state, reusing
+//! `rlm_core::guard::report`'s text so the CLI (`rlm guard status`/`rlm guard
+//! history`) and this page never disagree.
 //!
-//! This page never starts, stops, enables, disables or otherwise configures
-//! the guard service; it only reads systemd state, the config, a pressure
+//! The only thing the page changes is whether the service runs: its switch
+//! runs `rlm guard enable` or `rlm guard disable`, the same code path as the
+//! CLI. Everything else is read from systemd state, the config, a pressure
 //! sample, the write-ahead journal and the intervention history log.
 
 use adw::prelude::*;
 use common::{Config, GuardConfig, BUILTIN_PROTECT};
+use gtk::glib;
 use rlm_core::guard::history::{history_path, read_recent, unix_now, HistoryEvent};
 use rlm_core::guard::journal::JournalEntry;
 use rlm_core::guard::report::{
@@ -17,6 +19,8 @@ use rlm_core::guard::report::{
 use rlm_core::guard::service::{describe, query, ServiceState};
 use rlm_core::guard::{cgfs, journal_path, Journal, Sample, Sampler};
 use rlm_core::process::current_uid;
+use std::cell::Cell;
+use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -47,11 +51,57 @@ fn cached_service_state() -> ServiceState {
     state
 }
 
+/// Drop the cached service state so the next read queries systemd.
+fn invalidate_service_cache() {
+    *SERVICE_CACHE.lock().unwrap() = None;
+}
+
+/// Whether the switch should show the guard as on.
+pub fn switch_on(s: &ServiceState) -> bool {
+    s.enabled == "enabled" || s.active == "active"
+}
+
+thread_local! {
+    /// Set while `populate` moves the switch, so that change does not run
+    /// `rlm guard enable`/`disable` as if the user had flipped it.
+    static SYNCING_SWITCH: Cell<bool> = const { Cell::new(false) };
+}
+
+/// The `rlm` binary to run: the one next to `rlm-gtk` if present (they are
+/// installed together), otherwise whatever `rlm` is on PATH.
+fn rlm_binary() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join("rlm")))
+        .filter(|p| p.is_file())
+        .unwrap_or_else(|| PathBuf::from("rlm"))
+}
+
+/// Run `rlm guard <verb>` and return its error text on failure.
+fn run_guard_verb(verb: &str) -> std::result::Result<(), String> {
+    let out = std::process::Command::new(rlm_binary())
+        .args(["guard", verb])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| format!("could not run rlm: {e}"))?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let text = String::from_utf8_lossy(&out.stderr);
+    let text = text.trim();
+    Err(if text.is_empty() {
+        format!("rlm guard {verb} failed ({})", out.status)
+    } else {
+        text.to_string()
+    })
+}
+
 /// Everything the Guard page renders, computed once from plain data so it
 /// can be unit-tested without a display.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GuardView {
     pub service: String,
+    pub switch_on: bool,
     pub config: std::result::Result<(), String>,
     pub pressure: String,
     pub policy: String,
@@ -99,6 +149,7 @@ pub fn build_view(
 
     GuardView {
         service: service_desc,
+        switch_on: switch_on(service),
         config,
         pressure,
         policy,
@@ -145,11 +196,18 @@ fn add_row(list_box: &gtk::ListBox, title: &str, subtitle: Option<&str>) -> adw:
 /// Rebuild the four list boxes from a freshly gathered [`GuardView`].
 fn populate(
     view: &GuardView,
+    switch: &adw::SwitchRow,
     status_list: &gtk::ListBox,
     interventions_list: &gtk::ListBox,
     history_list: &gtk::ListBox,
     protect_list: &gtk::ListBox,
 ) {
+    if switch.is_sensitive() && switch.is_active() != view.switch_on {
+        SYNCING_SWITCH.with(|f| f.set(true));
+        switch.set_active(view.switch_on);
+        SYNCING_SWITCH.with(|f| f.set(false));
+    }
+
     clear(status_list);
     add_row(status_list, "Service", Some(&view.service));
     match &view.config {
@@ -163,9 +221,6 @@ fn populate(
     }
     add_row(status_list, "Pressure", Some(&view.pressure));
     add_row(status_list, "Policy", Some(&view.policy));
-    if view.service.contains("not installed") || view.service.contains("stopped") {
-        add_row(status_list, "Turn on with: rlm guard enable", None);
-    }
 
     clear(interventions_list);
     if view.interventions.is_empty() {
@@ -228,6 +283,13 @@ pub fn create() -> gtk::Widget {
     refresh_btn.add_css_class("flat");
     refresh_btn.set_tooltip_text(Some("Refresh"));
     status_group.set_header_suffix(Some(&refresh_btn));
+    let switch = adw::SwitchRow::new();
+    switch.set_widget_name("guard-switch");
+    switch.set_title("Run the guard");
+    switch.set_subtitle(
+        "Starts now and at every login; freezes or caps a runaway app under memory pressure",
+    );
+    status_group.add(&switch);
     let status_list = new_list_box("guard-status-list");
     status_group.add(&status_list);
     page.add(&status_group);
@@ -259,6 +321,7 @@ pub fn create() -> gtk::Widget {
     let widget = page.upcast::<gtk::Widget>();
     populate(
         &gather(),
+        &switch,
         &status_list,
         &interventions_list,
         &history_list,
@@ -270,20 +333,59 @@ pub fn create() -> gtk::Widget {
         refresh(&widget_for_btn);
     });
 
+    let widget_for_switch = widget.clone();
+    switch.connect_active_notify(move |row| {
+        if SYNCING_SWITCH.with(Cell::get) {
+            return;
+        }
+        let verb = if row.is_active() { "enable" } else { "disable" };
+        row.set_sensitive(false);
+        row.set_subtitle(if verb == "enable" { "Turning on..." } else { "Turning off..." });
+        let row = row.clone();
+        let widget = widget_for_switch.clone();
+        glib::MainContext::default().spawn_local(async move {
+            let result = gtk::gio::spawn_blocking(move || run_guard_verb(verb))
+                .await
+                .unwrap_or_else(|_| Err("rlm guard command panicked".to_string()));
+            invalidate_service_cache();
+            row.set_sensitive(true);
+            match result {
+                Ok(()) => row.set_subtitle(
+                    "Starts now and at every login; freezes or caps a runaway app under memory pressure",
+                ),
+                Err(e) => row.set_subtitle(&format!("Could not {verb} the guard: {e}")),
+            }
+            refresh(&widget);
+        });
+    });
+
     widget
 }
 
-/// Re-read the guard's state and rebuild the page's list boxes. Read-only:
-/// never starts, stops or configures the service.
+/// Re-read the guard's state, sync the switch and rebuild the page's list
+/// boxes. Moving the switch here never runs `rlm guard enable`/`disable`.
 pub fn refresh(widget: &gtk::Widget) {
+    let switch = find_widget_by_name(widget, "guard-switch")
+        .and_then(|w| w.downcast::<adw::SwitchRow>().ok());
     let status_list = list_box_named(widget, "guard-status-list");
     let interventions_list = list_box_named(widget, "guard-interventions-list");
     let history_list = list_box_named(widget, "guard-history-list");
     let protect_list = list_box_named(widget, "guard-protect-list");
-    if let (Some(status), Some(interventions), Some(history), Some(protect)) =
-        (status_list, interventions_list, history_list, protect_list)
-    {
-        populate(&gather(), &status, &interventions, &history, &protect);
+    if let (Some(switch), Some(status), Some(interventions), Some(history), Some(protect)) = (
+        switch,
+        status_list,
+        interventions_list,
+        history_list,
+        protect_list,
+    ) {
+        populate(
+            &gather(),
+            &switch,
+            &status,
+            &interventions,
+            &history,
+            &protect,
+        );
     }
 }
 
@@ -326,6 +428,15 @@ mod tests {
         );
         assert_eq!(v.config, Err("guard: bad".into()));
         assert!(v.protect.iter().all(|(_, src)| *src == "built-in"));
+    }
+
+    #[test]
+    fn switch_is_on_when_enabled_or_running() {
+        assert!(switch_on(&svc("active", "enabled")));
+        assert!(switch_on(&svc("active", "disabled")));
+        assert!(switch_on(&svc("inactive", "enabled")));
+        assert!(!switch_on(&svc("inactive", "disabled")));
+        assert!(!switch_on(&svc("inactive", "not-found")));
     }
 
     #[test]

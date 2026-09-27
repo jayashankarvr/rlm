@@ -30,7 +30,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- `rlm guard history`, the GUI Guard page, and service state in `rlm guard status`.
+- `rlm guard history`, the GUI Guard page (with an on/off switch), and service state in `rlm guard status`.
 - `rlm guard enable` installs a user unit pointing at your rlm-guard when no packaged unit exists.
 - `--yes` for batch operations; `--force` to limit a process on the protect list.
 - `rlm run` reports OOM kills and signal deaths and exits with 128+N for signal N.
