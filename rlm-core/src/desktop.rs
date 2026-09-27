@@ -83,18 +83,18 @@ fn parse_desktop_file(path: &Path) -> Option<DesktopApp> {
 }
 
 /// Turn a desktop file `Exec` value into a shell-quoted command line: field
-/// codes (%u, %F, ...) removed, an `env VAR=value` wrapper skipped, and each
-/// argument quoted when it holds spaces or shell characters, so a shell-style
-/// split gives back the same arguments. `None` if nothing is left or a quote
-/// is not closed.
+/// codes (%u, %F, ...) removed and each argument quoted when it holds spaces
+/// or shell characters, so a shell-style split gives back the same
+/// arguments. An `env VAR=value app` wrapper is kept whole, with `env` as
+/// the program, so the app still gets its variables. `None` if nothing is
+/// left, an `env` wrapper names no program, or a quote is not closed.
 pub fn exec_command(value: &str) -> Option<String> {
     let args = split_exec(&unescape_value(value))?;
-    let mut args: Vec<String> = args.into_iter().filter_map(expand_field_codes).collect();
-    if args.first().map(String::as_str) == Some("env") {
-        let rest = args.iter().skip(1).skip_while(|a| a.contains('=')).count();
-        args.drain(..args.len() - rest);
-    }
+    let args: Vec<String> = args.into_iter().filter_map(expand_field_codes).collect();
     if args.is_empty() {
+        return None;
+    }
+    if args[0] == "env" && !env_runs_a_program(&args[1..]) {
         return None;
     }
     Some(
@@ -103,6 +103,29 @@ pub fn exec_command(value: &str) -> Option<String> {
             .collect::<Vec<_>>()
             .join(" "),
     )
+}
+
+/// Whether the arguments after `env` name a program to run, rather than only
+/// settings (`VAR=value`, `-u NAME`, `-i`, ...), in which case `env` would
+/// just print the environment.
+fn env_runs_a_program(args: &[String]) -> bool {
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            // These take the next argument as their value.
+            "-u" | "--unset" | "-C" | "--chdir" => {
+                args.next();
+            }
+            // The string holds the command line itself.
+            "-S" | "--split-string" => return args.next().is_some(),
+            "--" => return args.next().is_some(),
+            a if a.starts_with("-S") && a.len() > 2 => return true,
+            a if a.starts_with('-') => {}
+            a if a.contains('=') => {}
+            _ => return true,
+        }
+    }
+    false
 }
 
 /// Undo the escapes every desktop file string value may use: \s, \n, \t,
@@ -234,7 +257,10 @@ pub fn search_cli_apps(query: &str) -> Vec<DesktopApp> {
                         if meta.is_file() && (meta.permissions().mode() & 0o111 != 0) {
                             apps.push(DesktopApp {
                                 name: format!("{} (CLI)", name),
-                                exec: name,
+                                // Quoted, since a file name may hold spaces or
+                                // shell characters and the command is split
+                                // like a shell line.
+                                exec: shell_quote(&name),
                                 is_cli: true,
                             });
                         }
@@ -295,11 +321,28 @@ mod tests {
     }
 
     #[test]
-    fn exec_skips_env_wrappers() {
+    fn exec_keeps_env_wrappers_and_their_variables() {
         assert_eq!(
             exec_command("env FOO=1 BAR=\"a b\" app --x %f").as_deref(),
-            Some("app --x")
+            Some("env FOO=1 'BAR=a b' app --x")
         );
+        assert_eq!(
+            exec_command("env -u GTK_THEME app").as_deref(),
+            Some("env -u GTK_THEME app")
+        );
+        assert_eq!(
+            exec_command("env -i -- app").as_deref(),
+            Some("env -i -- app")
+        );
+        assert_eq!(exec_command("env -u X"), None);
+        assert_eq!(exec_command("env -i"), None);
+    }
+
+    #[test]
+    fn cli_app_names_are_quoted() {
+        assert_eq!(shell_quote("my tool"), "'my tool'");
+        assert_eq!(shell_quote("rg"), "rg");
+        assert_eq!(shell_quote("a$b"), "'a$b'");
     }
 
     #[test]
