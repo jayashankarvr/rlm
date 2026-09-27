@@ -553,11 +553,34 @@ fn selection_summary(mode: LimitMode, apps: usize, pids: &[u32]) -> String {
     }
 }
 
+/// How many selected apps the PID field stands for: all of them while it
+/// holds exactly their processes, none once it has been edited by hand, so
+/// the summary then counts the field's processes instead of stale apps.
+fn apps_in_field(selected: &[&[u32]], pids: &[u32]) -> usize {
+    use std::collections::BTreeSet;
+    let from_rows: BTreeSet<u32> = selected.iter().flat_map(|g| g.iter().copied()).collect();
+    let in_field: BTreeSet<u32> = pids.iter().copied().collect();
+    if !selected.is_empty() && from_rows == in_field {
+        selected.len()
+    } else {
+        0
+    }
+}
+
 fn update_summary(state: &LimitState) {
     let mode = *state.limit_mode.borrow();
     let pids = parse_pid_list(&state.pid_entry.text()).unwrap_or_default();
     let apps = match mode {
-        LimitMode::Application => state.process_list.selected_rows().len(),
+        LimitMode::Application => {
+            let groups = state.group_pids.borrow();
+            let selected: Vec<&[u32]> = state
+                .process_list
+                .selected_rows()
+                .iter()
+                .filter_map(|r| groups.get(r.widget_name().as_str()).map(Vec::as_slice))
+                .collect();
+            apps_in_field(&selected, &pids)
+        }
         LimitMode::Individual => 0,
     };
     state
@@ -1111,6 +1134,22 @@ mod tests {
         assert_eq!(selection_summary(Individual, 0, &[3019]), "PID 3019");
         assert_eq!(selection_summary(Individual, 0, &[]), "No process selected");
         assert!(selection_summary(Individual, 0, &[1, 2]).starts_with("2 PIDs entered"));
+    }
+
+    #[test]
+    fn a_hand_edited_pid_field_is_counted_as_processes() {
+        let firefox: &[u32] = &[1, 2, 3];
+        let code: &[u32] = &[7];
+        assert_eq!(apps_in_field(&[firefox, code], &[1, 2, 3, 7]), 2);
+        assert_eq!(apps_in_field(&[firefox], &[3, 2, 1]), 1);
+        // A PID added or removed by hand: the field no longer is the apps.
+        assert_eq!(apps_in_field(&[firefox], &[1, 2, 3, 99]), 0);
+        assert_eq!(apps_in_field(&[firefox], &[1, 2]), 0);
+        assert_eq!(apps_in_field(&[], &[5]), 0);
+        assert_eq!(
+            selection_summary(LimitMode::Application, 0, &[1, 2, 3, 99]),
+            "4 processes entered"
+        );
     }
 
     #[test]
