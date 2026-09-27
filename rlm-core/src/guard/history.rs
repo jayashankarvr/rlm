@@ -65,13 +65,17 @@ pub struct HistoryEvent {
     pub detail: String,
 }
 
-/// Default path for the intervention history log: `<state_dir>/rlm/guard-history.jsonl`.
-/// Same fallback as [`super::journal_path`].
+/// Path of the intervention history log, `<state_dir>/rlm/guard-history.jsonl`,
+/// with the same per-user fallback as the journal (see [`super::guard_file`]).
+/// `None` when no per-user dir is known; history is then not recorded.
+pub fn try_history_path() -> Option<PathBuf> {
+    super::guard_file("guard-history.jsonl")
+}
+
+/// [`try_history_path`] for read-only callers. Returns an empty path when no
+/// per-user dir is known; [`read_recent`] then finds nothing.
 pub fn history_path() -> PathBuf {
-    dirs::state_dir()
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join("rlm")
-        .join("guard-history.jsonl")
+    try_history_path().unwrap_or_default()
 }
 
 /// The app name to record for an action that only carries a [`Resolution`]
@@ -218,6 +222,12 @@ pub fn unix_now() -> u64 {
 mod tests {
     use super::*;
     use crate::guard::resolve::{Coverage, Mechanism, Resolution, Verdict};
+
+    #[test]
+    fn reader_path_without_a_dir_reads_nothing_and_is_not_tmp() {
+        assert!(!history_path().starts_with("/tmp"));
+        assert!(read_recent(&PathBuf::new(), 5).is_empty());
+    }
 
     fn res() -> Resolution {
         Resolution {

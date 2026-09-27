@@ -102,6 +102,37 @@ fn validate_limit_args(save: bool, application: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+/// The config `rlm limit` uses, given the result of loading it. `limit`
+/// reads the guard protect list from the config, so an invalid config is an
+/// error (with the file and the parse error) rather than a silent fallback
+/// to defaults that would drop the user's protected apps. With `--force` the
+/// protect list is not consulted, so the command continues on the defaults
+/// and returns a warning to print instead.
+fn config_for_limit(
+    loaded: Result<Config>,
+    force: bool,
+    path: &str,
+) -> std::result::Result<(Config, Option<String>), String> {
+    match loaded {
+        Ok(c) => Ok((c, None)),
+        Err(e) => {
+            let line = rlm_core::guard::report::config_error_line(path, &e);
+            if force {
+                Ok((
+                    Config::default(),
+                    Some(format!(
+                        "warning: config {line}\n  continuing without your settings because of --force"
+                    )),
+                ))
+            } else {
+                Err(format!(
+                    "error: config {line}\n  rlm limit reads your guard protect list from it. Fix the file, or pass --force to limit without it."
+                ))
+            }
+        }
+    }
+}
+
 /// Refuse to limit a process this invocation should not touch: one owned by
 /// another user (unless we are root), or one on the guard protect list
 /// (desktop session, shells, audio) unless `--force` was given. The uid
@@ -423,7 +454,22 @@ fn run() -> Result<ExitCode> {
             let save_app = if save { application.clone() } else { None };
 
             let my_uid = current_uid();
-            let config = Config::load().unwrap_or_default();
+            let config = match config_for_limit(
+                Config::load(),
+                force,
+                &rlm_core::guard::report::config_error_path(),
+            ) {
+                Ok((config, warning)) => {
+                    if let Some(w) = warning {
+                        eprintln!("{w}");
+                    }
+                    config
+                }
+                Err(msg) => {
+                    eprintln!("{msg}");
+                    return Ok(ExitCode::FAILURE);
+                }
+            };
             let protect = common::protect_set(&config.guard.selection.protect);
 
             // Determine which mode we're in
@@ -924,10 +970,26 @@ fn guard_enable() -> Result<ExitCode> {
     let config_dir = dirs::config_dir()
         .ok_or_else(|| Error::InvalidArgs("cannot find the user config directory".into()))?;
     let unit_path = guard_unit::user_unit_path(&config_dir);
+    // Read before `enable --now`, which starts a stopped service.
+    let state = rlm_core::guard::service::query();
+    if let Some(msg) = guard_unit::masked_error(&state.enabled) {
+        eprintln!("error: {msg}");
+        return Ok(ExitCode::FAILURE);
+    }
+    let was_active = state.active == "active";
     let existing = std::fs::read_to_string(&unit_path).ok();
     let current_exe = std::env::current_exe().ok();
     let path_env = std::env::var_os("PATH");
     let guard_bin = guard_unit::find_guard_binary(current_exe.as_deref(), path_env.as_deref());
+    if let Some(bin) = &guard_bin {
+        if let Some(problem) = guard_unit::unit_path_problem(bin) {
+            eprintln!(
+                "error: cannot write a unit for {}: {problem}. Install rlm-guard under a plain path and rerun: rlm guard enable",
+                bin.display()
+            );
+            return Ok(ExitCode::FAILURE);
+        }
+    }
     let system_dirs: Vec<&std::path::Path> = guard_unit::SYSTEM_UNIT_DIRS
         .iter()
         .map(std::path::Path::new)
@@ -938,8 +1000,6 @@ fn guard_enable() -> Result<ExitCode> {
         guard_bin.as_deref(),
         &unit_path,
     );
-    // Read before `enable --now`, which starts a stopped service.
-    let was_active = rlm_core::guard::service::query().active == "active";
     let mut unit_written = false;
     match plan {
         guard_unit::EnablePlan::NoBinary => {
@@ -959,7 +1019,7 @@ fn guard_enable() -> Result<ExitCode> {
                     println!("saved the previous unit as {}", backup.display());
                 }
             }
-            std::fs::write(&path, contents)?;
+            guard_unit::write_atomically(&path, &contents)?;
             println!("wrote {}", path.display());
             unit_written = true;
             let reload = systemctl(&["daemon-reload"])?;
@@ -1165,6 +1225,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn limit_refuses_an_invalid_config_unless_forced() {
+        let path = "/h/.config/rlm/config.yaml";
+        let bad = || Err(Error::Config("failed to parse: unknown field".into()));
+        let msg = config_for_limit(bad(), false, path).unwrap_err();
+        assert!(msg.contains(path), "{msg}");
+        assert!(msg.contains("unknown field"), "{msg}");
+        assert!(msg.contains("--force"), "{msg}");
+        let (cfg, warning) = config_for_limit(bad(), true, path).unwrap();
+        assert!(cfg.guard.selection.protect.is_empty());
+        let warning = warning.unwrap();
+        assert!(warning.starts_with("warning:") && warning.contains(path));
+        let (_, none) = config_for_limit(Ok(Config::default()), false, path).unwrap();
+        assert_eq!(none, None);
+    }
+
+    #[test]
     fn packaging_metadata_is_consistent() {
         const MANIFEST: &str = include_str!("../Cargo.toml");
         assert!(
@@ -1182,7 +1258,7 @@ mod tests {
         assert!(MANIFEST.contains("rlm-delegate.conf"));
         assert!(!MANIFEST.contains("dist/delegate.conf"));
         assert!(MANIFEST.contains("maintainer-scripts = \"../dist/deb\""));
-        assert_eq!(env!("CARGO_PKG_VERSION"), "0.2.0");
+        assert_eq!(env!("CARGO_PKG_VERSION"), "0.2.1");
     }
 
     #[test]

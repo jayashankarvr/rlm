@@ -38,22 +38,31 @@ const SERVICE_QUERY_INTERVAL: Duration = Duration::from_secs(10);
 static SERVICE_CACHE: Mutex<Option<(Instant, ServiceState)>> = Mutex::new(None);
 
 /// The guard's systemd state, re-read at most once every
-/// [`SERVICE_QUERY_INTERVAL`]; a cached value is returned in between.
+/// [`SERVICE_QUERY_INTERVAL`]; a cached value is returned in between. The
+/// lock is not held while `query` runs, so a slow systemctl never blocks
+/// [`invalidate_service_cache`].
 fn cached_service_state() -> ServiceState {
-    let mut cache = SERVICE_CACHE.lock().unwrap();
-    if let Some((last, state)) = cache.as_ref() {
+    if let Some((last, state)) = service_cache().as_ref() {
         if last.elapsed() < SERVICE_QUERY_INTERVAL {
             return state.clone();
         }
     }
     let state = query();
-    *cache = Some((Instant::now(), state.clone()));
+    *service_cache() = Some((Instant::now(), state.clone()));
     state
+}
+
+/// The cache, recovered rather than panicking if a previous holder panicked:
+/// it only ever holds a complete value, so a poisoned lock is still usable.
+fn service_cache() -> std::sync::MutexGuard<'static, Option<(Instant, ServiceState)>> {
+    SERVICE_CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Drop the cached service state so the next read queries systemd.
 fn invalidate_service_cache() {
-    *SERVICE_CACHE.lock().unwrap() = None;
+    *service_cache() = None;
 }
 
 /// Whether the switch should show the guard as on, or `None` when systemd
@@ -81,27 +90,86 @@ thread_local! {
 /// The `rlm` binary to run: the one next to `rlm-gtk` if present (they are
 /// installed together), otherwise whatever `rlm` is on PATH.
 fn rlm_binary() -> PathBuf {
-    std::env::current_exe()
-        .ok()
+    rlm_binary_for(std::env::current_exe().ok().as_deref())
+}
+
+/// [`rlm_binary`] for a given `rlm-gtk` path. The sibling must be an
+/// executable file, not just any file named `rlm`.
+fn rlm_binary_for(current_exe: Option<&std::path::Path>) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    current_exe
         .and_then(|exe| exe.parent().map(|dir| dir.join("rlm")))
-        .filter(|p| p.is_file())
+        .filter(|p| {
+            std::fs::metadata(p)
+                .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+                .unwrap_or(false)
+        })
         .unwrap_or_else(|| PathBuf::from("rlm"))
+}
+
+/// How long the switch waits for `rlm guard enable`/`disable` before killing
+/// it. The command talks to systemd, which can hang on a wedged D-Bus; the
+/// switch would otherwise stay greyed out forever.
+const GUARD_VERB_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Run `cmd` with stdin and stdout closed and return its exit status and
+/// stderr, or `None` if it did not exit within `timeout` (it is then killed
+/// and reaped). stderr is drained on a separate thread so a chatty child
+/// cannot block on a full pipe; after exit we wait at most a second for it,
+/// since a grandchild may still hold the pipe open.
+fn output_with_timeout(
+    mut cmd: std::process::Command,
+    timeout: Duration,
+) -> std::io::Result<Option<(std::process::ExitStatus, String)>> {
+    use std::io::Read;
+    use std::process::Stdio;
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let stderr = child.stderr.take();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut text = String::new();
+        if let Some(mut e) = stderr {
+            let _ = e.read_to_string(&mut text);
+        }
+        let _ = tx.send(text);
+    });
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            let text = rx.recv_timeout(Duration::from_secs(1)).unwrap_or_default();
+            return Ok(Some((status, text)));
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(None);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 /// Run `rlm guard <verb>` and return its error text on failure.
 fn run_guard_verb(verb: &str) -> std::result::Result<(), String> {
-    let out = std::process::Command::new(rlm_binary())
-        .args(["guard", verb])
-        .stdin(std::process::Stdio::null())
-        .output()
-        .map_err(|e| format!("could not run rlm: {e}"))?;
-    if out.status.success() {
+    let mut cmd = std::process::Command::new(rlm_binary());
+    cmd.args(["guard", verb]);
+    let (status, stderr) = output_with_timeout(cmd, GUARD_VERB_TIMEOUT)
+        .map_err(|e| format!("could not run rlm: {e}"))?
+        .ok_or_else(|| {
+            format!(
+                "rlm guard {verb} did not finish in {} s",
+                GUARD_VERB_TIMEOUT.as_secs()
+            )
+        })?;
+    if status.success() {
         return Ok(());
     }
-    let text = String::from_utf8_lossy(&out.stderr);
-    let text = text.trim();
+    let text = stderr.trim();
     Err(if text.is_empty() {
-        format!("rlm guard {verb} failed ({})", out.status)
+        format!("rlm guard {verb} failed ({status})")
     } else {
         text.to_string()
     })
@@ -426,6 +494,59 @@ pub fn refresh(widget: &gtk::Widget) {
 mod tests {
     use super::*;
     use rlm_core::guard::history::{HistoryEvent, HistoryKind};
+
+    fn sh(script: &str) -> std::process::Command {
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args(["-c", script]);
+        cmd
+    }
+
+    #[test]
+    fn a_poisoned_service_cache_is_recovered() {
+        let _ = std::thread::spawn(|| {
+            let _guard = SERVICE_CACHE.lock().unwrap();
+            panic!("poison the cache");
+        })
+        .join();
+        assert!(SERVICE_CACHE.is_poisoned());
+        invalidate_service_cache();
+        assert!(service_cache().is_none());
+    }
+
+    #[test]
+    fn rlm_binary_needs_an_executable_sibling() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        let gtk = d.path().join("rlm-gtk");
+        assert_eq!(rlm_binary_for(Some(&gtk)), PathBuf::from("rlm"));
+        let rlm = d.path().join("rlm");
+        std::fs::write(&rlm, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&rlm, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(rlm_binary_for(Some(&gtk)), PathBuf::from("rlm"));
+        std::fs::set_permissions(&rlm, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(rlm_binary_for(Some(&gtk)), rlm);
+        assert_eq!(rlm_binary_for(None), PathBuf::from("rlm"));
+    }
+
+    #[test]
+    fn output_with_timeout_returns_status_and_stderr() {
+        let (status, err) = output_with_timeout(
+            sh("echo out; echo oops >&2; exit 3"),
+            Duration::from_secs(10),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(status.code(), Some(3));
+        assert_eq!(err.trim(), "oops");
+    }
+
+    #[test]
+    fn output_with_timeout_kills_a_hung_child() {
+        let start = Instant::now();
+        let r = output_with_timeout(sh("exec sleep 30"), Duration::from_millis(200)).unwrap();
+        assert!(r.is_none());
+        assert!(start.elapsed() < Duration::from_secs(5));
+    }
 
     fn svc(a: &str, e: &str) -> ServiceState {
         ServiceState {

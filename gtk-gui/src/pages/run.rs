@@ -503,19 +503,33 @@ fn run_command(state: &Rc<RefCell<RunState>>) {
                 "The launcher exited; {} process(es) keep running with limits in {name}",
                 manager_clone.pids_in_cgroup(&name).len()
             ));
+        }
+        if !cleanup_once(&manager_clone, &name) {
             // Remove the cgroup once the processes the launcher left behind
-            // have exited too, so it does not linger empty.
+            // have exited too, so it does not linger empty. Keep polling
+            // while the directory exists, even if cgroup.events is unreadable.
+            // Give up after a minute of failed removals (e.g. a child
+            // cgroup or a permission error) instead of retrying forever.
             let manager = manager_clone.clone();
             let name = name.clone();
+            let mut failed_removals = 0u32;
             glib::timeout_add_seconds_local(5, move || {
-                if manager.is_populated(&name) == Some(true) {
-                    return glib::ControlFlow::Continue;
+                match cleanup_step(manager.cgroup_exists(&name), manager.is_populated(&name)) {
+                    CleanupStep::Done => glib::ControlFlow::Break,
+                    CleanupStep::Wait => glib::ControlFlow::Continue,
+                    CleanupStep::TryRemove => {
+                        if matches!(manager.remove_if_empty(&name), Ok(true)) {
+                            return glib::ControlFlow::Break;
+                        }
+                        failed_removals += 1;
+                        if failed_removals >= 12 {
+                            glib::ControlFlow::Break
+                        } else {
+                            glib::ControlFlow::Continue
+                        }
+                    }
                 }
-                let _ = manager.remove_if_empty(&name);
-                glib::ControlFlow::Break
             });
-        } else {
-            let _ = manager_clone.remove_if_empty(&name);
         }
         let text = if lines.is_empty() {
             format!("Process {pid} exited")
@@ -526,6 +540,37 @@ fn run_command(state: &Rc<RefCell<RunState>>) {
         toast.set_timeout(5);
         toast_overlay.add_toast(toast);
     });
+}
+
+/// What the post-exit cleanup does with a launched app's cgroup on one poll.
+#[derive(Debug, PartialEq, Eq)]
+enum CleanupStep {
+    /// The cgroup directory is gone: stop polling.
+    Done,
+    /// Processes are still in it: poll again later.
+    Wait,
+    /// It looks empty, or `cgroup.events` could not be read: try to remove
+    /// it, and poll again if that fails.
+    TryRemove,
+}
+
+fn cleanup_step(exists: bool, populated: Option<bool>) -> CleanupStep {
+    match (exists, populated) {
+        (false, _) => CleanupStep::Done,
+        (true, Some(true)) => CleanupStep::Wait,
+        (true, _) => CleanupStep::TryRemove,
+    }
+}
+
+/// One cleanup poll for cgroup `name`; true when there is nothing left to do.
+/// An unreadable `populated` state no longer ends the polling while the
+/// directory still exists.
+fn cleanup_once(manager: &CgroupManager, name: &str) -> bool {
+    match cleanup_step(manager.cgroup_exists(name), manager.is_populated(name)) {
+        CleanupStep::Done => true,
+        CleanupStep::Wait => false,
+        CleanupStep::TryRemove => matches!(manager.remove_if_empty(name), Ok(true)),
+    }
 }
 
 fn show_status(label: &gtk::Label, message: &str, is_error: bool) {
@@ -579,4 +624,18 @@ fn find_widget_by_name(widget: &gtk::Widget, name: &str) -> Option<gtk::Widget> 
         child = c.next_sibling();
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cleanup_keeps_polling_while_the_cgroup_exists() {
+        assert_eq!(cleanup_step(false, None), CleanupStep::Done);
+        assert_eq!(cleanup_step(false, Some(true)), CleanupStep::Done);
+        assert_eq!(cleanup_step(true, Some(true)), CleanupStep::Wait);
+        assert_eq!(cleanup_step(true, Some(false)), CleanupStep::TryRemove);
+        assert_eq!(cleanup_step(true, None), CleanupStep::TryRemove);
+    }
 }

@@ -5,6 +5,31 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] - 2026-09-27
+
+### Upgrading from 0.2.0
+
+- cargo installs: rerun `rlm guard enable` to refresh your user unit (it adds `RestartPreventExitStatus=78 75`), then `systemctl --user restart rlm-guard`. Packaged installs get the new unit with the package.
+- `rlm limit` now refuses to run while the config file is invalid, instead of silently using defaults and dropping your protect list. Fix the file, or pass `--force`.
+- Guard config values now have upper bounds: `calm_hold_secs` and `freeze_cooldown_secs` at most 86400, `mem_available_floor_mb` and `min_rss_mb` at most 16 TiB. A config above them makes rlm-guard exit with status 78 until it is fixed.
+
+### Fixed
+
+- rlm-guard never keeps its lock, journal or history in a shared directory such as `/tmp`. It uses the per-user state directory, then `$XDG_RUNTIME_DIR/rlm`; with neither, it does not freeze or cap.
+- A second rlm-guard exits with status 75 and systemd does not restart it every 2 seconds.
+- The cold-start wait for growth data is bounded to 3 samples.
+- Startup waits at most 2 seconds for the systemd bus, then restores through cgroupfs directly.
+- Guard config arithmetic cannot overflow.
+- `rlm guard enable`: `%` in the binary path is escaped, paths systemd cannot run are refused with a clear error, relative `PATH` entries are ignored, the unit is written atomically, and a masked unit is reported with the unmask command.
+- GUI: the guard switch gives up after 30 seconds, the Run page removes a leftover cgroup once its processes exit (and stops retrying after a minute of failures), and the service state cache cannot deadlock.
+- Packaging: the AUR package stops the guard on removal, the rpm keeps an edited `rlm-delegate.conf` on upgrade, and the deb has a short synopsis.
+- crates.io: README links and the hero image resolve, and rlmctl-core and rlmctl-common have readmes.
+
+### Changed
+
+- Common terminal emulators and the tmux and screen multiplexers are on the built-in protect list.
+- CI and release workflows use the Node 24 versions of their actions.
+
 ## [0.2.0] - 2026-09-26
 
 ### Upgrading from 0.1

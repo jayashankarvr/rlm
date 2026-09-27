@@ -1,4 +1,4 @@
-//! `rlm-guard` — the freeze-guard daemon.
+//! `rlm-guard`, the freeze-guard daemon.
 //!
 //! Runs as a per-user systemd service. Each tick it samples memory pressure (PSI)
 //! and, only when needed, the user's own processes, asks the pure [`PolicyEngine`] what to do,
@@ -8,7 +8,9 @@
 use common::Config;
 use rlm_core::guard::history;
 use rlm_core::guard::sampler::{live_cgroups, strip_cgroup_root, targets_from_procs};
-use rlm_core::guard::{cgfs, journal_path, Effector, Journal, PolicyEngine, Sampler, SystemdUser};
+use rlm_core::guard::{
+    cgfs, try_journal_path, Effector, Journal, PolicyEngine, Sampler, SystemdUser,
+};
 use rlm_core::rules::RulesEnforcer;
 use rlm_core::CgroupManager;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -19,6 +21,11 @@ use std::time::{Duration, Instant};
 /// the shipped unit, so systemd does not restart-loop against a file that
 /// cannot fix itself.
 const EX_CONFIG: i32 = 78;
+
+/// Exit status when another rlm-guard holds the single-instance lock
+/// (`EX_TEMPFAIL`). Also in `RestartPreventExitStatus`: restarting every
+/// few seconds cannot help while the other guard runs.
+const EX_LOCKED: i32 = 75;
 
 /// How often persistent rules are reconciled. New matching processes are
 /// absorbed within this delay.
@@ -57,23 +64,35 @@ fn main() {
 
     // One guard per user. A second one would sweep and rewrite the first
     // one's journal, so stop before touching it. Held until exit.
-    let lock_path = rlm_core::guard::lock_path();
-    let _instance_lock = match rlm_core::guard::lock::try_lock(&lock_path) {
-        Ok(Some(file)) => Some(file),
-        Ok(None) => {
-            tracing::error!(
-                "another rlm-guard is already running (lock {} is held); exiting",
-                lock_path.display()
-            );
-            std::process::exit(1);
-        }
-        // The state dir is unusable, so the journal cannot open either and
-        // no second guard can share it. Keep running so persistent rules
-        // still work, as they do when only the journal fails.
-        Err(e) => {
+    let _instance_lock = match rlm_core::guard::lock_path() {
+        Some(lock_path) => match rlm_core::guard::lock::try_lock(&lock_path) {
+            Ok(Some(file)) => Some(file),
+            Ok(None) => {
+                tracing::error!(
+                    "another rlm-guard is already running (lock {} is held); exiting with \
+                     status {EX_LOCKED}. systemd will not restart this unit; once the other \
+                     guard stops, run: systemctl --user restart rlm-guard",
+                    lock_path.display()
+                );
+                std::process::exit(EX_LOCKED);
+            }
+            // The state dir is unusable, so the journal cannot open either and
+            // no second guard can share it. Keep running so persistent rules
+            // still work, as they do when only the journal fails.
+            Err(e) => {
+                tracing::warn!(
+                    "cannot take the lock {}: {e}; continuing without it",
+                    lock_path.display()
+                );
+                None
+            }
+        },
+        // No per-user state or runtime dir. A shared dir such as /tmp would
+        // let another user hold the lock and block this guard, so run
+        // without one.
+        None => {
             tracing::warn!(
-                "cannot take the lock {}: {e}; continuing without it",
-                lock_path.display()
+                "no per-user state dir or XDG_RUNTIME_DIR; running without the single-instance lock"
             );
             None
         }
@@ -102,7 +121,10 @@ fn recover_only() {
     let Ok(manager) = CgroupManager::new() else {
         return;
     };
-    let Ok(journal) = Journal::open(journal_path(), cgfs::boot_id()) else {
+    let Some(path) = try_journal_path() else {
+        return;
+    };
+    let Ok(journal) = Journal::open(path, cgfs::boot_id()) else {
         return;
     };
     let systemd = SystemdUser::connect();
@@ -121,20 +143,20 @@ fn run(config: Config) -> common::Result<()> {
 
     let manager = CgroupManager::new()?;
 
-    // Open the write-ahead journal. This must happen — and startup recovery
-    // (below) must run — BEFORE any early-exit decision: the journal is the
+    // Open the write-ahead journal. This must happen, and startup recovery
+    // (below) must run, BEFORE any early-exit decision: the journal is the
     // only record of an in-place freeze/cap, and a user who disables the
     // guard (or has no rules configured) after a crash must still get their
-    // frozen/capped cgroups restored on the next start (D5a fix — this used
+    // frozen/capped cgroups restored on the next start (D5a fix: this used
     // to run after the early-exit check, so it never ran at all in that
     // case).
     //
     // A journal-open failure is only fatal when there are no rules to fall
     // back to AND the guard is actually enabled: persistent-rule enforcement
-    // has no dependency on the journal at all (D5b fix — this used to be
+    // has no dependency on the journal at all (D5b fix: this used to be
     // fatal unconditionally, killing rules enforcement over a guard-only
     // concern like an unwritable $XDG_STATE_HOME). With rules configured, we
-    // log loudly and continue without journal-backed escalation instead —
+    // log loudly and continue without journal-backed escalation instead;
     // the daemon structurally cannot freeze/cap safely without a durable
     // journal anyway (`Effector` journals before every mutation), so
     // escalation is simply disabled for this run.
@@ -147,7 +169,24 @@ fn run(config: Config) -> common::Result<()> {
     // itself (nothing this process does can fix an unwritable
     // $XDG_STATE_HOME, and there's no escalation or rules work to attempt
     // either way).
-    let journal = match Journal::open(journal_path(), cgfs::boot_id()) {
+    // With no per-user state or runtime dir there is nowhere safe for the
+    // journal (never a shared dir such as /tmp), so treat it as a journal
+    // that failed to open: no freeze or cap this run, rules still apply.
+    if try_journal_path().is_none() && enforcer.rule_count() == 0 {
+        tracing::warn!(
+            "no per-user state dir or XDG_RUNTIME_DIR for the guard journal and no rules \
+             configured; nothing to do, exiting"
+        );
+        return Ok(());
+    }
+    let opened = match try_journal_path() {
+        Some(path) => Journal::open(path, cgfs::boot_id()),
+        None => Err(common::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no per-user state dir or XDG_RUNTIME_DIR for the guard journal",
+        ))),
+    };
+    let journal = match opened {
         Ok(j) => Some(j),
         Err(e) if enforcer.rule_count() > 0 => {
             tracing::error!(
@@ -168,9 +207,12 @@ fn run(config: Config) -> common::Result<()> {
         Err(e) => return Err(e),
     };
 
-    // No session bus (e.g. headless) -> every action below falls back to raw
-    // cgroupfs writes; SystemdUser::connect() already encodes that.
+    // Without a session bus (headless, or no answer within 2 s) every action
+    // below falls back to raw cgroupfs writes.
     let systemd = SystemdUser::connect();
+    if systemd.is_none() {
+        tracing::warn!("systemd user bus unavailable; using raw cgroupfs writes");
+    }
     let effector = journal
         .as_ref()
         .map(|j| Effector::new(&manager, j, systemd.as_ref()));
@@ -215,7 +257,10 @@ fn run(config: Config) -> common::Result<()> {
     let start = Instant::now();
     let mut warned_no_psi = false;
     let mut last_rules_ms: Option<u64> = None;
-    let hist = history::history_path();
+    let hist = history::try_history_path();
+    if hist.is_none() {
+        tracing::warn!("no per-user state dir or XDG_RUNTIME_DIR; guard history is not recorded");
+    }
 
     tracing::info!(
         uid,
@@ -261,8 +306,9 @@ fn run(config: Config) -> common::Result<()> {
                     if let Err(e) = &result {
                         tracing::warn!(?action, "action failed: {e}");
                     }
-                    if let Some(ev) = history::event_for(&action, &result, history::unix_now()) {
-                        if let Err(e) = history::append(&hist, &ev) {
+                    let event = history::event_for(&action, &result, history::unix_now());
+                    if let (Some(hist), Some(ev)) = (&hist, event) {
+                        if let Err(e) = history::append(hist, &ev) {
                             tracing::debug!("history write failed: {e}");
                         }
                     }
@@ -353,9 +399,22 @@ mod tests {
         );
     }
 
+    fn restart_prevent_codes() -> Vec<i32> {
+        UNIT.lines()
+            .filter_map(|l| l.strip_prefix("RestartPreventExitStatus="))
+            .flat_map(|v| v.split_whitespace())
+            .map(|c| c.parse().expect("numeric exit status"))
+            .collect()
+    }
+
     #[test]
     fn unit_does_not_restart_on_config_errors() {
-        assert!(UNIT.contains(&format!("RestartPreventExitStatus={}", super::EX_CONFIG)));
+        assert!(restart_prevent_codes().contains(&super::EX_CONFIG));
+    }
+
+    #[test]
+    fn unit_does_not_restart_while_another_guard_holds_the_lock() {
+        assert!(restart_prevent_codes().contains(&super::EX_LOCKED));
     }
 
     #[test]

@@ -1,9 +1,9 @@
-//! Pure policy state machine — the self-healing circuit breaker at the heart of
+//! Pure policy state machine: the self-healing circuit breaker at the heart of
 //! the freeze guard.
 //!
 //! Contract: [`PolicyEngine::tick`] is pure given `(now_ms, sample, targets,
 //! live_cgroups)` plus the engine's own internal state. It performs **no**
-//! syscalls and reads **no** clock — `now_ms` (monotonic milliseconds) is
+//! syscalls and reads **no** clock; `now_ms` (monotonic milliseconds) is
 //! injected by the caller. That is what makes the whole escalation/recovery
 //! ladder unit-testable without root.
 
@@ -29,6 +29,10 @@ pub const MAX_HELD_APPS: usize = 3;
 /// Growth rate (bytes/s of `memory.current`) an app must reach to be picked
 /// as the one causing pressure. Below it, the largest app is picked instead.
 pub const MIN_GROWTH_BPS: f64 = 1_048_576.0;
+/// Most consecutive ticks victim selection waits for growth data when every
+/// eligible cgroup is newly seen. After that the largest app is picked, so a
+/// stream of short-lived cgroups cannot keep the guard from acting.
+pub const MAX_COLD_DEFER_TICKS: u32 = 3;
 
 /// True when the host is actually short of memory: below the hard floor, or
 /// below `act_below_available_pct` percent of RAM. A stall confined to one
@@ -53,8 +57,8 @@ struct Growth {
 
 /// Self-healing circuit-breaker policy engine.
 ///
-/// On a memory spike it drives the ladder *notify -> freeze (short) -> auto-thaw
-/// -> still high? soft-cap -> calm sustained -> lift*, never issuing a kill. All
+/// On a memory spike it drives the ladder *notify, freeze (short), auto-thaw,
+/// if still high a soft cap, once calm is sustained a lift*, never issuing a kill. All
 /// of that lives in [`tick`](Self::tick); the struct just holds the state needed
 /// to make decisions stable across ticks (hysteresis, cooldowns, growth).
 ///
@@ -75,16 +79,19 @@ pub struct PolicyEngine {
     growth: HashMap<String, Growth>,
     /// When the level last became `Calm` (None while not calm). Gates cap lifts.
     calm_since_ms: Option<u64>,
-    /// When we last emitted a new freeze/cap — the global escalation gate.
+    /// When we last emitted a new freeze/cap: the global escalation gate.
     /// `None` means "never acted", so the gate is open on the first action.
     last_action_ms: Option<u64>,
     /// Whether the most recent escalation acted under `Coverage::Partial`.
     /// When true the gate is shortened to [`PARTIAL_GATE_MS`] (capped at the
     /// freeze hold) so the guard can re-assess sooner, but never instantly.
     last_action_partial: bool,
-    /// When we last emitted a `Notify` — drives notification rate-limiting.
+    /// When we last emitted a `Notify`; drives notification rate-limiting.
     /// `None` means "never notified", so the first eligible notify fires.
     last_notify_ms: Option<u64>,
+    /// Consecutive ticks on which selection deferred for lack of growth
+    /// data. Bounded by [`MAX_COLD_DEFER_TICKS`].
+    cold_defer_ticks: u32,
 }
 
 impl PolicyEngine {
@@ -99,6 +106,7 @@ impl PolicyEngine {
             last_action_ms: None,
             last_action_partial: false,
             last_notify_ms: None,
+            cold_defer_ticks: 0,
         }
     }
 
@@ -140,6 +148,7 @@ impl PolicyEngine {
                 if self.calm_since_ms.is_none() {
                     self.calm_since_ms = Some(now_ms);
                 }
+                self.cold_defer_ticks = 0;
             }
             _ => self.calm_since_ms = None,
         }
@@ -163,8 +172,8 @@ impl PolicyEngine {
         }
 
         // 5. Recover: auto-thaw held freezes, and lift caps once calm has held.
-        let freeze_hold_ms = self.cfg.timing.freeze_hold_secs * 1000;
-        let calm_hold_ms = self.cfg.timing.calm_hold_secs * 1000;
+        let freeze_hold_ms = self.cfg.timing.freeze_hold_secs.saturating_mul(1000);
+        let calm_hold_ms = self.cfg.timing.calm_hold_secs.saturating_mul(1000);
         let mut recovered = Vec::new();
         // Apps thawed on this tick must not be re-targeted by escalation in
         // the same tick; they need a re-measure first.
@@ -180,7 +189,7 @@ impl PolicyEngine {
                 }
                 Intervention::Capped { .. } => {
                     // Only lift a cap when pressure is calm *and* has stayed calm
-                    // long enough — prevents re-capping churn. `calm_since_ms` is
+                    // long enough; this prevents re-capping churn. `calm_since_ms` is
                     // the transition timestamp, so this measures *sustained* calm.
                     if self.level == Level::Calm {
                         if let Some(calm_since) = self.calm_since_ms {
@@ -226,7 +235,7 @@ impl PolicyEngine {
                     let partial = members
                         .iter()
                         .any(|m| m.resolution.coverage == Coverage::Partial);
-                    let cooldown_ms = self.cfg.timing.freeze_cooldown_secs * 1000;
+                    let cooldown_ms = self.cfg.timing.freeze_cooldown_secs.saturating_mul(1000);
                     let in_cooldown = self
                         .last_freeze_ms
                         .get(&app)
@@ -301,7 +310,7 @@ impl PolicyEngine {
         self.level
     }
 
-    /// Currently active interventions (cgroup path -> intervention), sorted by
+    /// Currently active interventions (cgroup path and intervention), sorted by
     /// cgroup path so callers get a deterministic order.
     pub fn interventions(&self) -> Vec<(String, Intervention)> {
         let mut out: Vec<(String, Intervention)> = self
@@ -313,7 +322,7 @@ impl PolicyEngine {
         out
     }
 
-    /// Cgroup paths the engine currently holds an intervention on — frozen
+    /// Cgroup paths the engine currently holds an intervention on, frozen
     /// *or* capped. Interventions are already keyed by cgroup, so this is
     /// just the key set. For external callers (e.g.
     /// `RulesEnforcer::reconcile`, D1) that must not fight/revert an active
@@ -346,7 +355,7 @@ impl PolicyEngine {
         let high_rise = s.some_avg10 >= t.psi_some_high || s.full_avg10 >= FULL_HIGH_RISE;
         let crit_rise = s.full_avg10 >= t.psi_full_critical || s.mem_available_mb < floor;
 
-        // Stay predicates (above the lower/fall threshold — keep the level).
+        // Stay predicates (above the lower/fall threshold: keep the level).
         let warn_stay = s.some_avg10 >= t.psi_some_warn / 2.0;
         let high_stay =
             s.some_avg10 >= t.psi_some_high / 2.0 || s.full_avg10 >= FULL_HIGH_RISE / 2.0;
@@ -417,15 +426,16 @@ impl PolicyEngine {
     /// at least one was first seen this tick, nothing is picked. The next
     /// tick (one sample interval later) has rates, so an idle large app is
     /// not frozen in place of a smaller one that is growing. The deferral
-    /// lasts one tick at most per new cgroup; if no eligible cgroup reports
-    /// `memory.current` at all, growth can never be measured and the largest
-    /// app is picked at once.
+    /// lasts one tick at most per new cgroup, and at most
+    /// [`MAX_COLD_DEFER_TICKS`] ticks in a row; after that the largest app is
+    /// picked. If no eligible cgroup reports `memory.current` at all, growth
+    /// can never be measured and the largest app is picked at once.
     fn select_app<'a>(
-        &self,
+        &mut self,
         targets: &'a [Target],
         blocked: &HashSet<String>,
     ) -> Option<(String, Vec<&'a Target>)> {
-        let min_rss_kb = self.cfg.selection.min_rss_mb * 1024;
+        let min_rss_kb = self.cfg.selection.min_rss_mb.saturating_mul(1024);
         let held = self.held_apps();
         let mut groups: BTreeMap<&str, Vec<&Target>> = BTreeMap::new();
         for t in targets {
@@ -456,9 +466,11 @@ impl PolicyEngine {
                     .is_some_and(|g| !g.warm)
             })
         });
-        if !any_warm && any_cold {
+        if !any_warm && any_cold && self.cold_defer_ticks < MAX_COLD_DEFER_TICKS {
+            self.cold_defer_ticks += 1;
             return None;
         }
+        self.cold_defer_ticks = 0;
         let growth = |ms: &[&Target]| -> f64 {
             ms.iter()
                 .map(|m| {
@@ -470,7 +482,7 @@ impl PolicyEngine {
         };
         let size = |ms: &[&Target]| -> u64 {
             ms.iter()
-                .map(|m| m.current_bytes.unwrap_or(m.rss_kb * 1024))
+                .map(|m| m.current_bytes.unwrap_or(m.rss_kb.saturating_mul(1024)))
                 .sum()
         };
         let pick = eligible
@@ -659,7 +671,7 @@ mod tests {
         e.tick(1_000, sample(0.0, 4.0, 8000), &procs, &live_from(&procs));
         assert_eq!(e.level, Level::High, "full=4.0 should enter High");
 
-        // full drifts to 2.0 — between the fall (1.5) and rise (3.0) thresholds.
+        // full drifts to 2.0, between the fall (1.5) and rise (3.0) thresholds.
         // With hysteresis it must HOLD High, not flap back to Calm.
         e.tick(2_000, sample(0.0, 2.0, 8000), &procs, &live_from(&procs));
         assert_eq!(
@@ -754,7 +766,7 @@ mod tests {
             cg
         ));
 
-        // Still high, and within the 60s freeze cooldown -> Cap, not re-Freeze.
+        // Still high, and within the 60s freeze cooldown: Cap, not re-Freeze.
         // t must clear the escalation gate (>= last_action 5000 + 5000 hold).
         let a = e.tick(10_000, high(), &procs, &live_from(&procs));
         assert!(
@@ -818,7 +830,7 @@ mod tests {
             "lifted just before hold: {a2:?}"
         );
 
-        // 30s of sustained calm -> lift the cap.
+        // 30s of sustained calm lifts the cap.
         let a3 = e.tick(45_000, calm(), &procs, &live_from(&procs));
         assert!(
             has_liftcap_target(&a3, cg),
@@ -841,8 +853,8 @@ mod tests {
         ));
 
         e.tick(15_000, calm(), &procs, &live_from(&procs)); // calm clock starts
-        e.tick(20_000, high(), &procs, &live_from(&procs)); // pressure returns -> calm clock cleared
-                                                            // New calm window starts at 25s; at 50s only 25s have passed -> no lift.
+        e.tick(20_000, high(), &procs, &live_from(&procs)); // pressure returns, calm clock cleared
+                                                            // New calm window starts at 25s; at 50s only 25s have passed, so no lift.
         e.tick(25_000, calm(), &procs, &live_from(&procs));
         let a = e.tick(50_000, calm(), &procs, &live_from(&procs));
         assert!(
@@ -889,7 +901,7 @@ mod tests {
         );
         assert_eq!(e.interventions().len(), 1);
 
-        // Next tick the process (and its resolution) has vanished -> LiftCap
+        // Next tick the process (and its resolution) has vanished, so LiftCap
         // cleanup, intervention dropped.
         let a = e.tick(1_000, calm(), &[], &live_from(&[]));
         assert!(
@@ -901,7 +913,7 @@ mod tests {
 
     /// D2 regression: a cgroup absent from `procs` (e.g. the cap evicted
     /// enough file pages to drop the process below `min_rss_mb`) but still
-    /// present in `live_cgroups` must NOT be pruned — the cgroup is real and
+    /// present in `live_cgroups` must NOT be pruned: the cgroup is real and
     /// alive, just not currently eligible for (re-)selection. A cgroup
     /// absent from *both* sets must still be pruned with a LiftCap.
     #[test]
@@ -920,7 +932,7 @@ mod tests {
 
         // Next tick: the process no longer appears in `procs` (as if the cap
         // evicted its file pages below the min-RSS floor), but its cgroup is
-        // still in `live_cgroups` — must NOT be pruned.
+        // still in `live_cgroups`, so it must NOT be pruned.
         let live: std::collections::HashSet<String> = [cg.to_string()].into();
         let a1 = e.tick(1_000, calm(), &[], &live);
         assert!(
@@ -933,7 +945,7 @@ mod tests {
             "intervention must survive while the cgroup is live"
         );
 
-        // Now the cgroup is gone from both sets entirely -> pruned.
+        // Now the cgroup is gone from both sets entirely, so it is pruned.
         let a2 = e.tick(2_000, calm(), &[], &std::collections::HashSet::new());
         assert!(
             has_liftcap_target(&a2, cg),
@@ -946,7 +958,7 @@ mod tests {
     fn interventions_reflect_state_sorted_by_cgroup() {
         let mut e = PolicyEngine::new(cfg());
         // pid 5 ("a") is the larger hog; pid 3 ("b") the smaller. We build a
-        // Capped "a" and a Frozen->Capped "b" that coexist, then check
+        // Capped "a" and a "b" capped after a freeze, both active, then check
         // ordering + content. "/app.slice/app-a-5.scope" sorts before
         // "/app.slice/app-b-3.scope" lexicographically.
         let procs = vec![proc(5, "a", 4000), proc(3, "b", 3500)];
@@ -954,7 +966,7 @@ mod tests {
         let cg_a = "/app.slice/app-a-5.scope";
         let cg_b = "/app.slice/app-b-3.scope";
 
-        // Walk both cgroups down the freeze -> thaw -> (still hot) cap ladder
+        // Walk both cgroups down the freeze, thaw, (still hot) cap ladder
         // so two Capped interventions coexist. Caps persist while High (never
         // auto-thaw), which is what lets two interventions overlap under
         // default timing.
@@ -986,7 +998,7 @@ mod tests {
         let mut e = PolicyEngine::new(cfg());
         let procs = vec![proc(2, "hog", 4000)];
         prime(&mut e, &procs);
-        // No PSI pressure, but MemAvailable below the 400 MB floor -> Critical.
+        // No PSI pressure, but MemAvailable below the 400 MB floor, so Critical.
         let a = e.tick(0, sample(0.0, 0.0, 100), &procs, &live_from(&procs));
         assert_eq!(e.level, Level::Critical);
         assert_eq!(freeze_targets(&a), vec!["/app.slice/app-hog-2.scope"]);
@@ -1232,6 +1244,35 @@ mod tests {
             freeze_targets(&e.tick(1_000, sample(0.0, 0.0, 300), &t1, &live_from(&t1))),
             vec!["/app.slice/hog.scope"]
         );
+    }
+
+    /// A new cgroup on every tick never gets a measured growth rate. The
+    /// deferral is bounded, so the guard still acts by the fourth tick and
+    /// falls back to the largest eligible app.
+    #[test]
+    fn cold_start_deferral_is_bounded_when_cgroups_keep_changing() {
+        let mut e = PolicyEngine::new(cfg());
+        let crit = sample(0.0, 0.0, 300);
+        for tick in 0..4u64 {
+            let ts = vec![
+                target(
+                    &format!("big{tick}"),
+                    &format!("/app.slice/b{tick}.scope"),
+                    3000,
+                ),
+                target(
+                    &format!("small{tick}"),
+                    &format!("/app.slice/s{tick}.scope"),
+                    1000,
+                ),
+            ];
+            let frozen = freeze_targets(&e.tick(tick * 1_000, crit, &ts, &live_from(&ts)));
+            if tick < u64::from(MAX_COLD_DEFER_TICKS) {
+                assert!(frozen.is_empty(), "tick {tick} should defer: {frozen:?}");
+            } else {
+                assert_eq!(frozen, vec![format!("/app.slice/b{tick}.scope")]);
+            }
+        }
     }
 
     /// Without any memory.current reading, growth can never be measured, so

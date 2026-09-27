@@ -7,6 +7,12 @@ use std::path::{Path, PathBuf};
 /// Maximum config file size (1 MB) - prevents YAML bomb DoS attacks
 const MAX_CONFIG_SIZE: u64 = 1_048_576;
 
+/// Upper bound for guard sizes given in MB (16 TiB). Far above any real
+/// host, and low enough that converting to bytes cannot overflow.
+pub const MAX_GUARD_MB: u64 = 16 * 1024 * 1024;
+/// Upper bound for guard durations given in seconds (one day).
+pub const MAX_GUARD_SECS: u64 = 86_400;
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -131,6 +137,11 @@ impl GuardConfig {
         if !(1..=100).contains(&t.act_below_available_pct) {
             return bad("trigger.act_below_available_pct must be between 1 and 100");
         }
+        if t.mem_available_floor_mb > MAX_GUARD_MB {
+            return bad(&format!(
+                "trigger.mem_available_floor_mb must be at most {MAX_GUARD_MB}"
+            ));
+        }
         let tm = &self.timing;
         if !(100..=60_000).contains(&tm.sample_interval_ms) {
             return bad("timing.sample_interval_ms must be between 100 and 60000");
@@ -138,11 +149,23 @@ impl GuardConfig {
         if !(1..=60).contains(&tm.freeze_hold_secs) {
             return bad("timing.freeze_hold_secs must be between 1 and 60");
         }
-        if tm.calm_hold_secs == 0 {
-            return bad("timing.calm_hold_secs must be at least 1");
+        if !(1..=MAX_GUARD_SECS).contains(&tm.calm_hold_secs) {
+            return bad(&format!(
+                "timing.calm_hold_secs must be between 1 and {MAX_GUARD_SECS}"
+            ));
         }
         if tm.freeze_cooldown_secs < tm.freeze_hold_secs {
             return bad("timing.freeze_cooldown_secs must be at least timing.freeze_hold_secs");
+        }
+        if tm.freeze_cooldown_secs > MAX_GUARD_SECS {
+            return bad(&format!(
+                "timing.freeze_cooldown_secs must be at most {MAX_GUARD_SECS}"
+            ));
+        }
+        if self.selection.min_rss_mb > MAX_GUARD_MB {
+            return bad(&format!(
+                "selection.min_rss_mb must be at most {MAX_GUARD_MB}"
+            ));
         }
         if self.selection.protect.iter().any(|p| p.trim().is_empty()) {
             return bad("selection.protect must not contain empty names");
@@ -243,6 +266,27 @@ pub const BUILTIN_PROTECT: &[&str] = &[
     "bash",
     "zsh",
     "fish",
+    // Terminal emulators. Most run as their own unit in app.slice with the
+    // shells in other scopes, so without this they could be frozen.
+    // Matched on the exe basename; terminator is a Python script, so its
+    // exe is python3 and it matches on comm instead.
+    "gnome-terminal-server",
+    "ptyxis",
+    "ptyxis-agent",
+    "kgx",
+    "konsole",
+    "kitty",
+    "alacritty",
+    "wezterm-gui",
+    "foot",
+    "tilix",
+    "xfce4-terminal",
+    "xterm",
+    "terminator",
+    // Terminal multiplexers. The tmux server sets its comm to "tmux: server".
+    "tmux",
+    "tmux: server",
+    "screen",
 ];
 
 /// Built-in protect names plus the user's additions from `guard.selection.protect`.
@@ -618,6 +662,33 @@ mod tests {
         assert!(s.contains("gnome-control-center"));
     }
 
+    /// Terminals and multiplexers are protected by their exe basename, and
+    /// tmux also by the comm "tmux: server" it sets on its server process.
+    #[test]
+    fn terminals_and_multiplexers_are_protected() {
+        let s = protect_set(&[]);
+        for exe in [
+            "gnome-terminal-server",
+            "ptyxis",
+            "ptyxis-agent",
+            "kgx",
+            "konsole",
+            "kitty",
+            "alacritty",
+            "wezterm-gui",
+            "foot",
+            "tilix",
+            "xfce4-terminal",
+            "xterm",
+            "terminator",
+            "tmux",
+            "screen",
+        ] {
+            assert!(is_protected(&s, "x", Some(exe)), "{exe}");
+        }
+        assert!(is_protected(&s, "tmux: server", None));
+    }
+
     #[test]
     fn is_protected_prefers_full_exe_name_over_truncated_comm() {
         let s = protect_set(&["gnome-control-center".into()]);
@@ -690,6 +761,62 @@ mod tests {
             let mut c = GuardConfig::default();
             f(&mut c);
             assert!(c.validate().is_err(), "case {i} should be rejected");
+        }
+    }
+
+    /// Every size and duration has an upper bound: the bound itself is
+    /// accepted, one past it is rejected with a message naming the field.
+    #[test]
+    #[allow(clippy::type_complexity)]
+    fn validate_enforces_upper_bounds() {
+        let cases: Vec<(&str, Box<dyn Fn(&mut GuardConfig, u64)>, u64)> = vec![
+            (
+                "trigger.mem_available_floor_mb",
+                Box::new(|c, v| c.trigger.mem_available_floor_mb = v),
+                MAX_GUARD_MB,
+            ),
+            (
+                "timing.calm_hold_secs",
+                Box::new(|c, v| c.timing.calm_hold_secs = v),
+                MAX_GUARD_SECS,
+            ),
+            (
+                "timing.freeze_cooldown_secs",
+                Box::new(|c, v| c.timing.freeze_cooldown_secs = v),
+                MAX_GUARD_SECS,
+            ),
+            (
+                "selection.min_rss_mb",
+                Box::new(|c, v| c.selection.min_rss_mb = v),
+                MAX_GUARD_MB,
+            ),
+            (
+                "timing.freeze_hold_secs",
+                Box::new(|c, v| c.timing.freeze_hold_secs = v),
+                60,
+            ),
+            (
+                "timing.sample_interval_ms",
+                Box::new(|c, v| c.timing.sample_interval_ms = v),
+                60_000,
+            ),
+            (
+                "trigger.act_below_available_pct",
+                Box::new(|c, v| c.trigger.act_below_available_pct = v),
+                100,
+            ),
+        ];
+        for (field, set, max) in &cases {
+            let mut c = GuardConfig::default();
+            set(&mut c, *max);
+            c.validate()
+                .unwrap_or_else(|e| panic!("{field} = {max} must be accepted: {e}"));
+            for v in [max + 1, u64::MAX] {
+                let mut c = GuardConfig::default();
+                set(&mut c, v);
+                let err = c.validate().expect_err(field).to_string();
+                assert!(err.contains(field), "{field} = {v}: {err}");
+            }
         }
     }
 

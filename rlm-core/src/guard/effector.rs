@@ -14,7 +14,7 @@
 //! `Effector` from a single thread (the tick loop in `rlm-guard`'s `main`),
 //! so `Effector` just holds a `&Journal` and relies on the daemon's
 //! single-threaded call discipline plus the journal's own internal locking
-//! for safety — it adds no locking of its own.
+//! for safety; it adds no locking of its own.
 //!
 //! # Mechanism: systemd unit vs. raw cgroupfs
 //! When a target resolved to a systemd unit (`Mechanism::Unit`), we prefer
@@ -48,11 +48,11 @@
 //! If more than one journal entry ever coexists for the same
 //! cgroup (a leak from an incomplete prior removal), every restore path
 //! treats them as one chain: liveness is judged against the chain's `Cap`
-//! entry specifically (only a `Cap` has a `memory.high` to restore — a
+//! entry specifically (only a `Cap` has a `memory.high` to restore; a
 //! `Freeze` entry does not, so judging against `entries.last()` when it
 //! happens to be a newer `Freeze` would wrongly look like "nothing to
 //! restore" and strand `memory.high` at the guard's value forever), and the
-//! value restored is always the *oldest* `Cap` entry's `prev_high` — the
+//! value restored is always the *oldest* `Cap` entry's `prev_high`, the
 //! true pre-intervention value, not an intermediate entry's `prev_high`
 //! (which is just our own previous `our_high`). See [`restore_target`].
 //! Liveness, however, is judged against the *newest* `Cap` entry, not the
@@ -124,7 +124,7 @@ impl<'a> Effector<'a> {
         // still the same cgroup" from "this cgroup was torn down and
         // recreated" (`should_restore`). `unwrap_or(0)` used to substitute a
         // poison sentinel here: 0 is never a real inode, so the guard could
-        // never match again and the entry became permanently unrestorable —
+        // never match again and the entry became permanently unrestorable,
         // yet it was still journaled-and-acted-on, then later cleared and
         // logged as if it were an intentional skip (Promoted Minor A). Fail
         // closed instead: refuse to freeze at all rather than act with a
@@ -273,7 +273,7 @@ impl<'a> Effector<'a> {
     /// read-back value. Uses `Journal::replace` (a single atomic rewrite),
     /// not a separate `remove` then `append`: the latter has a window where
     /// the cgroup has no journal record at all, so a crash/SIGKILL/append
-    /// failure right there would leave a permanent, unrecoverable cap —
+    /// failure right there would leave a permanent, unrecoverable cap,
     /// exactly the invariant the journal exists to prevent (Task 6 review,
     /// fix round 2).
     fn reconcile_our_high(&self, written: &JournalEntry) {
@@ -291,7 +291,7 @@ impl<'a> Effector<'a> {
         let mut entries = self.entries_for(cgroup);
         let Some(pos) = entries.iter().rposition(|e| e == written) else {
             // Already removed/replaced by something else (e.g. a concurrent
-            // Thaw/LiftCap) — nothing left to correct.
+            // Thaw/LiftCap); nothing left to correct.
             return;
         };
         entries[pos].our_high = Some(actual);
@@ -304,7 +304,7 @@ impl<'a> Effector<'a> {
         tracing::info!(cgroup = %res.cgroup, "lifting cap");
         let entries = self.entries_for(&res.cgroup);
         // Mechanism-independent thaw always runs, regardless of whether any
-        // journal record exists — a dead-cgroup prune (carry-forward
+        // journal record exists: a dead-cgroup prune (carry-forward
         // finding, Task 5 review) must never leave a target frozen just
         // because we lost the journal entry.
         let _ = self.thaw_raw(&res.cgroup, res.unit.as_deref());
@@ -313,7 +313,7 @@ impl<'a> Effector<'a> {
     }
 
     /// All journal entries for one cgroup, in the order `Journal::entries()`
-    /// returns them — oldest-first, since entries are strictly appended.
+    /// returns them, oldest-first, since entries are strictly appended.
     fn entries_for(&self, cgroup: &str) -> Vec<JournalEntry> {
         self.journal
             .entries()
@@ -341,7 +341,7 @@ impl<'a> Effector<'a> {
     fn replay_and_clear(&self) -> Result<()> {
         // Group by cgroup first (entries for the same cgroup aren't
         // necessarily contiguous in the file) so each cgroup's chain is
-        // replayed as one unit — see `restore_high_if_any` — rather than
+        // replayed as one unit (see `restore_high_if_any`) rather than
         // entry-by-entry, which would mis-restore whenever more than one
         // entry coexists for a cgroup (Important #3, Task 6 review).
         let mut by_cgroup: std::collections::HashMap<String, Vec<JournalEntry>> =
@@ -374,7 +374,7 @@ impl<'a> Effector<'a> {
     }
 
     /// Restore `memory.high` for one cgroup's journal `entries` (oldest-first),
-    /// if the chain is still live — called *after* the caller has already
+    /// if the chain is still live. Called *after* the caller has already
     /// performed the mechanism-independent thaw (see module docs: no path
     /// here ever means "leave frozen"). All the decision logic is delegated
     /// to the pure [`restore_decision`]: liveness is judged against the
@@ -430,7 +430,7 @@ impl<'a> Effector<'a> {
 }
 
 /// What to do with one journal entry's `memory.high` at restore time. Never
-/// speaks to freeze/thaw — that is unconditional and already handled by the
+/// speaks to freeze/thaw; that is unconditional and already handled by the
 /// caller (`Effector::thaw_raw`) before `restore_step` is even consulted, so
 /// no variant here can ever mean "leave it frozen".
 #[derive(Debug, PartialEq, Eq)]
@@ -492,27 +492,27 @@ pub fn cap_tightens(prev_high: Option<&str>, target: u64) -> bool {
 
 /// Pure: the full restore decision for one cgroup's journal `entries`
 /// (oldest-first), given the cgroup's current inode and on-disk
-/// `memory.high` (both already read by the caller — no IO here). Answers two
+/// `memory.high` (both already read by the caller, no IO here). Answers two
 /// orthogonal questions with two different entries on purpose:
 ///
 /// - **Liveness** (is the guard we wrote still intact?) is judged against
 ///   the *newest* `Cap` entry in the chain. Entries are strictly appended,
-///   so a later Cap's write always supersedes an earlier one's on disk —
+///   so a later Cap's write always supersedes an earlier one's on disk, so
 ///   `should_restore`'s string-equality check must compare against the
 ///   entry whose `our_high` is what's actually there right now.
 /// - **Value** (what do we restore to?) is [`restore_target`]'s *oldest*
-///   `Cap` entry's `prev_high` — the true pre-intervention value, not an
+///   `Cap` entry's `prev_high`, the true pre-intervention value, not an
 ///   intermediate entry's `prev_high` (which is just our own previous
 ///   `our_high` from an earlier cap in the same chain).
 ///
 /// Judging both against the oldest Cap (NEW-1 regression) makes a stacked
 /// `[Cap, Cap]` chain's liveness check compare a stale `our_high` against
 /// the newer write on disk, so it never matches and the chain is treated as
-/// dead — stranding `memory.high` at the guard's value forever. Judging
+/// dead, stranding `memory.high` at the guard's value forever. Judging
 /// liveness against `entries.last()` fails the same way for `[Cap, Freeze]`
 /// (Promoted Minor B): the newest entry is the `Freeze`, which has no
 /// `memory.high` of its own. Returns [`RestoreStep::ThawOnly`] when there's
-/// no `Cap` entry anywhere in the chain (a `Freeze`-only chain) — nothing to
+/// no `Cap` entry anywhere in the chain (a `Freeze`-only chain): nothing to
 /// restore beyond the caller's unconditional thaw.
 pub fn restore_decision(
     entries: &[JournalEntry],
@@ -539,7 +539,7 @@ pub fn restore_decision(
 
 /// Pure: given all journal entries for one cgroup, oldest-first, select the
 /// `memory.high` value to restore, if the chain contains a `Cap` entry. The
-/// OLDEST `Cap` entry's `prev_high` is the true pre-intervention value — a
+/// OLDEST `Cap` entry's `prev_high` is the true pre-intervention value; a
 /// later entry's `prev_high` is just our own previous `our_high` from an
 /// earlier cap in the same chain, not the original (Task 6 review,
 /// Important #3). Returns `None` if there's no `Cap` entry (e.g. a
@@ -553,7 +553,7 @@ pub fn restore_target(entries: &[JournalEntry]) -> Option<String> {
 
 /// Runtime page size in bytes, via `sysconf(_SC_PAGESIZE)`. Falls back to
 /// 4096 (by far the most common value) only if the syscall ever returns
-/// something nonsensical — a defensive fallback, not the source of truth,
+/// something nonsensical, a defensive fallback, not the source of truth,
 /// since the whole point is to match whatever the kernel actually enforces.
 fn page_size() -> u64 {
     // SAFETY: sysconf(_SC_PAGESIZE) reads a static system parameter; no
@@ -569,7 +569,7 @@ fn page_size() -> u64 {
 /// Pure: round `bytes` down to a multiple of `page` (a no-op if `page` is 0).
 /// The kernel truncates `memory.high` writes to page multiples (Task 6
 /// review, Critical #1), so we must journal/write the value it will
-/// actually store, not the pre-truncation target — otherwise
+/// actually store, not the pre-truncation target; otherwise
 /// `should_restore`'s string-equality check can never pass again and a cap
 /// becomes permanent.
 fn page_align_down(bytes: u64, page: u64) -> u64 {
@@ -577,7 +577,7 @@ fn page_align_down(bytes: u64, page: u64) -> u64 {
 }
 
 /// Best-effort desktop notification via `notify-send`. Silently does nothing if
-/// the binary is missing or the spawn fails — notifications must never break the
+/// the binary is missing or the spawn fails; notifications must never break the
 /// guard.
 fn notify(message: &str) {
     match Command::new("notify-send")
@@ -697,7 +697,7 @@ mod tests {
     /// Task 6 review, Important #3: when duplicate/stacked `Cap` entries end
     /// up coexisting for one cgroup (a leak from an incomplete prior
     /// removal), the restore target must be the OLDEST entry's `prev_high`
-    /// — the true pre-intervention value. The newer entry's `prev_high` is
+    /// (the true pre-intervention value). The newer entry's `prev_high` is
     /// deliberately a different-looking value here to prove we don't
     /// chain-follow it.
     #[test]
@@ -721,7 +721,7 @@ mod tests {
     /// actually on disk), while the value restored stays the OLDEST `Cap`
     /// entry's `prev_high`. A stacked `[Cap(prev="max", our="A"),
     /// Cap(prev="A", our="B")]` chain with disk `memory.high == "B"` must
-    /// restore to `"max"` — not `SkipRemove`, which the old
+    /// restore to `"max"`, not `SkipRemove`, which the old
     /// `entries.iter().find()` (oldest-Cap-for-everything) produced: it
     /// compared the oldest entry's `our_high` ("A") against disk ("B"),
     /// never matched, and permanently stranded `memory.high`. Also covers
@@ -817,7 +817,7 @@ mod tests {
         assert_eq!(
             restore_step(&frz, None, None),
             RestoreStep::SkipRemove,
-            "dead cgroup: restore_step only decides memory.high, never freeze — the \
+            "dead cgroup: restore_step only decides memory.high, never freeze; the \
              unconditional thaw in Effector::thaw_raw already ran before this is consulted, \
              so a still-frozen dead cgroup is never left behind (carry-forward: Task 5 review)"
         );
@@ -827,7 +827,7 @@ mod tests {
     /// Writing `cgroup.freeze` only *requests* a state change; `cgroup.events`'s
     /// `frozen` field (what `read_frozen` reads) only flips once the kernel has
     /// actually quiesced every task in the cgroup, which can lag the write by a
-    /// few milliseconds under load — so a bare immediate read is flaky.
+    /// few milliseconds under load, so a bare immediate read is flaky.
     fn wait_for_frozen(cgroup: &str, want: bool, timeout: Duration) -> Option<bool> {
         let deadline = std::time::Instant::now() + timeout;
         loop {
@@ -1003,7 +1003,7 @@ mod tests {
     }
 
     /// Regression test for Task 6 review Critical #1: cap a real cgroup and
-    /// assert `cgfs::read_high` matches the journaled `our_high` exactly —
+    /// assert `cgfs::read_high` matches the journaled `our_high` exactly,
     /// i.e. the value we wrote never got silently page-truncated out from
     /// under the journal. The target process holds enough random anon
     /// memory (well above the 256 MiB `MIN_CAP_BYTES` floor, a round power
@@ -1205,8 +1205,8 @@ mod tests {
     /// (Cap journaled first, then the same cgroup frozen later without the
     /// Cap entry ever being cleared) must still restore the Cap's
     /// `prev_high` on thaw. Before the fix, liveness was judged against
-    /// `entries.last()` — the Freeze entry, which has no `memory.high` of
-    /// its own — so `restore_step` reported "nothing to restore" and
+    /// `entries.last()` (the Freeze entry, which has no `memory.high` of
+    /// its own), so `restore_step` reported "nothing to restore" and
     /// `memory.high` stayed pinned at the guard's Cap value forever once the
     /// whole chain was cleared. Requires cgroup v2 delegation, so it's
     /// `#[ignore]`d.
@@ -1260,7 +1260,7 @@ mod tests {
         );
 
         // ...then freeze the same cgroup without ever clearing the Cap
-        // entry — this is the leaked-chain scenario: two coexisting entries,
+        // entry. This is the leaked-chain scenario: two coexisting entries,
         // Freeze newest.
         effector
             .apply(&Action::Freeze {

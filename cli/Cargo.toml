@@ -6,7 +6,7 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 rust-version.workspace = true
-description = "rlm: unprivileged cgroup v2 limits for your own processes, plus rlm-guard, which freezes or caps a runaway app under memory pressure instead of killing it"
+description = "Unprivileged cgroup v2 limits and a freeze guard for your own Linux processes"
 readme = "../README.md"
 keywords = ["cgroups", "resource-limit", "memory", "systemd", "linux"]
 categories = ["command-line-utilities", "os::linux-apis"]
@@ -19,7 +19,7 @@ maintainer = "Jayashankar <me.jayashankar@gmail.com>"
 section = "admin"
 priority = "optional"
 depends = "$auto, systemd"
-extended-description = "Command-line tool (rlm) and per-user guard daemon (rlm-guard) for cgroup v2 resource limits under systemd user delegation."
+extended-description = "rlm sets unprivileged cgroup v2 memory, CPU and I/O limits on your own processes through systemd user delegation. rlm-guard is a per-user daemon that freezes or caps a runaway app under memory pressure instead of killing it."
 assets = [
     ["target/release/rlm", "usr/bin/", "755"],
     ["target/release/rlm-guard", "usr/bin/", "755"],
@@ -36,7 +36,7 @@ assets = [
     { source = "target/release/rlm-guard", dest = "/usr/bin/rlm-guard", mode = "755" },
     { source = "assets/rlm-guard.service", dest = "/usr/lib/systemd/user/rlm-guard.service", mode = "644" },
     { source = "../README.md", dest = "/usr/share/doc/rlm/README.md", mode = "644" },
-    { source = "../dist/rlm-delegate.conf", dest = "/etc/systemd/system/user@.service.d/rlm-delegate.conf", mode = "644", config = true },
+    { source = "../dist/rlm-delegate.conf", dest = "/etc/systemd/system/user@.service.d/rlm-delegate.conf", mode = "644", config = "noreplace" },
 ]
 post_install_script = "../dist/rpm/post"
 pre_uninstall_script = "../dist/rpm/preun"
