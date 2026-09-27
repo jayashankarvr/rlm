@@ -414,10 +414,17 @@ pub fn create() -> gtk::Widget {
     let protect_group = adw::PreferencesGroup::new();
     protect_group.set_title("Protected processes");
     protect_group.set_description(Some(
-        "The guard never freezes or caps these. Add names under guard.selection.protect in ~/.config/rlm/config.yaml.",
+        "The guard never freezes these; an app that shares a scope with one can only be capped. Add names under guard.selection.protect in ~/.config/rlm/config.yaml.",
     ));
     let protect_list = new_list_box("guard-protect-list");
-    protect_group.add(&protect_list);
+    // The built-in list alone is 40+ names; scroll inside a fixed-height box
+    // so it does not push the rest of the page down.
+    let protect_scroll = gtk::ScrolledWindow::new();
+    protect_scroll.set_hscrollbar_policy(gtk::PolicyType::Never);
+    protect_scroll.set_min_content_height(240);
+    protect_scroll.set_max_content_height(240);
+    protect_scroll.set_child(Some(&protect_list));
+    protect_group.add(&protect_scroll);
     page.add(&protect_group);
 
     let widget = page.upcast::<gtk::Widget>();

@@ -87,17 +87,6 @@ pub fn create() -> gtk::Widget {
     license_group.add(&license_scroll);
     page.add(&license_group);
 
-    // Credits group
-    let credits_group = adw::PreferencesGroup::new();
-    credits_group.set_title("Credits");
-
-    let credits_row = adw::ActionRow::new();
-    credits_row.set_title("RLM Contributors");
-    credits_row.set_subtitle("Thank you to all contributors!");
-    credits_group.add(&credits_row);
-
-    page.add(&credits_group);
-
     page.upcast()
 }
 
