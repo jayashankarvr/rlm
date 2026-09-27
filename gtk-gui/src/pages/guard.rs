@@ -56,6 +56,11 @@ fn cached_service_state() -> ServiceState {
     state
 }
 
+/// Whether `rlm-guard` is running, from the cached service state.
+pub(crate) fn guard_running() -> bool {
+    cached_service_state().active == "active"
+}
+
 /// The cache, recovered rather than panicking if a previous holder panicked:
 /// it only ever holds a complete value, so a poisoned lock is still usable.
 fn service_cache() -> std::sync::MutexGuard<'static, Option<(Instant, ServiceState)>> {

@@ -17,6 +17,12 @@ pub fn show_toast(widget: &impl IsA<gtk::Widget>, toast: adw::Toast) {
     }
 }
 
+/// An error as the GUI shows it: the first line only, since later lines are
+/// hints for the command line (flags, shell commands).
+pub fn gui_error(e: &common::Error) -> String {
+    e.to_string().lines().next().unwrap_or("").to_string()
+}
+
 /// A toast whose title is shown as plain text, so names with `&` or `<` in
 /// them are not read as markup.
 pub fn plain_toast(title: &str) -> adw::Toast {

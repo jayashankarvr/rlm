@@ -4,7 +4,8 @@
 //! The page is rebuilt only when what it would show changes ([`StatusView`]),
 //! so the 2 s auto-refresh never steals keyboard focus or scroll position.
 
-use crate::pages::{plain_toast, show_toast};
+use crate::pages::guard::guard_running;
+use crate::pages::{gui_error, plain_toast, show_toast};
 use adw::prelude::*;
 use common::{build_limit, format_bytes, AppRule, Config, Limit};
 use gtk::glib;
@@ -113,23 +114,86 @@ pub fn restore_limit(row: &RowView) -> common::Result<Limit> {
     )
 }
 
-/// The saved rule that owns `cgroup`, if any: rlm-guard keeps each rule's
+/// The saved rules that own `cgroup`, sorted: rlm-guard keeps each rule's
 /// processes in `app-<rule name>`, so removing that cgroup's limit only
-/// lasts until the guard's next pass.
-pub fn rule_for_cgroup(rules: &HashMap<String, AppRule>, cgroup: &str) -> Option<String> {
-    let mut names: Vec<&String> = rules
+/// lasts until the guard's next pass. Names that differ only in `/` or a
+/// space ("my app" and "my_app") share one cgroup, so there can be several.
+pub fn rules_for_cgroup(rules: &HashMap<String, AppRule>, cgroup: &str) -> Vec<String> {
+    let mut names: Vec<String> = rules
         .keys()
         .filter(|n| cgroup_name_for(n) == cgroup)
+        .cloned()
         .collect();
     names.sort();
-    names.first().map(|n| (*n).clone())
+    names
 }
 
-/// Remove the saved rule `name`, as `rlm unlimit --application <name>
-/// --forget` does.
-fn forget_rule(name: &str) -> common::Result<()> {
+/// Rule names as "'a'", "'a' and 'b'" or "'a', 'b' and 'c'".
+fn quoted_names(names: &[String]) -> String {
+    let quoted: Vec<String> = names.iter().map(|n| format!("'{n}'")).collect();
+    match quoted.split_last() {
+        None => String::new(),
+        Some((last, [])) => last.clone(),
+        Some((last, rest)) => format!("{} and {last}", rest.join(", ")),
+    }
+}
+
+/// "rule 'a'" or "rules 'a' and 'b'".
+fn rules_phrase(names: &[String]) -> String {
+    let noun = if names.len() == 1 { "rule" } else { "rules" };
+    format!("{noun} {}", quoted_names(names))
+}
+
+/// The toast after removing a limit that saved rules own. Only a running
+/// guard puts the limit back, so only then is that said.
+pub fn rule_kept_text(app: &str, rules: &[String], guard_running: bool) -> String {
+    let phrase = rules_phrase(rules);
+    if guard_running {
+        let (verb, it) = if rules.len() == 1 {
+            ("is", "it")
+        } else {
+            ("are", "them")
+        };
+        format!(
+            "{} {verb} still saved; rlm-guard will apply {it} again",
+            capitalize(&phrase)
+        )
+    } else {
+        format!("Removed the limit from {app}; {phrase} still saved")
+    }
+}
+
+/// The toast after forgetting `rules`. A running guard loaded its rules at
+/// start and keeps applying them until it restarts.
+pub fn forgot_text(rules: &[String], guard_running: bool) -> String {
+    let mut text = format!("Forgot {}.", rules_phrase(rules));
+    if guard_running {
+        text.push_str(if rules.len() == 1 {
+            " Restart rlm-guard to stop it applying the rule."
+        } else {
+            " Restart rlm-guard to stop it applying the rules."
+        });
+    }
+    text
+}
+
+fn capitalize(text: &str) -> String {
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
+}
+
+/// Remove the saved rules `names`, as `rlm unlimit --application <name>
+/// --forget` does for one.
+fn forget_rules(names: &[String]) -> common::Result<()> {
     let mut config = Config::load()?;
-    if config.remove_rule(name) {
+    let mut removed = false;
+    for name in names {
+        removed |= config.remove_rule(name);
+    }
+    if removed {
         config.save()?;
     }
     Ok(())
@@ -300,20 +364,35 @@ impl StatusPage {
         }
         self.refresh();
 
-        let rule = Config::load()
-            .ok()
-            .and_then(|c| rule_for_cgroup(&c.rules, &row.cgroup));
+        let rules = Config::load()
+            .map(|c| rules_for_cgroup(&c.rules, &row.cgroup))
+            .unwrap_or_default();
         let weak = Rc::downgrade(self);
-        let toast = if let Some(rule) = rule {
-            let toast = plain_toast(&format!(
-                "Rule '{rule}' is still saved; rlm-guard will apply it again"
-            ));
-            toast.set_button_label(Some("Forget rule"));
+        let toast = if !rules.is_empty() {
+            let toast = plain_toast(&rule_kept_text(&row.name, &rules, guard_running()));
+            toast.set_button_label(Some(if rules.len() == 1 {
+                "Forget rule"
+            } else {
+                "Forget rules"
+            }));
+            let cgroup = row.cgroup.clone();
             toast.connect_button_clicked(move |_| {
                 let Some(page) = weak.upgrade() else { return };
-                let text = match forget_rule(&rule) {
-                    Ok(()) => format!("Forgot rule '{rule}'"),
-                    Err(e) => format!("Could not forget rule '{rule}': {e}"),
+                let text = match forget_rules(&rules) {
+                    Ok(()) => {
+                        // The guard may have put the limit back since it was
+                        // removed; take it off again now the rule is gone.
+                        if let Some(manager) = page.manager.as_ref() {
+                            let _ = manager.cleanup_cgroup(&cgroup);
+                        }
+                        page.refresh();
+                        forgot_text(&rules, guard_running())
+                    }
+                    Err(e) => format!(
+                        "Could not forget {}: {}",
+                        rules_phrase(&rules),
+                        gui_error(&e)
+                    ),
                 };
                 page.toast(plain_toast(&text));
             });
@@ -437,16 +516,45 @@ mod tests {
     }
 
     #[test]
-    fn rule_is_found_by_its_cgroup_name() {
+    fn rules_are_found_by_their_cgroup_name() {
         let mut rules = HashMap::new();
         rules.insert("firefox".to_string(), AppRule::default());
         rules.insert("my app".to_string(), AppRule::default());
+        assert_eq!(rules_for_cgroup(&rules, "app-firefox"), ["firefox"]);
+        assert_eq!(rules_for_cgroup(&rules, "app-my_app"), ["my app"]);
+        assert!(rules_for_cgroup(&rules, "pid-42").is_empty());
+        assert!(rules_for_cgroup(&rules, "app-chrome").is_empty());
+        // Two names that map to one cgroup are both found.
+        rules.insert("my_app".to_string(), AppRule::default());
+        assert_eq!(rules_for_cgroup(&rules, "app-my_app"), ["my app", "my_app"]);
+    }
+
+    #[test]
+    fn rule_toasts_mention_the_guard_only_while_it_runs() {
+        let one = vec!["firefox".to_string()];
+        let two = vec!["my app".to_string(), "my_app".to_string()];
         assert_eq!(
-            rule_for_cgroup(&rules, "app-firefox"),
-            Some("firefox".into())
+            rule_kept_text("firefox", &one, true),
+            "Rule 'firefox' is still saved; rlm-guard will apply it again"
         );
-        assert_eq!(rule_for_cgroup(&rules, "app-my_app"), Some("my app".into()));
-        assert_eq!(rule_for_cgroup(&rules, "pid-42"), None);
-        assert_eq!(rule_for_cgroup(&rules, "app-chrome"), None);
+        assert_eq!(
+            rule_kept_text("firefox", &one, false),
+            "Removed the limit from firefox; rule 'firefox' still saved"
+        );
+        assert_eq!(
+            rule_kept_text("app", &two, true),
+            "Rules 'my app' and 'my_app' are still saved; rlm-guard will apply them again"
+        );
+        assert_eq!(
+            forgot_text(&one, true),
+            "Forgot rule 'firefox'. Restart rlm-guard to stop it applying the rule."
+        );
+        assert_eq!(forgot_text(&one, false), "Forgot rule 'firefox'.");
+        assert_eq!(
+            forgot_text(&two, false),
+            "Forgot rules 'my app' and 'my_app'."
+        );
+        let three = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        assert_eq!(quoted_names(&three), "'a', 'b' and 'c'");
     }
 }
