@@ -39,16 +39,18 @@ rlm sets memory, CPU and I/O limits on your own Linux processes without root, fr
 
 The CLI and the guard run on any Linux with cgroup v2, PSI and systemd. The GUI (rlm-gtk) also needs GTK 4 and libadwaita 1.4 or newer.
 
+The release packages and the tarball for the CLI and guard are built on Ubuntu 22.04 and need glibc 2.35 or newer. The GUI packages are built on Ubuntu 24.04 and need glibc 2.39 or newer. The table lists where the release packages install:
+
 | Distro              | CLI and guard | GUI     |
 |---------------------|---------------|---------|
 | Ubuntu              | 22.04+        | 24.04+  |
 | Debian              | 12+           | 13+     |
-| Fedora              | 31+           | 39+     |
-| RHEL / Rocky / Alma | 9+            | 10+     |
-| Arch                | current       | current |
+| Fedora              | 36+           | 40+     |
+| RHEL / Rocky / Alma | 10+           | 10+     |
+| Arch (AUR)          | current       | current |
 | openSUSE Tumbleweed | current       | current |
 
-On Ubuntu 22.04, Debian 12 and RHEL 9 the libadwaita version is too old for the GUI; use the CLI there. Older versions may work with the `systemd.unified_cgroup_hierarchy=1` kernel boot parameter.
+On Ubuntu 22.04, Debian 12 and RHEL 9 the libadwaita version is too old for the GUI; use the CLI there. On a distro with cgroup v2 but an older glibc (RHEL 9, Fedora 31 to 35), build the CLI and guard with `cargo install rlmctl` instead of using the packages. Older versions may work with the `systemd.unified_cgroup_hierarchy=1` kernel boot parameter.
 
 ## Install
 
@@ -61,7 +63,7 @@ Download from [Releases](https://github.com/jayashankarvr/rlm/releases) (package
 sudo apt install ./rlm_*.deb ./rlm-gtk_*.deb   # rlm-gtk: Ubuntu 24.04+, Debian 13+
 
 # Fedora/RHEL
-sudo dnf install ./rlm-0*.rpm ./rlm-gtk-0*.rpm   # rlm-gtk: Fedora 39+, RHEL 10+
+sudo dnf install ./rlm-0*.rpm ./rlm-gtk-0*.rpm   # rlm-gtk: Fedora 40+, RHEL 10+
 ```
 
 The `rlm` package ships `rlm`, `rlm-guard`, a systemd user unit for the guard and the delegation drop-in `rlm-delegate.conf`. `rlm-gtk` is the GUI.

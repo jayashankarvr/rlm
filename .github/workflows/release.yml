@@ -6,15 +6,14 @@ on:
       - 'v*'
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build:
+  version:
     runs-on: ubuntu-latest
-
     steps:
       - uses: actions/checkout@v4
 
@@ -29,6 +28,55 @@ jobs:
           have="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name=="rlmctl") | .version')"
           test "$want" = "$have" || { echo "tag $REF_NAME does not match Cargo version $have"; exit 1; }
 
+  # rlm and rlm-guard are built on the oldest supported Ubuntu so the
+  # binaries and packages run on glibc 2.35 and newer.
+  cli:
+    needs: version
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install packaging tools
+        run: cargo install cargo-deb cargo-generate-rpm
+
+      - name: Build release binaries
+        run: cargo build --release --locked -p rlmctl
+
+      - name: Build .deb and .rpm
+        run: |
+          cargo deb -p rlmctl --no-build
+          cargo generate-rpm -p cli
+
+      - name: Create tarball
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          mkdir -p release out
+          cp target/release/rlm target/release/rlm-guard release/
+          cp cli/assets/rlm-guard.service dist/rlm-delegate.conf release/
+          cp README.md LICENSE release/
+          tar -czvf "out/rlm-${REF_NAME}-x86_64-linux.tar.gz" -C release .
+          cp target/debian/*.deb target/generate-rpm/*.rpm out/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cli
+          path: out/*
+          if-no-files-found: error
+
+  # The GUI needs libadwaita 1.4, which Ubuntu 22.04 does not have.
+  gui:
+    needs: version
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
       - name: Install dependencies
         run: |
           sudo apt-get update
@@ -37,46 +85,45 @@ jobs:
       - name: Install packaging tools
         run: cargo install cargo-deb cargo-generate-rpm
 
-      - name: Build release binaries
-        run: cargo build --release --locked
+      - name: Build release binary
+        run: cargo build --release --locked -p rlm-gtk
 
-      - name: Build .deb packages
+      - name: Build .deb and .rpm
         run: |
-          cargo deb -p rlmctl --no-build
           cargo deb -p rlm-gtk --no-build
-
-      - name: Build .rpm packages
-        run: |
-          cargo generate-rpm -p cli
           cargo generate-rpm -p gtk-gui
+          mkdir -p out
+          cp target/debian/*.deb target/generate-rpm/*.rpm out/
 
-      - name: Create tarball
-        env:
-          REF_NAME: ${{ github.ref_name }}
-        run: |
-          mkdir -p release
-          cp target/release/rlm release/
-          cp target/release/rlm-guard release/
-          cp target/release/rlm-gtk release/
-          cp cli/assets/rlm-guard.service release/
-          cp dist/rlm-delegate.conf release/
-          cp README.md LICENSE release/
-          tar -czvf "rlm-${REF_NAME}-x86_64-linux.tar.gz" -C release .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gui
+          path: out/*
+          if-no-files-found: error
+
+  release:
+    needs: [cli, gui]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+          merge-multiple: true
 
       - name: Write checksums
+        working-directory: out
         run: |
-          cp target/debian/*.deb target/generate-rpm/*.rpm .
-          sha256sum *.deb *.rpm rlm-*.tar.gz > SHA256SUMS
+          ls -l
+          sha256sum -- * > SHA256SUMS
+          cat SHA256SUMS
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
           draft: false
           generate_release_notes: true
-          files: |
-            *.deb
-            *.rpm
-            rlm-${{ github.ref_name }}-x86_64-linux.tar.gz
-            SHA256SUMS
+          files: out/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
