@@ -114,17 +114,17 @@ impl ProcessGroup {
 
 /// Read process stat file to get PPID and session
 fn read_process_stat(proc_path: &Path) -> Option<(u32, u32)> {
-    // Format: pid comm state ppid pgrp session ...
-    // Fields: 0   1    2     3    4    5
-    if let Ok(content) = fs::read_to_string(proc_path.join("stat")) {
-        let parts: Vec<&str> = content.split_whitespace().collect();
-        if parts.len() >= 6 {
-            if let (Ok(ppid), Ok(session)) = (parts[3].parse(), parts[5].parse()) {
-                return Some((ppid, session));
-            }
-        }
-    }
-    None
+    parse_ppid_session(&fs::read_to_string(proc_path.join("stat")).ok()?)
+}
+
+/// PPID (field 4) and session (field 6) from the text of `/proc/<pid>/stat`.
+/// Fields are counted from the last ')', since the comm may hold spaces.
+fn parse_ppid_session(stat: &str) -> Option<(u32, u32)> {
+    let mut fields = stat[stat.rfind(')')? + 1..].split_whitespace();
+    // After the comm: state, ppid, pgrp, session.
+    let ppid = fields.nth(1)?.parse().ok()?;
+    let session = fields.nth(1)?.parse().ok()?;
+    Some((ppid, session))
 }
 
 /// The start time (field 22, clock ticks after boot) from the text of
@@ -563,5 +563,13 @@ mod tests {
         assert_eq!(names, vec!["d", "a", "b", "c"]);
         assert_eq!(groups[0].rss_kb(), 900);
         assert_eq!(groups[1].rss_kb(), 200);
+    }
+
+    #[test]
+    fn ppid_and_session_survive_a_comm_with_spaces() {
+        let stat = "4242 (Isolated Web Co) S 4100 4100 3000 0 -1 4194560";
+        assert_eq!(parse_ppid_session(stat), Some((4100, 3000)));
+        assert_eq!(parse_ppid_session("7 (a) b) R 1 7 7 0"), Some((1, 7)));
+        assert_eq!(parse_ppid_session("garbage"), None);
     }
 }
