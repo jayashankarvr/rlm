@@ -47,3 +47,6 @@ ctrlc.workspace = true
 dirs.workspace = true
 libc = "0.2.178"
 serde_yaml_ng = "0.10"
+
+[dev-dependencies]
+tempfile = "3"

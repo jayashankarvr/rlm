@@ -50,12 +50,9 @@ fn plan_scan(
 }
 
 fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive(tracing::Level::INFO.into()),
-        )
-        .init();
+    // INFO here is the journal history rlm-guard relies on (journalctl --user
+    // -u rlm-guard); it is not noise like a one-shot CLI's INFO would be.
+    rlm_core::logging::init(tracing::Level::INFO);
 
     let config = match Config::load_validated() {
         Ok(c) => c,

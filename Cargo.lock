@@ -1227,6 +1227,7 @@ dependencies = [
  "libc",
  "rlm-core",
  "serde_yaml_ng",
+ "tempfile",
  "tracing",
  "tracing-subscriber",
 ]
@@ -1243,6 +1244,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tracing",
+ "tracing-subscriber",
  "zbus",
 ]
 

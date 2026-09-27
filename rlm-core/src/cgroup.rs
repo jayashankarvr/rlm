@@ -269,8 +269,7 @@ impl CgroupManager {
             }
             // Process is in a different cgroup (run-* or gtk-*)
             return Err(Error::InvalidArgs(format!(
-                "process {} is already managed in cgroup '{}'",
-                pid, existing_cgroup
+                "process {pid} is already limited in cgroup '{existing_cgroup}'; run rlm unlimit --pid {pid} first"
             )));
         }
 
@@ -323,8 +322,7 @@ impl CgroupManager {
                 // Allow if it's already in the same cgroup we're creating
                 if existing_cgroup != safe_name {
                     return Err(Error::InvalidArgs(format!(
-                        "process {} is already managed in cgroup '{}'",
-                        pid, existing_cgroup
+                        "process {pid} is already limited in cgroup '{existing_cgroup}'; run rlm unlimit --cgroup {existing_cgroup} first"
                     )));
                 }
             }
