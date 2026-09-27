@@ -10,6 +10,7 @@ use rlm_core::CgroupManager;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 // Field length limits
 const MAX_COMMAND_LEN: usize = 1000;
@@ -31,6 +32,18 @@ struct RunState {
     all_apps: RefCell<Vec<rlm_core::desktop::DesktopApp>>,
     running_pid: RefCell<Option<u32>>,
     cgroup_name: RefCell<Option<String>>,
+    /// When the last launch started. Holding Enter in a field repeats the
+    /// activation, so launches closer together than [`RELAUNCH_GAP`] are
+    /// ignored rather than starting several instances.
+    last_launch: Cell<Option<Instant>>,
+}
+
+/// Shortest time between two launches; see `RunState::last_launch`.
+const RELAUNCH_GAP: Duration = Duration::from_secs(1);
+
+/// Whether a launch at `now` comes too soon after the one at `last`.
+fn too_soon(last: Option<Instant>, now: Instant) -> bool {
+    last.is_some_and(|t| now.saturating_duration_since(t) < RELAUNCH_GAP)
 }
 
 static RUN_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -190,6 +203,7 @@ pub fn create(manager: Option<Arc<CgroupManager>>) -> gtk::Widget {
         all_apps: RefCell::new(Vec::new()),
         running_pid: RefCell::new(None),
         cgroup_name: RefCell::new(None),
+        last_launch: Cell::new(None),
     }));
 
     // Load apps
@@ -381,6 +395,9 @@ fn apply_profile(state: &Rc<RefCell<RunState>>, name: Option<&str>) {
 
 fn run_command(state: &Rc<RefCell<RunState>>) {
     let state = state.borrow();
+    if too_soon(state.last_launch.get(), Instant::now()) {
+        return;
+    }
 
     let command_text = state.command_entry.text();
     if command_text.is_empty() {
@@ -460,6 +477,7 @@ fn run_command(state: &Rc<RefCell<RunState>>) {
     };
 
     let pid = child.id();
+    state.last_launch.set(Some(Instant::now()));
 
     // Pre-exec placement already ran; add_to_cgroup here is only a fallback.
     // A failure does not mean the child is unlimited or unreaped, so it
@@ -684,6 +702,15 @@ mod tests {
         );
         assert_eq!(split_command("  ").unwrap_err(), "Enter a command");
         assert!(split_command("app 'open").is_err());
+    }
+
+    #[test]
+    fn a_held_enter_launches_once() {
+        let t = Instant::now();
+        assert!(!too_soon(None, t));
+        assert!(too_soon(Some(t), t + Duration::from_millis(30)));
+        assert!(too_soon(Some(t), t + Duration::from_millis(999)));
+        assert!(!too_soon(Some(t), t + RELAUNCH_GAP));
     }
 
     #[test]
