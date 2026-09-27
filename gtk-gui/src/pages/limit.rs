@@ -10,7 +10,9 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 // Field length limits
-const MAX_PID_LEN: usize = 10;
+/// Longest text the PID field keeps: room for a few hundred PIDs when an
+/// application is selected, which fills the field with a comma-separated list.
+const MAX_PID_LEN: usize = 4096;
 
 struct LimitState {
     pid_entry: adw::EntryRow,
@@ -343,22 +345,42 @@ pub fn create(manager: Option<Arc<CgroupManager>>) -> gtk::Widget {
 fn setup_pid_validation(entry: &adw::EntryRow) {
     entry.connect_changed(move |e| {
         let text = e.text();
-        if text.len() > MAX_PID_LEN {
-            e.set_text(&text[..MAX_PID_LEN]);
+        let cleaned = clean_pid_input(&text);
+        if cleaned != text.as_str() {
+            e.set_text(&cleaned);
             return;
         }
-        // Only allow digits
-        let filtered: String = text.chars().filter(|c| c.is_ascii_digit()).collect();
-        if filtered != text.as_str() {
-            e.set_text(&filtered);
-        }
         // Visual feedback
-        if !text.is_empty() && text.parse::<u32>().is_err() {
+        if !text.is_empty() && parse_pid_list(&text).is_none() {
             e.add_css_class("error");
         } else {
             e.remove_css_class("error");
         }
     });
+}
+
+/// Keep only what a PID or a comma-separated PID list can contain (digits,
+/// commas and spaces), capped at [`MAX_PID_LEN`]. Commas must survive:
+/// selecting an application writes its PIDs as "2894,52896", and dropping
+/// the comma would turn that into the single PID 289452896.
+fn clean_pid_input(text: &str) -> String {
+    text.chars()
+        .filter(|c| c.is_ascii_digit() || *c == ',' || *c == ' ')
+        .take(MAX_PID_LEN)
+        .collect()
+}
+
+/// Parse "123" or "123, 456" into PIDs. `None` if any entry is not a
+/// positive number; empty entries (a trailing comma) are ignored.
+fn parse_pid_list(text: &str) -> Option<Vec<u32>> {
+    let mut pids = Vec::new();
+    for part in text.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        match part.parse::<u32>() {
+            Ok(pid) if pid > 0 => pids.push(pid),
+            _ => return None,
+        }
+    }
+    Some(pids)
 }
 
 fn load_profile_names() -> Vec<String> {
@@ -691,20 +713,18 @@ fn apply_limits(state: &Rc<RefCell<LimitState>>) {
                 return;
             }
 
-            // Parse comma-separated PIDs or use selected PIDs
-            let pids: Vec<u32> = if !pid_text.contains(',') {
-                // Single PID or use selected
-                if let Ok(pid) = pid_text.parse::<u32>() {
-                    vec![pid]
-                } else {
-                    state.selected_pids.borrow().clone()
+            // The field holds one PID or the selected application's list.
+            let pids: Vec<u32> = match parse_pid_list(&pid_text) {
+                Some(pids) if !pids.is_empty() => pids,
+                Some(_) => state.selected_pids.borrow().clone(),
+                None => {
+                    show_status(
+                        &state.status_label,
+                        "Invalid PID list (use numbers separated by commas)",
+                        true,
+                    );
+                    return;
                 }
-            } else {
-                // Comma-separated PIDs
-                pid_text
-                    .split(',')
-                    .filter_map(|s| s.trim().parse::<u32>().ok())
-                    .collect()
             };
 
             if pids.is_empty() {
@@ -847,4 +867,30 @@ fn find_widget_by_name(widget: &gtk::Widget, name: &str) -> Option<gtk::Widget> 
         child = c.next_sibling();
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn application_pid_list_keeps_its_commas() {
+        assert_eq!(clean_pid_input("2894,52896"), "2894,52896");
+        assert_eq!(clean_pid_input("12a, 3-4"), "12, 34");
+        assert_eq!(parse_pid_list("2894,52896"), Some(vec![2894, 52896]));
+        assert_eq!(parse_pid_list(" 7 , 8,"), Some(vec![7, 8]));
+        assert_eq!(parse_pid_list(""), Some(vec![]));
+        assert_eq!(parse_pid_list("0"), None);
+        assert_eq!(parse_pid_list("99999999999"), None);
+    }
+
+    #[test]
+    fn long_application_lists_are_not_cut_to_one_pid() {
+        let list = (1000..1300)
+            .map(|p| p.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        assert_eq!(clean_pid_input(&list), list);
+        assert_eq!(parse_pid_list(&list).map(|p| p.len()), Some(300));
+    }
 }
