@@ -21,14 +21,29 @@ pub const SYSTEM_UNIT_DIRS: &[&str] = &[
     "/lib/systemd/user",
 ];
 
-/// `path` as an `ExecStart` argument, double-quoted when it contains
-/// whitespace.
+/// `path` as an `ExecStart` argument. systemd expands `%` specifiers and
+/// `$` variables and processes C-style escapes in `ExecStart=`, so `%` and
+/// `$` are doubled and `\`, `"` and `'` are backslash-escaped. The result is
+/// double-quoted when the path has whitespace or quotes.
 pub fn exec_arg(path: &Path) -> String {
     let s = path.display().to_string();
-    if s.chars().any(char::is_whitespace) {
-        format!("\"{s}\"")
+    let mut out = String::with_capacity(s.len() + 2);
+    for c in s.chars() {
+        match c {
+            '%' => out.push_str("%%"),
+            '$' => out.push_str("$$"),
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\'' => out.push_str("\\'"),
+            c => out.push(c),
+        }
+    }
+    if s.chars()
+        .any(|c| c.is_whitespace() || c == '"' || c == '\'')
+    {
+        format!("\"{out}\"")
     } else {
-        s
+        out
     }
 }
 
@@ -191,6 +206,34 @@ mod tests {
         assert_eq!(
             exec_arg(Path::new("/usr/bin/rlm-guard")),
             "/usr/bin/rlm-guard"
+        );
+    }
+
+    #[test]
+    fn exec_arg_escapes_systemd_syntax() {
+        assert_eq!(
+            exec_arg(Path::new("/opt/100%/rlm-guard")),
+            "/opt/100%%/rlm-guard"
+        );
+        assert_eq!(
+            exec_arg(Path::new("/opt/a$b/rlm-guard")),
+            "/opt/a$$b/rlm-guard"
+        );
+        assert_eq!(
+            exec_arg(Path::new(r"/opt/a\b/rlm-guard")),
+            r"/opt/a\\b/rlm-guard"
+        );
+        assert_eq!(
+            exec_arg(Path::new(r#"/opt/say "hi"/rlm-guard"#)),
+            r#""/opt/say \"hi\"/rlm-guard""#
+        );
+        assert_eq!(
+            exec_arg(Path::new("/opt/it's/rlm-guard")),
+            r#""/opt/it\'s/rlm-guard""#
+        );
+        assert_eq!(
+            exec_arg(Path::new(r"/opt/my 50% \dir/rlm-guard")),
+            r#""/opt/my 50%% \\dir/rlm-guard""#
         );
     }
 
