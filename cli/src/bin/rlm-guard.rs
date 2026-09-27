@@ -1,4 +1,4 @@
-//! `rlm-guard` — the freeze-guard daemon.
+//! `rlm-guard`, the freeze-guard daemon.
 //!
 //! Runs as a per-user systemd service. Each tick it samples memory pressure (PSI)
 //! and, only when needed, the user's own processes, asks the pure [`PolicyEngine`] what to do,
@@ -138,20 +138,20 @@ fn run(config: Config) -> common::Result<()> {
 
     let manager = CgroupManager::new()?;
 
-    // Open the write-ahead journal. This must happen — and startup recovery
-    // (below) must run — BEFORE any early-exit decision: the journal is the
+    // Open the write-ahead journal. This must happen, and startup recovery
+    // (below) must run, BEFORE any early-exit decision: the journal is the
     // only record of an in-place freeze/cap, and a user who disables the
     // guard (or has no rules configured) after a crash must still get their
-    // frozen/capped cgroups restored on the next start (D5a fix — this used
+    // frozen/capped cgroups restored on the next start (D5a fix: this used
     // to run after the early-exit check, so it never ran at all in that
     // case).
     //
     // A journal-open failure is only fatal when there are no rules to fall
     // back to AND the guard is actually enabled: persistent-rule enforcement
-    // has no dependency on the journal at all (D5b fix — this used to be
+    // has no dependency on the journal at all (D5b fix: this used to be
     // fatal unconditionally, killing rules enforcement over a guard-only
     // concern like an unwritable $XDG_STATE_HOME). With rules configured, we
-    // log loudly and continue without journal-backed escalation instead —
+    // log loudly and continue without journal-backed escalation instead;
     // the daemon structurally cannot freeze/cap safely without a durable
     // journal anyway (`Effector` journals before every mutation), so
     // escalation is simply disabled for this run.

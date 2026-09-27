@@ -10,7 +10,7 @@
 //! `mpsc::Receiver::recv_timeout`. If the deadline passes first we return
 //! `Err` immediately; the spawned thread is left to finish (or never finish,
 //! if the bus is wedged) in the background and its result is dropped. This is
-//! a bounded leak — one thread per timed-out call — accepted because the
+//! a bounded leak (one thread per timed-out call), accepted because the
 //! storm path always falls back to raw cgroup writes on `Err`, so a wedged
 //! D-Bus call never blocks the daemon itself.
 
@@ -107,7 +107,7 @@ fn connect_within(
 /// own notion of a deadline. On timeout, returns `Err` immediately; the
 /// spawned thread is detached and left to finish (or never finish) in the
 /// background, with its eventual result silently dropped on send. This is a
-/// bounded leak — one thread per timed-out call — accepted because callers
+/// bounded leak (one thread per timed-out call), accepted because callers
 /// always treat `Err` as "fall back to raw cgroup ops", so a wedged call
 /// never blocks the daemon itself.
 fn run_with_timeout<T: Send + 'static>(

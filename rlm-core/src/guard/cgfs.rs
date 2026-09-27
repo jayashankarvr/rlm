@@ -58,7 +58,7 @@ pub fn current_bytes(cg: &str) -> Option<u64> {
 }
 
 /// Get the file-backed (page cache) byte count from `memory.stat`'s `file`
-/// line — the only pool a swap-disabled cgroup can actually reclaim from.
+/// line, the only pool a swap-disabled cgroup can actually reclaim from.
 pub fn file_bytes(cg: &str) -> Option<u64> {
     let stat = fs::read_to_string(abs(cg).join("memory.stat")).ok()?;
     parse_file(&stat)
@@ -123,7 +123,7 @@ pub fn pids_in(cg: &str) -> Vec<u32> {
 /// a protected process one level down (a shell in a terminal scope's child
 /// cgroup, a nested `systemd-run`, an app-created sub-cgroup) and wrongly
 /// clear it to freeze. Unlike `pids_in`, this is the membership view that
-/// must back any freeze/protect decision. `pids_in` is left unchanged —
+/// must back any freeze/protect decision. `pids_in` is left unchanged;
 /// other callers (e.g. inode/liveness checks) rely on its exact-directory
 /// semantics.
 pub fn pids_under(cg: &str) -> Vec<u32> {
@@ -135,7 +135,7 @@ pub fn pids_under(cg: &str) -> Vec<u32> {
 /// Recursive helper for [`pids_under`]. Reads `cgroup.procs` in `dir`, then
 /// descends into every subdirectory. Unreadable directories/files are
 /// skipped, not fatal (a cgroup can vanish mid-walk). Does not follow
-/// symlinks — `DirEntry::file_type` reports the on-disk type without
+/// symlinks: `DirEntry::file_type` reports the on-disk type without
 /// dereferencing, and only entries reporting as directories are recursed
 /// into.
 fn collect_pids_recursive(dir: &Path, out: &mut Vec<u32>) {
@@ -301,7 +301,7 @@ mod tests {
     #[test]
     fn pids_under_recurses_into_descendant_directories() {
         // Directory-walk shape test: doesn't need real cgroupfs, just files
-        // named `cgroup.procs` nested under a temp tree — collect_pids_recursive
+        // named `cgroup.procs` nested under a temp tree; collect_pids_recursive
         // only cares about directory structure and file contents, not that
         // it's actually cgroupfs.
         let root = tempfile::tempdir().unwrap();
@@ -336,7 +336,7 @@ mod tests {
     #[test]
     fn pids_under_tolerates_missing_and_unreadable_dirs() {
         let root = tempfile::tempdir().unwrap();
-        // No cgroup.procs at all, no subdirectories — must not panic, just
+        // No cgroup.procs at all, no subdirectories: must not panic, just
         // return empty.
         let mut out = Vec::new();
         collect_pids_recursive(root.path(), &mut out);
@@ -373,7 +373,7 @@ mod tests {
         );
 
         // A real, undelegated-controller child directory under a delegated
-        // cgroup is a plain mkdir — the kernel populates its interface files.
+        // cgroup is a plain mkdir; the kernel populates its interface files.
         let child_dir = abs_path.join("child");
         fs::create_dir(&child_dir).expect("mkdir child cgroup");
 

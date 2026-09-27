@@ -30,7 +30,7 @@ pub use types::{Action, Intervention, Level, ProcInfo, PsiSource, Sample, Target
 /// Prefers `$XDG_STATE_HOME` (`~/.local/state` by default), matching the
 /// XDG-first convention `common::Config` already uses for `config_dir()`.
 /// Falls back to `/tmp/rlm` on the rare system where no state dir can be
-/// resolved (e.g. `$HOME` unset) — the journal is still boot_id-guarded, so a
+/// resolved (e.g. `$HOME` unset); the journal is still boot_id-guarded, so a
 /// non-persistent fallback location only costs us WAL recovery across a
 /// reboot in that degraded case, not correctness.
 pub fn journal_path() -> PathBuf {

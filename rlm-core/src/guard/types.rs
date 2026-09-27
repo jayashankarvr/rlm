@@ -78,13 +78,13 @@ pub struct Target {
 
 /// An action the [`PolicyEngine`](crate::guard::PolicyEngine) asks the
 /// [`Effector`](crate::guard::Effector) to perform. Actions are keyed by the
-/// *resolved cgroup*, not a single pid — freezing/capping acts on every
+/// *resolved cgroup*, not a single pid; freezing/capping acts on every
 /// process in that cgroup.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     /// Best-effort user notification.
     Notify { message: String },
-    /// Pause the resolved cgroup (cgroup.freeze) — the circuit breaker.
+    /// Pause the resolved cgroup (cgroup.freeze), the circuit breaker.
     /// `name` is the app the cgroup belongs to.
     Freeze { res: Resolution, name: String },
     /// Resume a previously frozen cgroup.
