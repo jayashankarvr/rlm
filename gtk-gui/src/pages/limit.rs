@@ -1,7 +1,7 @@
 use crate::widgets::{
     cpu_suffix_label, create_io_unit_dropdown, create_unit_dropdown, get_unit_suffix,
-    limits_description, parse_cpu_value, require_manager, set_value_with_unit,
-    setup_number_validation, setup_size_validation, NO_MANAGER_HINT,
+    limits_description, on_enter, parse_cpu_value, require_manager, set_value_with_unit,
+    setup_number_validation, setup_size_validation, with_action_bar, NO_MANAGER_HINT,
 };
 use adw::prelude::*;
 use gtk::glib;
@@ -243,16 +243,7 @@ pub fn create(manager: Option<Arc<CgroupManager>>) -> gtk::Widget {
     apply_btn.add_css_class("suggested-action");
     apply_btn.add_css_class("pill");
     apply_btn.set_halign(gtk::Align::Center);
-    apply_btn.set_margin_bottom(24);
     require_manager(&apply_btn, manager.is_some());
-
-    let button_box = gtk::Box::new(gtk::Orientation::Vertical, 12);
-    button_box.append(&status_label);
-    button_box.append(&apply_btn);
-
-    let button_group = adw::PreferencesGroup::new();
-    button_group.add(&button_box);
-    page.add(&button_group);
 
     // Store state
     let state = Rc::new(RefCell::new(LimitState {
@@ -385,7 +376,20 @@ pub fn create(manager: Option<Arc<CgroupManager>>) -> gtk::Widget {
         apply_limits(&state_clone);
     });
 
-    toast_overlay.set_child(Some(&page));
+    // Enter in a field does what the button does.
+    let state_clone = state.clone();
+    on_enter(
+        &[
+            &pid_entry,
+            &memory_entry,
+            &cpu_entry,
+            &io_read_entry,
+            &io_write_entry,
+        ],
+        move || apply_limits(&state_clone),
+    );
+
+    toast_overlay.set_child(Some(&with_action_bar(&page, &status_label, &apply_btn)));
     toast_overlay.upcast()
 }
 

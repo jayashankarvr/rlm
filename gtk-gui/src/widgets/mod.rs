@@ -83,6 +83,35 @@ pub fn require_manager(button: &gtk::Button, has_manager: bool) {
     }
 }
 
+/// Put `page` above a bottom bar holding `status` and the page's main
+/// `button`, so the button stays in view however far the page scrolls.
+pub fn with_action_bar(
+    page: &impl IsA<gtk::Widget>,
+    status: &gtk::Label,
+    button: &gtk::Button,
+) -> adw::ToolbarView {
+    let bar = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    bar.set_margin_top(6);
+    bar.set_margin_bottom(6);
+    bar.set_margin_start(12);
+    bar.set_margin_end(12);
+    bar.append(status);
+    bar.append(button);
+    let view = adw::ToolbarView::new();
+    view.set_content(Some(page));
+    view.add_bottom_bar(&bar);
+    view.set_bottom_bar_style(adw::ToolbarStyle::Raised);
+    view
+}
+
+/// Run `action` when Enter is pressed in any of `entries`.
+pub fn on_enter(entries: &[&adw::EntryRow], action: impl Fn() + Clone + 'static) {
+    for entry in entries {
+        let action = action.clone();
+        entry.connect_entry_activated(move |_| action());
+    }
+}
+
 /// The dim "% of one core" text after a CPU field.
 pub fn cpu_suffix_label() -> gtk::Label {
     let label = gtk::Label::new(Some("% of one core"));
