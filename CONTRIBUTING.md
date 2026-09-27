@@ -51,7 +51,7 @@ Tests that touch real cgroups are `#[ignore]` and opt-in. They create `test-*` a
 
 1. Bump `version` in the workspace `Cargo.toml` (and the path dependency versions in `[workspace.dependencies]`), `dist/aur/PKGBUILD` `pkgver`, and add the CHANGELOG section.
 2. Run the gate and `scripts/check-docs.sh`.
-3. Tag and push: `git tag -a vX.Y.Z -m "rlm X.Y.Z"` and `git push origin main vX.Y.Z`. Check that the release workflow attached the .deb and .rpm packages, the tarball and `SHA256SUMS`.
+3. Tag and push: `git tag -a vX.Y.Z -m "rlm X.Y.Z"` and `git push origin main vX.Y.Z`. Check that the release workflow attached the .deb and .rpm packages, the tarball and `SHA256SUMS`. Its `apt` job then adds the .deb files to the apt repository on the `gh-pages` branch (served at https://jayashankarvr.github.io/rlm), signed with the `APT_SIGNING_KEY` secret. To republish a tag, run the Apt repository workflow by hand with that tag. The signing key's offline backup is kept by the maintainer; if it is ever replaced, update `dist/apt/` and the fingerprint in README.
 4. Publish to crates.io in dependency order, waiting for each to appear in the index:
    `cargo publish -p rlmctl-common`, then `cargo publish -p rlmctl-core`, then `cargo publish -p rlmctl`.
 5. AUR: the tag tarball must exist first. In `dist/aur`, run `updpkgsums` to replace `sha256sums=('SKIP')` with the real checksum, then `makepkg --printsrcinfo > .SRCINFO`, build in a clean chroot, and push `PKGBUILD`, `rlm.install` and `.SRCINFO` to the AUR.

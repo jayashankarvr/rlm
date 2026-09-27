@@ -127,3 +127,13 @@ jobs:
           files: out/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  apt:
+    needs: release
+    permissions:
+      contents: write
+    uses: ./.github/workflows/apt.yml
+    with:
+      tag: ${{ github.ref_name }}
+    secrets:
+      APT_SIGNING_KEY: ${{ secrets.APT_SIGNING_KEY }}

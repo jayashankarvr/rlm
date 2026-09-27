@@ -54,6 +54,20 @@ The GUI needs libadwaita 1.4, which Ubuntu 22.04, Debian 12 and RHEL 9 do not sh
 
 ## Install
 
+### Ubuntu and Debian (apt repository)
+
+The apt repository gets every release and updates with `apt upgrade`:
+
+```bash
+sudo install -d -m 0755 /etc/apt/keyrings
+curl -fsSL https://jayashankarvr.github.io/rlm/rlm-archive-keyring.gpg | sudo tee /etc/apt/keyrings/rlm.gpg >/dev/null
+echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/rlm.gpg] https://jayashankarvr.github.io/rlm stable main" | sudo tee /etc/apt/sources.list.d/rlm.list
+sudo apt update
+sudo apt install rlm rlm-gtk   # rlm-gtk needs Ubuntu 24.04+ or Debian 13+; rlm alone works on 22.04 and Debian 12
+```
+
+The repository is signed with the key `C7E1 E11F ED31 3EDB 9A60 9BD7 41F3 0081 BB8A BEC2` ("rlm apt repository"). The same key is in this repository at `dist/apt/rlm-archive-keyring.asc`, so you can check the download against it. Log out and back in once after the first install so the delegation drop-in takes effect.
+
 ### From packages
 
 Download from [Releases](https://github.com/jayashankarvr/rlm/releases) (packages are available from 0.2.0 on):

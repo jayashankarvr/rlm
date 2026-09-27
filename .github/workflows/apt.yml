@@ -1,0 +1,69 @@
+name: Apt repository
+
+# Publishes a release's .deb files to the signed apt repository served from
+# the gh-pages branch (https://jayashankarvr.github.io/rlm). Called by the
+# release workflow for every tag; run it by hand to republish a tag.
+on:
+  workflow_call:
+    inputs:
+      tag:
+        required: true
+        type: string
+    secrets:
+      APT_SIGNING_KEY:
+        required: true
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to publish, for example v0.2.3
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: apt-repository
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install tools
+        run: sudo apt-get install -y -qq apt-utils
+
+      - name: Fetch the release packages
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: gh release download "$TAG" -R "$GITHUB_REPOSITORY" -p '*.deb' -D debs
+
+      - name: Check out the published repository
+        run: |
+          if git ls-remote --exit-code --heads origin gh-pages >/dev/null; then
+            git fetch --depth 1 origin gh-pages
+            git worktree add site FETCH_HEAD
+          else
+            git worktree add --orphan -b gh-pages site
+          fi
+
+      - name: Import the signing key
+        env:
+          APT_SIGNING_KEY: ${{ secrets.APT_SIGNING_KEY }}
+        run: printf '%s\n' "$APT_SIGNING_KEY" | gpg --batch --import
+
+      - name: Update the repository
+        run: scripts/build-apt-repo.sh site debs/*.deb
+
+      - name: Publish
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          cd site
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -q -m "apt: publish $TAG"
+          git push origin HEAD:gh-pages
