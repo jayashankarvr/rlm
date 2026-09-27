@@ -202,9 +202,19 @@ Limiting by `--name`, `--application` or `--all-pids` asks for confirmation when
 
 ## GUI Support
 
-The GUI groups processes by executable on the Limit page (Application mode). Each
-group is an expandable row, so you can limit a whole application at once or expand
-it to limit individual instances.
+The Limit Running page has two modes:
+
+- **Whole app (shared limit)**, the default, groups processes by executable. You
+  select whole apps with each row's Select button; every process of the selected
+  apps goes into one cgroup under one shared limit, like `--application`. Expanding
+  a row lists its processes for reference, but those child rows cannot be selected
+  on their own.
+- **Single process** lists processes one by one. You select one process and it gets
+  its own limit, like `--pid`.
+
+To limit a process the list does not show, type its PID under "Enter PIDs manually".
+In Whole app mode, "Save as a rule for rlm-guard" also saves the limits as a rule
+for future instances of the app, like `rlm limit --save`.
 
 ## FAQ
 

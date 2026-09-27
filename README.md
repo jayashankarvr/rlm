@@ -212,7 +212,7 @@ rlm import profiles.yaml --overwrite # replace profiles with the same name
 Launch with `rlm-gtk`. Pages:
 
 - **Managed Processes**: what rlm is limiting now
-- **Limit Running**: limit running processes, grouped by application
+- **Limit Running**: limit running processes, either whole apps under one shared limit ("Whole app (shared limit)") or one process on its own ("Single process")
 - **Launch New**: start a command with limits
 - **Profiles**: create, edit and delete profiles
 - **Guard**: service state, pressure, active interventions and history
