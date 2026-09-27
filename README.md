@@ -2,7 +2,7 @@
 
 rlm sets memory, CPU and I/O limits on your own Linux processes without root, from a CLI or a GTK app, and can run a small guard that freezes or caps a runaway app under memory pressure instead of killing it.
 
-![rlm run, rlm status and rlm guard status in a terminal](docs/assets/hero.svg)
+![rlm run, rlm status and rlm guard status in a terminal](https://raw.githubusercontent.com/jayashankarvr/rlm/main/docs/assets/hero.svg)
 
 ## What it does today
 
@@ -150,7 +150,7 @@ rlm limit --pid 1234 --memory 1G --io-read 50M --io-write 20M
 rlm limit --pid 1234 --memory 512M --dry-run
 ```
 
-With `--application` or `--all-pids`, the processes share the limits: 10 processes with a 4G limit get 4G in total, not 4G each. See [APPLICATION_LIMITING.md](APPLICATION_LIMITING.md).
+With `--application` or `--all-pids`, the processes share the limits: 10 processes with a 4G limit get 4G in total, not 4G each. See [APPLICATION_LIMITING.md](https://github.com/jayashankarvr/rlm/blob/main/APPLICATION_LIMITING.md).
 
 - Sizes use binary units and accept decimals and `B`/`iB` suffixes: `512M`, `1.5G`, `2GiB`, `512MB` are all valid. Memory limits below 8M and I/O limits below 64K/s are rejected.
 - CPU is a percentage of one core: `50%` is half a core, `200%` is two cores.

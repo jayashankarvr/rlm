@@ -7,6 +7,7 @@ repository.workspace = true
 homepage.workspace = true
 rust-version.workspace = true
 description = "Shared limit, profile and config types for rlmctl (the rlm resource limit manager)"
+readme = "README.md"
 keywords = ["cgroups", "resource-limit", "linux"]
 categories = ["os::linux-apis"]
 

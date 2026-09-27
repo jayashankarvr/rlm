@@ -7,6 +7,7 @@ repository.workspace = true
 homepage.workspace = true
 rust-version.workspace = true
 description = "cgroup v2 limit management and the rlm-guard engine for rlmctl"
+readme = "README.md"
 keywords = ["cgroups", "resource-limit", "linux"]
 categories = ["os::linux-apis"]
 
