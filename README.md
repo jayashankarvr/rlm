@@ -168,8 +168,9 @@ since been recreated for something else.
 
 ```bash
 rlm guard enable    # enable + start the user service (systemctl --user)
-rlm guard status    # current pressure + active interventions
+rlm guard status    # service state, config, current pressure, active interventions, recent history
 rlm guard test      # dry-run: print what it would do right now (no action)
+rlm guard history   # recent interventions (freeze/thaw/cap/lift, and failures)
 rlm guard disable   # stop and disable
 ```
 
