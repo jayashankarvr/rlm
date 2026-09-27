@@ -809,7 +809,7 @@ fn apply_limits(state: &Rc<RefCell<LimitState>>) {
                     }
 
                     let toast = adw::Toast::new(&msg);
-                    toast.set_timeout(3);
+                    toast.set_timeout(6);
                     state.toast_overlay.add_toast(toast);
                 }
                 Err(e) => show_status(&state.status_label, &format!("{e}"), true),
