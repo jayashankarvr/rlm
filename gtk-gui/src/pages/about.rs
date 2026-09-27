@@ -18,7 +18,7 @@ pub fn create() -> gtk::Widget {
     version_label.set_margin_bottom(24);
 
     let desc_label = gtk::Label::new(Some(
-        "A Linux resource management tool that prevents system freezes through proactive cgroup-based resource limiting.",
+        "Set memory, CPU and I/O limits on your own processes with cgroups, and optionally let a guard freeze or cap a runaway app under memory pressure.",
     ));
     desc_label.set_wrap(true);
     desc_label.set_justify(gtk::Justification::Center);
@@ -41,7 +41,7 @@ pub fn create() -> gtk::Widget {
     repo_row.set_title("Repository");
     repo_row.set_subtitle("https://github.com/jayashankarvr/rlm");
     repo_row.set_activatable(true);
-    repo_row.add_suffix(&gtk::Image::from_icon_name("external-link-symbolic"));
+    repo_row.add_suffix(&gtk::Image::from_icon_name("adw-external-link-symbolic"));
     repo_row.connect_activated(|_| {
         let _ = open::that("https://github.com/jayashankarvr/rlm");
     });
@@ -51,7 +51,7 @@ pub fn create() -> gtk::Widget {
     issues_row.set_title("Report Issues");
     issues_row.set_subtitle("https://github.com/jayashankarvr/rlm/issues");
     issues_row.set_activatable(true);
-    issues_row.add_suffix(&gtk::Image::from_icon_name("external-link-symbolic"));
+    issues_row.add_suffix(&gtk::Image::from_icon_name("adw-external-link-symbolic"));
     issues_row.connect_activated(|_| {
         let _ = open::that("https://github.com/jayashankarvr/rlm/issues");
     });

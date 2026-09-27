@@ -328,7 +328,7 @@ pub fn group_by_executable(processes: &[ProcessInfo]) -> Vec<ProcessGroup> {
         groups.entry(key).or_default().push(proc.clone());
     }
 
-    groups
+    let mut groups: Vec<ProcessGroup> = groups
         .into_iter()
         .map(|(name, procs)| {
             let executable = procs.first().and_then(|p| p.executable.clone());
@@ -339,7 +339,14 @@ pub fn group_by_executable(processes: &[ProcessInfo]) -> Vec<ProcessGroup> {
             }
         })
         .filter(|group| group.processes.len() > 1) // Only groups with multiple processes
-        .collect()
+        .collect();
+    groups.sort_by(|a, b| {
+        b.processes
+            .len()
+            .cmp(&a.processes.len())
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    groups
 }
 
 /// Group processes by session ID (same process group)
@@ -489,5 +496,29 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(p.exe_name(), Some("chrome"));
+    }
+
+    #[test]
+    fn groups_are_ordered_by_size_then_name() {
+        let p = |pid: u32, exe: &str| ProcessInfo {
+            pid,
+            name: exe.into(),
+            executable: Some(format!("/bin/{exe}").into()),
+            ..Default::default()
+        };
+        let procs = vec![
+            p(1, "b"),
+            p(2, "b"),
+            p(3, "a"),
+            p(4, "a"),
+            p(5, "c"),
+            p(6, "c"),
+            p(7, "c"),
+        ];
+        let names: Vec<String> = group_by_executable(&procs)
+            .into_iter()
+            .map(|g| g.name)
+            .collect();
+        assert_eq!(names, vec!["c", "a", "b"]);
     }
 }

@@ -6,12 +6,27 @@ use rlm_core::CgroupManager;
 use std::cell::RefCell;
 use std::sync::Arc;
 
+/// The sidebar pages, in display order: (id, title, icon).
+pub const NAV_PAGES: [(&str, &str, &str); 5] = [
+    ("status", "Managed Processes", "view-list-symbolic"),
+    ("limit", "Limit Running", "power-profile-balanced-symbolic"),
+    ("run", "Launch New", "media-playback-start-symbolic"),
+    ("profiles", "Profiles", "document-properties-symbolic"),
+    ("about", "About", "help-about-symbolic"),
+];
+
+/// The sidebar row index for a page id, or `None` if it isn't a nav page.
+pub fn nav_index(page: &str) -> Option<usize> {
+    NAV_PAGES.iter().position(|(id, _, _)| *id == page)
+}
+
 mod imp {
     use super::*;
 
     #[derive(Default)]
     pub struct Window {
         pub manager: RefCell<Option<Arc<CgroupManager>>>,
+        pub sidebar: RefCell<Option<gtk::ListBox>>,
     }
 
     #[glib::object_subclass]
@@ -59,34 +74,22 @@ impl Window {
         self.add_action(&quit_action);
         app.set_accels_for_action("win.quit", &["<Control>q"]);
 
-        // Page navigation shortcuts (Ctrl+1 through Ctrl+5)
-        for (i, page) in ["status", "limit", "run", "profiles", "about"]
-            .iter()
-            .enumerate()
-        {
-            let action = gio::SimpleAction::new(&format!("goto-{page}"), None);
-            let page_name = page.to_string();
+        // Page navigation shortcuts (Ctrl+1 through Ctrl+5). Selecting the
+        // sidebar row (rather than switching the stack directly) keeps the
+        // highlight in sync with the visible page.
+        for (i, (id, _, _)) in NAV_PAGES.iter().enumerate() {
+            let action = gio::SimpleAction::new(&format!("goto-{id}"), None);
             let window_clone = self.clone();
             action.connect_activate(move |_, _| {
-                if let Some(stack) = window_clone.find_content_stack() {
-                    stack.set_visible_child_name(&page_name);
+                if let Some(list) = window_clone.imp().sidebar.borrow().as_ref() {
+                    if let Some(row) = list.row_at_index(i as i32) {
+                        list.select_row(Some(&row));
+                    }
                 }
             });
             self.add_action(&action);
-            app.set_accels_for_action(
-                &format!("win.goto-{page}"),
-                &[&format!("<Control>{}", i + 1)],
-            );
+            app.set_accels_for_action(&format!("win.goto-{id}"), &[&format!("<Control>{}", i + 1)]);
         }
-    }
-
-    fn find_content_stack(&self) -> Option<gtk::Stack> {
-        // Navigate through the widget hierarchy to find the stack
-        let content = self.content()?;
-        let split_view = content.downcast::<adw::NavigationSplitView>().ok()?;
-        let content_page = split_view.content()?;
-        let toolbar = content_page.child().and_downcast::<adw::ToolbarView>()?;
-        toolbar.content().and_downcast::<gtk::Stack>()
     }
 
     fn manager(&self) -> Option<Arc<CgroupManager>> {
@@ -116,22 +119,12 @@ impl Window {
         sidebar_list.set_selection_mode(gtk::SelectionMode::Single);
         sidebar_list.add_css_class("navigation-sidebar");
 
-        let nav_items = [
-            (
-                "status",
-                "Managed Processes",
-                "utilities-system-monitor-symbolic",
-            ),
-            ("limit", "Limit Running", "speedometer-symbolic"),
-            ("run", "Launch New", "media-playback-start-symbolic"),
-            ("profiles", "Profiles", "document-properties-symbolic"),
-            ("about", "About", "help-about-symbolic"),
-        ];
-
-        for (id, title, icon) in nav_items {
+        for (id, title, icon) in NAV_PAGES {
             let row = Self::create_sidebar_row(id, title, icon);
             sidebar_list.append(&row);
         }
+
+        self.imp().sidebar.replace(Some(sidebar_list.clone()));
 
         // Connect sidebar selection to stack
         let content_stack_clone = content_stack.clone();
@@ -161,9 +154,11 @@ impl Window {
             }
         });
 
-        // Select first item by default
-        if let Some(first_row) = sidebar_list.row_at_index(0) {
-            sidebar_list.select_row(Some(&first_row));
+        // Select the status page by default.
+        if let Some(idx) = nav_index("status") {
+            if let Some(first_row) = sidebar_list.row_at_index(idx as i32) {
+                sidebar_list.select_row(Some(&first_row));
+            }
         }
 
         // Sidebar with header
@@ -203,6 +198,10 @@ impl Window {
     }
 
     fn create_sidebar_row(id: &str, title: &str, icon_name: &str) -> gtk::ListBoxRow {
+        debug_assert!(
+            crate::icons::STOCK_ICONS.contains(&icon_name),
+            "{icon_name} is not a stock Adwaita icon"
+        );
         let row = gtk::ListBoxRow::new();
         row.set_widget_name(&format!("nav-{id}"));
 
@@ -237,5 +236,16 @@ impl Window {
             }
             glib::ControlFlow::Continue
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn every_page_has_a_sidebar_row_and_shortcut() {
+        assert_eq!(nav_index("status"), Some(0));
+        assert_eq!(nav_index("about"), Some(NAV_PAGES.len() - 1));
+        assert_eq!(nav_index("nope"), None);
     }
 }

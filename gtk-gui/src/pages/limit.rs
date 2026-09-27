@@ -43,7 +43,7 @@ pub fn create(manager: Option<Arc<CgroupManager>>) -> gtk::Widget {
 
     let page = adw::PreferencesPage::new();
     page.set_title("Limit");
-    page.set_icon_name(Some("speedometer-symbolic"));
+    page.set_icon_name(Some("power-profile-balanced-symbolic"));
 
     // Main heading group
     let header_group = adw::PreferencesGroup::new();
@@ -364,9 +364,8 @@ fn setup_pid_validation(entry: &adw::EntryRow) {
 fn load_profile_names() -> Vec<String> {
     let mut names = vec!["(None)".to_string()];
     if let Ok(config) = common::Config::load() {
-        names.extend(config.all_profiles().keys().cloned());
+        names.extend(config.profile_names());
     }
-    names.sort();
     names
 }
 
@@ -398,7 +397,22 @@ fn apply_profile(state: &Rc<RefCell<LimitState>>, index: usize) {
 }
 
 fn load_all_processes(state: &Rc<RefCell<LimitState>>) {
-    if let Ok(processes) = rlm_core::process::list_all() {
+    let uid = rlm_core::process::current_uid();
+    let processes = if uid == 0 {
+        rlm_core::process::list_all()
+    } else {
+        rlm_core::process::list_for_uid(uid)
+    };
+    if let Ok(processes) = processes {
+        let protect = common::protect_set(
+            &common::Config::load()
+                .map(|c| c.guard.selection.protect)
+                .unwrap_or_default(),
+        );
+        let processes: Vec<_> = processes
+            .into_iter()
+            .filter(|p| !common::is_protected(&protect, &p.name, p.exe_name()))
+            .collect();
         state.borrow().all_processes.replace(processes);
     }
 }

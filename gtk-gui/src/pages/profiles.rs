@@ -71,8 +71,10 @@ fn refresh_profiles(state: &Rc<RefCell<ProfilesState>>) {
                 empty_row.set_subtitle("Click + to create your first profile");
                 group.add(&empty_row);
             } else {
-                for (name, profile) in &config.profiles {
-                    let row = create_profile_row(name, profile);
+                let mut names: Vec<&String> = config.profiles.keys().collect();
+                names.sort_by_key(|n| n.to_lowercase());
+                for name in names {
+                    let row = create_profile_row(name, &config.profiles[name]);
                     group.add(&row);
                 }
             }
@@ -657,8 +659,10 @@ fn show_edit_profile_dialog(parent: &adw::PreferencesPage, name: &str, profile: 
                         }
                     }
                     if let Ok(config) = Config::load() {
-                        for (name, profile) in &config.profiles {
-                            let row = create_profile_row(name, profile);
+                        let mut names: Vec<&String> = config.profiles.keys().collect();
+                        names.sort_by_key(|n| n.to_lowercase());
+                        for name in names {
+                            let row = create_profile_row(name, &config.profiles[name]);
                             group.add(&row);
                         }
                     }
