@@ -1,4 +1,6 @@
 mod confirm;
+mod doctor;
+mod guard_unit;
 mod run;
 
 use clap::{Parser, Subcommand};
@@ -812,7 +814,7 @@ fn run() -> Result<ExitCode> {
         }
 
         Commands::Doctor => {
-            run_doctor();
+            return Ok(doctor::run());
         }
 
         Commands::Guard { action } => {
@@ -881,7 +883,7 @@ fn run_rule(action: RuleAction) -> Result<ExitCode> {
 
 fn run_guard(action: GuardAction) -> Result<ExitCode> {
     match action {
-        GuardAction::Enable => systemctl(&["enable", "--now", "rlm-guard"]),
+        GuardAction::Enable => guard_enable(),
         GuardAction::Disable => systemctl(&["disable", "--now", "rlm-guard"]),
         GuardAction::Status => Ok(guard_status()),
         GuardAction::Test => Ok(guard_test()),
@@ -913,6 +915,52 @@ fn validate_import(profiles: &std::collections::HashMap<String, common::Profile>
         "import rejected, nothing was written. Fix these profiles: {}",
         list.join("; ")
     )))
+}
+
+/// Install a user unit pointing at the real `rlm-guard` when no packaged
+/// unit exists (or refresh one this command wrote earlier), then enable and
+/// start the service.
+fn guard_enable() -> Result<ExitCode> {
+    let config_dir = dirs::config_dir()
+        .ok_or_else(|| Error::InvalidArgs("cannot find the user config directory".into()))?;
+    let unit_path = guard_unit::user_unit_path(&config_dir);
+    let existing = std::fs::read_to_string(&unit_path).ok();
+    let current_exe = std::env::current_exe().ok();
+    let path_env = std::env::var_os("PATH");
+    let guard_bin = guard_unit::find_guard_binary(current_exe.as_deref(), path_env.as_deref());
+    let system_dirs: Vec<&std::path::Path> = guard_unit::SYSTEM_UNIT_DIRS
+        .iter()
+        .map(std::path::Path::new)
+        .collect();
+    let plan = guard_unit::plan_enable(
+        guard_unit::system_unit_installed(&system_dirs),
+        existing.as_deref(),
+        guard_bin.as_deref(),
+        &unit_path,
+    );
+    match plan {
+        guard_unit::EnablePlan::NoBinary => {
+            return Err(Error::InvalidArgs(
+                "rlm-guard was not found next to rlm or on PATH. Install it with: cargo install --path cli (from a source checkout) or: cargo install rlmctl".into(),
+            ));
+        }
+        guard_unit::EnablePlan::WriteUserUnit { path, contents } => {
+            if let Some(dir) = path.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            std::fs::write(&path, contents)?;
+            println!("wrote {}", path.display());
+            let reload = systemctl(&["daemon-reload"])?;
+            if reload != ExitCode::SUCCESS {
+                return Ok(reload);
+            }
+        }
+        guard_unit::EnablePlan::UserUnitCustom => {
+            println!("note: keeping your own {}", unit_path.display());
+        }
+        guard_unit::EnablePlan::UseSystemUnit | guard_unit::EnablePlan::UserUnitCurrent => {}
+    }
+    systemctl(&["enable", "--now", "rlm-guard"])
 }
 
 fn systemctl(args: &[&str]) -> Result<ExitCode> {
@@ -1094,99 +1142,6 @@ fn guard_history(lines: usize) {
     for e in &events {
         println!("{}", rlm_core::guard::report::history_line(e, now));
     }
-}
-
-fn run_doctor() {
-    println!("rlm doctor - checking system requirements\n");
-
-    let mut all_ok = true;
-
-    // Check cgroups v2
-    let cgroup_check = std::path::Path::new("/sys/fs/cgroup/cgroup.controllers").exists();
-    print_check("cgroups v2 available", cgroup_check);
-    if !cgroup_check {
-        println!("  -> ensure kernel supports cgroups v2 and unified hierarchy is mounted");
-        all_ok = false;
-    }
-
-    // Check available controllers
-    if cgroup_check {
-        if let Ok(controllers) = std::fs::read_to_string("/sys/fs/cgroup/cgroup.controllers") {
-            let has_memory = controllers.contains("memory");
-            let has_cpu = controllers.contains("cpu");
-            let has_io = controllers.contains("io");
-
-            print_check("memory controller", has_memory);
-            print_check("cpu controller", has_cpu);
-            print_check("io controller", has_io);
-
-            if !has_memory || !has_cpu || !has_io {
-                all_ok = false;
-            }
-        }
-    }
-
-    // Check user cgroup delegation (for non-root)
-    let uid = std::fs::read_to_string("/proc/self/status")
-        .ok()
-        .and_then(|s| {
-            s.lines()
-                .find(|l| l.starts_with("Uid:"))
-                .and_then(|l| l.split_whitespace().nth(1))
-                .and_then(|u| u.parse::<u32>().ok())
-        });
-
-    if let Some(uid) = uid {
-        if uid != 0 {
-            let user_slice =
-                format!("/sys/fs/cgroup/user.slice/user-{uid}.slice/user@{uid}.service");
-            let delegation_ok = std::path::Path::new(&user_slice).exists();
-            print_check("user cgroup delegation", delegation_ok);
-            if !delegation_ok {
-                println!("  -> run these commands to enable delegation:");
-                println!("     sudo mkdir -p /etc/systemd/system/user@.service.d");
-                println!("     echo '[Service]' | sudo tee /etc/systemd/system/user@.service.d/delegate.conf");
-                println!("     echo 'Delegate=cpu memory io' | sudo tee -a /etc/systemd/system/user@.service.d/delegate.conf");
-                println!("     sudo systemctl daemon-reload");
-                println!("     # then log out and back in");
-                all_ok = false;
-            }
-        } else {
-            print_check("running as root", true);
-        }
-    }
-
-    // Check config file
-    let config_path = dirs::config_dir()
-        .map(|p| p.join("rlm/config.yaml"))
-        .unwrap_or_default();
-    let config_exists = config_path.exists();
-    print_check(
-        &format!("config file ({})", config_path.display()),
-        config_exists,
-    );
-    if !config_exists {
-        println!("  -> optional: create config for profiles");
-    }
-
-    // Check PSI availability (required by the freeze guard, rlm-guard)
-    let psi_ok = std::path::Path::new("/proc/pressure/memory").exists();
-    print_check("memory pressure info (PSI, for rlm-guard)", psi_ok);
-    if !psi_ok {
-        println!("  -> the freeze guard needs PSI; boot with `psi=1` if your kernel disables it");
-    }
-
-    println!();
-    if all_ok {
-        println!("all checks passed - rlm is ready to use");
-    } else {
-        println!("some checks failed - see hints above");
-    }
-}
-
-fn print_check(name: &str, ok: bool) {
-    let status = if ok { "[ok]" } else { "[FAIL]" };
-    println!("{:>8} {}", status, name);
 }
 
 #[cfg(test)]

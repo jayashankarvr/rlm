@@ -287,7 +287,7 @@ fn sleep_responsive(total: Duration, shutdown: &AtomicBool) {
 
 #[cfg(test)]
 mod tests {
-    const UNIT: &str = include_str!("../../cli/assets/rlm-guard.service");
+    const UNIT: &str = include_str!("../../assets/rlm-guard.service");
 
     #[test]
     fn idle_ticks_do_not_scan_proc() {

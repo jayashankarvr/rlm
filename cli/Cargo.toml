@@ -37,6 +37,10 @@ post_install_script = "../dist/postinst"
 name = "rlm"
 path = "src/main.rs"
 
+[[bin]]
+name = "rlm-guard"
+path = "src/bin/rlm-guard.rs"
+
 [dependencies]
 common.workspace = true
 rlm-core.workspace = true
