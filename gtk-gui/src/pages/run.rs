@@ -213,8 +213,11 @@ pub fn create(manager: Option<Arc<CgroupManager>>) -> gtk::Widget {
     let state_clone = state.clone();
     search_entry.connect_search_changed(move |entry| {
         let text = entry.text();
-        if text.len() > MAX_SEARCH_LEN {
-            entry.set_text(&text[..MAX_SEARCH_LEN]);
+        if text.chars().count() > MAX_SEARCH_LEN {
+            // Cut on a character boundary; a byte slice panics inside a
+            // multibyte character.
+            let cut: String = text.chars().take(MAX_SEARCH_LEN).collect();
+            entry.set_text(&cut);
             return;
         }
         filter_apps(&state_clone, text.as_str());
@@ -587,8 +590,11 @@ fn show_status(label: &gtk::Label, message: &str, is_error: bool) {
 fn setup_command_validation(entry: &adw::EntryRow) {
     entry.connect_changed(move |e| {
         let text = e.text();
-        if text.len() > MAX_COMMAND_LEN {
-            e.set_text(&text[..MAX_COMMAND_LEN]);
+        if text.chars().count() > MAX_COMMAND_LEN {
+            // Cut on a character boundary; a byte slice panics inside a
+            // multibyte character.
+            let cut: String = text.chars().take(MAX_COMMAND_LEN).collect();
+            e.set_text(&cut);
         }
         // Visual feedback for empty command
         if text.trim().is_empty() && !text.is_empty() {

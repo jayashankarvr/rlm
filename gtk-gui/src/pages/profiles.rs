@@ -695,8 +695,11 @@ fn save_profile_to_config(name: &str, profile: Profile, state: &Rc<RefCell<Profi
 fn setup_name_validation(entry: &adw::EntryRow) {
     entry.connect_changed(move |e| {
         let text = e.text();
-        if text.len() > MAX_NAME_LEN {
-            e.set_text(&text[..MAX_NAME_LEN]);
+        if text.chars().count() > MAX_NAME_LEN {
+            // Cut on a character boundary; a byte slice panics inside a
+            // multibyte character.
+            let cut: String = text.chars().take(MAX_NAME_LEN).collect();
+            e.set_text(&cut);
             return;
         }
         // Visual feedback for empty or whitespace-only name

@@ -12,7 +12,7 @@ use std::sync::Arc;
 // Field length limits
 /// Longest text the PID field keeps: room for a few hundred PIDs when an
 /// application is selected, which fills the field with a comma-separated list.
-const MAX_PID_LEN: usize = 4096;
+const MAX_PID_LEN: usize = 65536;
 
 struct LimitState {
     pid_entry: adw::EntryRow,
@@ -249,6 +249,10 @@ pub fn create(manager: Option<Arc<CgroupManager>>) -> gtk::Widget {
             LimitMode::Application
         };
         state_clone.borrow().limit_mode.replace(mode);
+        // A PID list from Application mode means nothing in Individual mode
+        // (and the reverse), so start each mode with an empty selection.
+        state_clone.borrow().selected_pids.replace(Vec::new());
+        state_clone.borrow().pid_entry.set_text("");
         update_mode_info(&mode_info_label_clone, mode);
         // The "save as rule" toggle only applies to application (shared) mode.
         state_clone
@@ -272,8 +276,11 @@ pub fn create(manager: Option<Arc<CgroupManager>>) -> gtk::Widget {
     search_entry.connect_search_changed(move |entry| {
         let text = entry.text();
         // Limit search query length
-        if text.len() > 100 {
-            entry.set_text(&text[..100]);
+        if text.chars().count() > 100 {
+            // Cut on a character boundary; a byte slice panics inside a
+            // multibyte character.
+            let cut: String = text.chars().take(100).collect();
+            entry.set_text(&cut);
             return;
         }
         filter_processes(&state_clone, text.as_str());
@@ -715,8 +722,7 @@ fn apply_limits(state: &Rc<RefCell<LimitState>>) {
 
             // The field holds one PID or the selected application's list.
             let pids: Vec<u32> = match parse_pid_list(&pid_text) {
-                Some(pids) if !pids.is_empty() => pids,
-                Some(_) => state.selected_pids.borrow().clone(),
+                Some(pids) => pids,
                 None => {
                     show_status(
                         &state.status_label,
@@ -797,12 +803,12 @@ fn apply_limits(state: &Rc<RefCell<LimitState>>) {
                 return;
             }
 
-            let pid: u32 = match pid_text.parse() {
+            let pid: u32 = match pid_text.trim().parse() {
                 Ok(p) if p > 0 => p,
                 _ => {
                     show_status(
                         &state.status_label,
-                        "Invalid PID (must be positive number)",
+                        "Individual mode takes one PID; to limit several processes together, switch to Application mode",
                         true,
                     );
                     return;
