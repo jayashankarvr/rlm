@@ -1,0 +1,26 @@
+pkgbase = rlm
+	pkgdesc = Unprivileged cgroup v2 resource limits with an optional freeze-or-cap guard
+	pkgver = 0.2.0
+	pkgrel = 1
+	url = https://github.com/jayashankarvr/rlm
+	arch = x86_64
+	arch = aarch64
+	license = Apache-2.0
+	makedepends = cargo
+	makedepends = gtk4
+	makedepends = libadwaita
+	source = rlm-0.2.0.tar.gz::https://github.com/jayashankarvr/rlm/archive/refs/tags/v0.2.0.tar.gz
+	sha256sums = 6b2f8c6d15d544ce3b66b3dedfcd05bbf7f915e7e0f95643da8122701f4fe83d
+
+pkgname = rlm
+	pkgdesc = Unprivileged cgroup v2 resource limits (rlm) with an optional freeze-or-cap guard (rlm-guard)
+	install = rlm.install
+	depends = systemd
+	depends = gcc-libs
+	depends = glibc
+
+pkgname = rlm-gtk
+	pkgdesc = GTK4 interface for rlm
+	depends = rlm
+	depends = gtk4
+	depends = libadwaita
