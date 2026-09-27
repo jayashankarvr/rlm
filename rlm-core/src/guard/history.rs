@@ -9,8 +9,15 @@ use super::types::Action;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Owner-only permissions for the history log: entries record app names and
+/// cgroup paths, so the file is created `0600` rather than inheriting the
+/// process umask. Only takes effect when this call actually creates the
+/// file (`O_CREAT`); an already-existing file's mode is left as-is.
+const HISTORY_FILE_MODE: u32 = 0o600;
 
 /// Rotate the log once it reaches this size: the current file is renamed to
 /// `guard-history.jsonl.1` (overwriting any previous rotation) and a fresh
@@ -149,7 +156,11 @@ pub fn append(path: &Path, ev: &HistoryEvent) -> std::io::Result<()> {
             fs::rename(path, path.with_extension("jsonl.1"))?;
         }
     }
-    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(HISTORY_FILE_MODE)
+        .open(path)?;
     let line = serde_json::to_string(ev)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     writeln!(file, "{line}")?;
@@ -295,6 +306,52 @@ mod tests {
             read_recent(&p, 10),
             vec![ev],
             "corrupt old lines are skipped"
+        );
+    }
+
+    /// Fix round 1, ruling R15: the history log records app names and cgroup
+    /// paths, so both the live file and its rotated `.jsonl.1` predecessor
+    /// must be owner-only (`0600`), not whatever the process umask would
+    /// otherwise give a newly created file.
+    #[test]
+    fn history_file_and_rotation_are_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("h.jsonl");
+        let ev = HistoryEvent {
+            ts: 1,
+            kind: HistoryKind::Freeze,
+            app: "a".into(),
+            cgroup: "/c".into(),
+            detail: String::new(),
+        };
+        append(&p, &ev).unwrap();
+        let mode_of = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode_of(&p), 0o600, "history file must be created 0600");
+
+        // Grow the file past the rotation threshold without ever recreating
+        // it (a bare append, not our `append()`, so its existing mode is
+        // untouched), then append once more through `append()` to trigger
+        // rotation.
+        {
+            let mut f = OpenOptions::new().append(true).open(&p).unwrap();
+            f.write_all(&vec![b'x'; MAX_HISTORY_BYTES as usize])
+                .unwrap();
+        }
+        append(&p, &ev).unwrap();
+
+        let rotated = p.with_extension("jsonl.1");
+        assert!(rotated.exists());
+        assert_eq!(
+            mode_of(&rotated),
+            0o600,
+            "rotated file must stay owner-only"
+        );
+        assert_eq!(
+            mode_of(&p),
+            0o600,
+            "fresh file after rotation must also be 0600"
         );
     }
 

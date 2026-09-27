@@ -10,7 +10,7 @@ use common::GuardTrigger;
 /// One line describing a pressure sample: source, PSI averages, and
 /// available memory. `available unknown` replaces the MB figures when
 /// `/proc/meminfo` couldn't be read (`Sample::mem_available_mb == u64::MAX`
-/// or `mem_total_mb == 0`, the sentinels `Sampler::sample` uses) — printing
+/// or `mem_total_mb == 0`, the sentinels `Sampler::sample` uses); printing
 /// the raw sentinels (`18446744073709551615 MB of 0 MB`) would be nonsense.
 pub fn pressure_line(s: &Sample) -> String {
     let avail = if s.mem_available_mb == u64::MAX || s.mem_total_mb == 0 {
@@ -59,6 +59,16 @@ pub fn history_line(e: &HistoryEvent, now: u64) -> String {
     format!("{age:>9}  {:<6}  {}  {}", e.kind.word(), e.app, e.detail)
 }
 
+/// The `Pressure:` line's text when `Sampler::sample` returned `None`:
+/// neither PSI source could be read at all (both files missing, or neither
+/// parsed). Pulled into its own function so `rlm guard status` and
+/// `rlm guard test` show identical, accurate wording (fix round 1, Important
+/// #1: the old text named only `/proc/pressure/memory`, but app.slice PSI is
+/// checked first and can also be the one that failed).
+pub fn pressure_unavailable() -> &'static str {
+    "unavailable (neither app.slice nor system PSI could be read)"
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -100,6 +110,18 @@ mod tests {
         assert_eq!(
             pressure_line(&sentinel),
             "system: some 5.0% full 1.0%, available unknown"
+        );
+    }
+
+    /// Fix round 1, Important #1: pin the exact wording `guard status`/
+    /// `guard test` show when `Sampler::sample` returns `None` (no PSI
+    /// source readable at all), so it can never regress to blaming a single
+    /// file again.
+    #[test]
+    fn pressure_unavailable_names_both_sources() {
+        assert_eq!(
+            pressure_unavailable(),
+            "unavailable (neither app.slice nor system PSI could be read)"
         );
     }
 }

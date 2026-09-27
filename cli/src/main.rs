@@ -767,7 +767,10 @@ fn guard_status() -> ExitCode {
         rlm_core::guard::Sampler::new(cfg.guard.clone(), std::process::id(), current_uid(), None);
     match sampler.sample() {
         Some(s) => println!("Pressure: {}", rlm_core::guard::report::pressure_line(&s)),
-        None => println!("Pressure: unavailable (no PSI)"),
+        None => println!(
+            "Pressure: {}",
+            rlm_core::guard::report::pressure_unavailable()
+        ),
     }
     println!(
         "Policy:   {}",
@@ -846,7 +849,10 @@ fn guard_test(manager: &CgroupManager) -> ExitCode {
     let mut engine = rlm_core::guard::PolicyEngine::new(cfg.guard);
 
     let Some(sample) = sampler.sample() else {
-        println!("Pressure: unavailable (no PSI); cannot evaluate guard actions.");
+        println!(
+            "Pressure: {}; cannot evaluate guard actions.",
+            rlm_core::guard::report::pressure_unavailable()
+        );
         return ExitCode::SUCCESS;
     };
     let snapshot = rlm_core::process::list_for_uid(current_uid()).unwrap_or_default();
