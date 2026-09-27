@@ -1,6 +1,6 @@
 use crate::widgets::{
     create_unit_dropdown, get_unit_suffix, parse_cpu_value, set_value_with_unit,
-    setup_number_validation,
+    setup_number_validation, setup_size_validation,
 };
 use adw::prelude::*;
 use gtk::glib;
@@ -26,7 +26,6 @@ struct RunState {
     toast_overlay: adw::ToastOverlay,
     app_list: gtk::ListBox,
     manager: Option<Arc<CgroupManager>>,
-    profiles: RefCell<Vec<String>>,
     all_apps: RefCell<Vec<rlm_core::desktop::DesktopApp>>,
     running_pid: RefCell<Option<u32>>,
     cgroup_name: RefCell<Option<String>>,
@@ -129,8 +128,8 @@ pub fn create(manager: Option<Arc<CgroupManager>>) -> gtk::Widget {
     // Memory with unit dropdown
     let memory_entry = adw::EntryRow::new();
     memory_entry.set_title("Memory");
-    memory_entry.set_input_purpose(gtk::InputPurpose::Digits);
-    setup_number_validation(&memory_entry);
+    memory_entry.set_input_purpose(gtk::InputPurpose::Number);
+    setup_size_validation(&memory_entry);
     let memory_unit = create_unit_dropdown();
     memory_unit.set_selected(1); // Default to MB
     memory_entry.add_suffix(&memory_unit);
@@ -150,8 +149,8 @@ pub fn create(manager: Option<Arc<CgroupManager>>) -> gtk::Widget {
     // I/O Read with unit dropdown
     let io_read_entry = adw::EntryRow::new();
     io_read_entry.set_title("I/O Read");
-    io_read_entry.set_input_purpose(gtk::InputPurpose::Digits);
-    setup_number_validation(&io_read_entry);
+    io_read_entry.set_input_purpose(gtk::InputPurpose::Number);
+    setup_size_validation(&io_read_entry);
     let io_read_unit = create_unit_dropdown();
     io_read_unit.set_selected(1); // Default to MB
     io_read_entry.add_suffix(&io_read_unit);
@@ -160,8 +159,8 @@ pub fn create(manager: Option<Arc<CgroupManager>>) -> gtk::Widget {
     // I/O Write with unit dropdown
     let io_write_entry = adw::EntryRow::new();
     io_write_entry.set_title("I/O Write");
-    io_write_entry.set_input_purpose(gtk::InputPurpose::Digits);
-    setup_number_validation(&io_write_entry);
+    io_write_entry.set_input_purpose(gtk::InputPurpose::Number);
+    setup_size_validation(&io_write_entry);
     let io_write_unit = create_unit_dropdown();
     io_write_unit.set_selected(1); // Default to MB
     io_write_entry.add_suffix(&io_write_unit);
@@ -198,7 +197,6 @@ pub fn create(manager: Option<Arc<CgroupManager>>) -> gtk::Widget {
         toast_overlay: toast_overlay.clone(),
         app_list: app_list.clone(),
         manager: manager.clone(),
-        profiles: RefCell::new(profiles),
         all_apps: RefCell::new(Vec::new()),
         running_pid: RefCell::new(None),
         cgroup_name: RefCell::new(None),
@@ -233,7 +231,7 @@ pub fn create(manager: Option<Arc<CgroupManager>>) -> gtk::Widget {
     // Profile selection handler
     let state_clone = state.clone();
     profile_dropdown.connect_selected_notify(move |dropdown| {
-        apply_profile(&state_clone, dropdown.selected() as usize);
+        apply_profile(&state_clone, selected_profile(dropdown).as_deref());
     });
 
     // Run button handler
@@ -319,31 +317,50 @@ fn filter_apps(state: &Rc<RefCell<RunState>>, query: &str) {
     }
 }
 
-fn apply_profile(state: &Rc<RefCell<RunState>>, index: usize) {
-    let state = state.borrow();
-    let profiles = state.profiles.borrow();
+/// The profile name a dropdown shows, or `None` for "(None)".
+fn selected_profile(dropdown: &gtk::DropDown) -> Option<String> {
+    if dropdown.selected() == 0 {
+        return None;
+    }
+    dropdown
+        .selected_item()
+        .and_downcast::<gtk::StringObject>()
+        .map(|s| s.string().to_string())
+}
 
-    if index == 0 || index >= profiles.len() {
+/// Fill the limit fields from a profile. Every field is cleared first, so
+/// a limit the profile leaves unset does not keep an earlier profile's value.
+fn apply_profile(state: &Rc<RefCell<RunState>>, name: Option<&str>) {
+    let Some(name) = name else {
         return;
-    }
-
-    let profile_name = &profiles[index];
-    if let Ok(config) = common::Config::load() {
-        if let Some(profile) = config.get_profile(profile_name) {
-            if let Some(ref mem) = profile.memory {
-                set_value_with_unit(&state.memory_entry, &state.memory_unit, mem);
-            }
-            if let Some(ref cpu) = profile.cpu {
-                state.cpu_entry.set_text(&parse_cpu_value(cpu));
-            }
-            if let Some(ref ior) = profile.io_read {
-                set_value_with_unit(&state.io_read_entry, &state.io_read_unit, ior);
-            }
-            if let Some(ref iow) = profile.io_write {
-                set_value_with_unit(&state.io_write_entry, &state.io_write_unit, iow);
-            }
+    };
+    let Some(profile) = common::Config::load()
+        .ok()
+        .and_then(|config| config.get_profile(name))
+    else {
+        return;
+    };
+    let state = state.borrow();
+    let fill = |entry: &adw::EntryRow, unit: &gtk::DropDown, value: &Option<String>| {
+        entry.set_text("");
+        if let Some(value) = value {
+            set_value_with_unit(entry, unit, value);
         }
-    }
+    };
+    fill(&state.memory_entry, &state.memory_unit, &profile.memory);
+    state.cpu_entry.set_text(
+        &profile
+            .cpu
+            .as_deref()
+            .map(parse_cpu_value)
+            .unwrap_or_default(),
+    );
+    fill(&state.io_read_entry, &state.io_read_unit, &profile.io_read);
+    fill(
+        &state.io_write_entry,
+        &state.io_write_unit,
+        &profile.io_write,
+    );
 }
 
 fn run_command(state: &Rc<RefCell<RunState>>) {
@@ -617,10 +634,26 @@ pub fn refresh_profiles(widget: &gtk::Widget) {
     if let Some(dropdown) = find_widget_by_name(widget, "run-profile-dropdown") {
         if let Some(dropdown) = dropdown.downcast_ref::<gtk::DropDown>() {
             let profiles = load_profile_names();
+            let current = selected_profile(dropdown);
+            let unchanged = dropdown.model().is_some_and(|m| {
+                m.n_items() as usize == profiles.len()
+                    && profiles.iter().enumerate().all(|(i, name)| {
+                        m.item(i as u32)
+                            .and_downcast::<gtk::StringObject>()
+                            .is_some_and(|s| s.string() == name.as_str())
+                    })
+            });
+            if unchanged {
+                return;
+            }
             let profile_list =
                 gtk::StringList::new(&profiles.iter().map(|s| s.as_str()).collect::<Vec<_>>());
             dropdown.set_model(Some(&profile_list));
-            dropdown.set_selected(0);
+            // Keep the chosen profile selected while it still exists.
+            let keep = current
+                .and_then(|c| profiles.iter().position(|p| *p == c))
+                .unwrap_or(0);
+            dropdown.set_selected(keep as u32);
         }
     }
 }

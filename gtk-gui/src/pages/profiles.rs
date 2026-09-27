@@ -1,4 +1,7 @@
-use crate::widgets::{create_unit_dropdown, get_unit_suffix, setup_number_validation};
+use crate::widgets::{
+    create_unit_dropdown, get_unit_suffix, parse_cpu_value, set_value_with_unit,
+    setup_number_validation, setup_size_validation,
+};
 use adw::prelude::*;
 use common::{Config, Profile};
 use std::cell::RefCell;
@@ -241,8 +244,8 @@ fn show_profile_dialog(parent: &adw::PreferencesPage, state: &Rc<RefCell<Profile
     // Memory with unit dropdown
     let memory_entry = adw::EntryRow::new();
     memory_entry.set_title("Memory");
-    memory_entry.set_input_purpose(gtk::InputPurpose::Digits);
-    setup_number_validation(&memory_entry);
+    memory_entry.set_input_purpose(gtk::InputPurpose::Number);
+    setup_size_validation(&memory_entry);
     let memory_unit = create_unit_dropdown();
     memory_unit.set_selected(1); // Default to MB
     memory_entry.add_suffix(&memory_unit);
@@ -262,8 +265,8 @@ fn show_profile_dialog(parent: &adw::PreferencesPage, state: &Rc<RefCell<Profile
     // I/O Read with unit dropdown
     let io_read_entry = adw::EntryRow::new();
     io_read_entry.set_title("I/O Read");
-    io_read_entry.set_input_purpose(gtk::InputPurpose::Digits);
-    setup_number_validation(&io_read_entry);
+    io_read_entry.set_input_purpose(gtk::InputPurpose::Number);
+    setup_size_validation(&io_read_entry);
     let io_read_unit = create_unit_dropdown();
     io_read_unit.set_selected(1); // Default to MB
     io_read_entry.add_suffix(&io_read_unit);
@@ -272,8 +275,8 @@ fn show_profile_dialog(parent: &adw::PreferencesPage, state: &Rc<RefCell<Profile
     // I/O Write with unit dropdown
     let io_write_entry = adw::EntryRow::new();
     io_write_entry.set_title("I/O Write");
-    io_write_entry.set_input_purpose(gtk::InputPurpose::Digits);
-    setup_number_validation(&io_write_entry);
+    io_write_entry.set_input_purpose(gtk::InputPurpose::Number);
+    setup_size_validation(&io_write_entry);
     let io_write_unit = create_unit_dropdown();
     io_write_unit.set_selected(1); // Default to MB
     io_write_entry.add_suffix(&io_write_unit);
@@ -507,38 +510,15 @@ fn show_edit_profile_dialog(parent: &adw::PreferencesPage, name: &str, profile: 
     limits_group.set_title("Resource Limits");
     limits_group.set_description(Some("Leave a field empty to leave that resource unlimited"));
 
-    // Helper to extract numeric value and unit index from limit string
-    fn parse_limit(limit: Option<&String>) -> (String, u32) {
-        match limit {
-            Some(s) => {
-                let s = s.trim();
-                if let Some(v) = s.strip_suffix('K') {
-                    (v.to_string(), 0)
-                } else if let Some(v) = s.strip_suffix('M') {
-                    (v.to_string(), 1)
-                } else if let Some(v) = s.strip_suffix('G') {
-                    (v.to_string(), 2)
-                } else if let Some(v) = s.strip_suffix('T') {
-                    (v.to_string(), 3)
-                } else if let Some(v) = s.strip_suffix('%') {
-                    (v.to_string(), 0)
-                } else {
-                    (s.to_string(), 1) // Default MB
-                }
-            }
-            None => (String::new(), 1),
-        }
-    }
-
     // Memory with unit dropdown
     let memory_entry = adw::EntryRow::new();
     memory_entry.set_title("Memory");
-    memory_entry.set_input_purpose(gtk::InputPurpose::Digits);
-    setup_number_validation(&memory_entry);
+    memory_entry.set_input_purpose(gtk::InputPurpose::Number);
+    setup_size_validation(&memory_entry);
     let memory_unit = create_unit_dropdown();
-    let (mem_val, mem_unit_idx) = parse_limit(profile.memory.as_ref());
-    memory_entry.set_text(&mem_val);
-    memory_unit.set_selected(mem_unit_idx);
+    if let Some(ref v) = profile.memory {
+        set_value_with_unit(&memory_entry, &memory_unit, v);
+    }
     memory_entry.add_suffix(&memory_unit);
     limits_group.add(&memory_entry);
 
@@ -551,31 +531,32 @@ fn show_edit_profile_dialog(parent: &adw::PreferencesPage, name: &str, profile: 
     cpu_suffix.add_css_class("dim-label");
     cpu_suffix.set_margin_start(4);
     cpu_entry.add_suffix(&cpu_suffix);
-    let (cpu_val, _) = parse_limit(profile.cpu.as_ref());
-    cpu_entry.set_text(&cpu_val);
+    if let Some(ref v) = profile.cpu {
+        cpu_entry.set_text(&parse_cpu_value(v));
+    }
     limits_group.add(&cpu_entry);
 
     // I/O Read with unit dropdown
     let io_read_entry = adw::EntryRow::new();
     io_read_entry.set_title("I/O Read");
-    io_read_entry.set_input_purpose(gtk::InputPurpose::Digits);
-    setup_number_validation(&io_read_entry);
+    io_read_entry.set_input_purpose(gtk::InputPurpose::Number);
+    setup_size_validation(&io_read_entry);
     let io_read_unit = create_unit_dropdown();
-    let (ior_val, ior_unit_idx) = parse_limit(profile.io_read.as_ref());
-    io_read_entry.set_text(&ior_val);
-    io_read_unit.set_selected(ior_unit_idx);
+    if let Some(ref v) = profile.io_read {
+        set_value_with_unit(&io_read_entry, &io_read_unit, v);
+    }
     io_read_entry.add_suffix(&io_read_unit);
     limits_group.add(&io_read_entry);
 
     // I/O Write with unit dropdown
     let io_write_entry = adw::EntryRow::new();
     io_write_entry.set_title("I/O Write");
-    io_write_entry.set_input_purpose(gtk::InputPurpose::Digits);
-    setup_number_validation(&io_write_entry);
+    io_write_entry.set_input_purpose(gtk::InputPurpose::Number);
+    setup_size_validation(&io_write_entry);
     let io_write_unit = create_unit_dropdown();
-    let (iow_val, iow_unit_idx) = parse_limit(profile.io_write.as_ref());
-    io_write_entry.set_text(&iow_val);
-    io_write_unit.set_selected(iow_unit_idx);
+    if let Some(ref v) = profile.io_write {
+        set_value_with_unit(&io_write_entry, &io_write_unit, v);
+    }
     io_write_entry.add_suffix(&io_write_unit);
     limits_group.add(&io_write_entry);
 
