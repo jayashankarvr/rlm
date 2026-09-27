@@ -1,4 +1,5 @@
 mod confirm;
+mod run;
 
 use clap::{Parser, Subcommand};
 use common::{build_limit, format_bytes, Config, Error, Limit, Result};
@@ -8,8 +9,6 @@ use rlm_core::CgroupManager;
 use std::collections::HashSet;
 use std::io::{self, IsTerminal};
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 
 fn parse_pid_list(pids_str: &str) -> Result<Vec<u32>> {
     pids_str
@@ -670,7 +669,7 @@ fn run() -> Result<ExitCode> {
                 ));
             }
 
-            return run_with_limits(manager, &limit, &command);
+            return run::run_with_limits(manager, &limit, &command);
         }
 
         Commands::Profiles => {
@@ -1204,89 +1203,6 @@ fn run_doctor() {
 fn print_check(name: &str, ok: bool) {
     let status = if ok { "[ok]" } else { "[FAIL]" };
     println!("{:>8} {}", status, name);
-}
-
-fn run_with_limits(
-    manager: &CgroupManager,
-    limit: &common::Limit,
-    command: &[String],
-) -> Result<ExitCode> {
-    let (program, args) = command
-        .split_first()
-        .ok_or_else(|| common::Error::InvalidArgs("command is required".into()))?;
-
-    // Generate a collision-resistant cgroup name. Using only the PID risks
-    // reusing a stale leaked `run-<pid>` cgroup after PID reuse; the timestamp
-    // suffix makes that effectively impossible.
-    let uniq = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let cgroup_name = format!("run-{}-{}", std::process::id(), uniq);
-
-    // Create cgroup and set limits BEFORE spawning the process
-    let prepared = manager.prepare_cgroup(&cgroup_name, limit)?;
-    for w in &prepared.warnings {
-        eprintln!("warning: {w}");
-    }
-    let cgroup_path = prepared.path;
-
-    // Set up signal handler
-    let terminated = Arc::new(AtomicBool::new(false));
-    let terminated_clone = Arc::clone(&terminated);
-
-    ctrlc::set_handler(move || {
-        terminated_clone.store(true, Ordering::SeqCst);
-    })
-    .ok();
-
-    // Place the child into the cgroup BEFORE it execs, so it is constrained from
-    // its first instruction (see CgroupManager::placement_command).
-    let mut cmd = manager.placement_command(&cgroup_path, program);
-    cmd.args(args);
-    let mut child = cmd.spawn()?;
-
-    let pid = child.id();
-
-    // Fallback: ensure the process is in the cgroup even if pre-exec placement
-    // failed. Idempotent if it's already there.
-    if let Err(e) = manager.add_to_cgroup(&cgroup_path, pid) {
-        eprintln!("warning: failed to apply limits: {e}");
-    }
-
-    // Track if we've sent SIGTERM
-    let mut sigterm_sent = false;
-
-    // Wait for process, checking for signals
-    let status = loop {
-        if terminated.load(Ordering::SeqCst) && !sigterm_sent {
-            // Forward signal to child (only once)
-            // SAFETY: pid is a valid process ID obtained from child.id() of a process
-            // we just spawned. libc::kill with SIGTERM is safe for any PID - worst case
-            // the process already exited and kill returns an error (which we ignore).
-            unsafe {
-                libc::kill(pid as i32, libc::SIGTERM);
-            }
-            sigterm_sent = true;
-        }
-
-        match child.try_wait()? {
-            Some(status) => break status,
-            None => std::thread::sleep(std::time::Duration::from_millis(100)),
-        }
-    };
-
-    // Clean up our ephemeral cgroup. Don't propagate a cleanup error here: cgroup
-    // v2 can briefly return EBUSY on rmdir right after the last process exits, and
-    // we must not let that mask the child program's real exit code.
-    if let Err(e) = manager.cleanup_cgroup(&cgroup_name) {
-        eprintln!("warning: failed to remove cgroup: {e}");
-    }
-
-    Ok(status
-        .code()
-        .map(|c| ExitCode::from(c as u8))
-        .unwrap_or(ExitCode::FAILURE))
 }
 
 #[cfg(test)]

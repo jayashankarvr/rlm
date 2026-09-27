@@ -1,5 +1,6 @@
 mod cgroup;
 pub mod desktop;
+pub mod exit;
 pub mod guard;
 pub mod logging;
 pub mod process;
