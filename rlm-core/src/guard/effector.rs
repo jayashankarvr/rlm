@@ -229,6 +229,15 @@ impl<'a> Effector<'a> {
         // whitespace off the raw file contents) returns. See
         // `our_high_string_is_plain_decimal_no_separators` below, and
         // `reconcile_our_high` for the belt-and-braces check.
+        if !cap_tightens(prev_high.as_deref(), our_bytes) {
+            tracing::info!(
+                cgroup = %res.cgroup, name, prev_high = ?prev_high, our_bytes,
+                "existing memory.high already at or below the cap; not capping"
+            );
+            return Err(common::Error::Cgroup(
+                "existing memory.high already at or below the cap; refusing to cap".into(),
+            ));
+        }
         let our_high = our_bytes.to_string();
 
         let entry = JournalEntry {
@@ -255,7 +264,7 @@ impl<'a> Effector<'a> {
 
     /// After a successful `Cap` write, read `memory.high` back; if what's
     /// actually on disk differs from what we journaled (page truncation we
-    /// didn't fully pre-empt), correct the journal to match reality — otherwise
+    /// didn't fully pre-empt), correct the journal to match reality. Otherwise
     /// `should_restore`'s string-equality check can never pass again and
     /// the cap becomes permanent (Task 6 review, Critical #1). Rebuilds
     /// only this cgroup's entries, preserving any others that might coexist
@@ -452,6 +461,17 @@ pub fn cap_target(current: Option<u64>, file: Option<u64>, anon_reclaimable: boo
     Some(target.max(MIN_CAP_BYTES))
 }
 
+/// Pure: whether writing `target` would tighten the existing `memory.high`.
+/// A numeric `prev_high` at or below `target` means the cap would loosen (or
+/// not change) the limit already in place, so the caller must not write it.
+/// `"max"`, or anything else that is not a byte count, is no limit at all.
+pub fn cap_tightens(prev_high: Option<&str>, target: u64) -> bool {
+    match prev_high.and_then(|s| s.trim().parse::<u64>().ok()) {
+        Some(prev) => prev > target,
+        None => true,
+    }
+}
+
 /// Pure: the full restore decision for one cgroup's journal `entries`
 /// (oldest-first), given the cgroup's current inode and on-disk
 /// `memory.high` (both already read by the caller — no IO here). Answers two
@@ -602,6 +622,25 @@ mod tests {
             cap_target(Some(100 * MIB), Some(0), true),
             Some(MIN_CAP_BYTES)
         );
+    }
+
+    #[test]
+    fn cap_never_loosens_an_existing_memory_high() {
+        let floor = cap_target(Some(100 * MIB), Some(0), true).unwrap();
+        assert_eq!(floor, MIN_CAP_BYTES);
+        let prev = (200 * MIB).to_string();
+        assert!(
+            !cap_tightens(Some(&prev), floor),
+            "200 MiB unit limit must not be raised to the 256 MiB floor"
+        );
+        assert!(
+            !cap_tightens(Some(&floor.to_string()), floor),
+            "equal: no-op"
+        );
+        assert!(cap_tightens(Some("max"), floor));
+        assert!(cap_tightens(None, floor));
+        let prev = (2 * GIB).to_string();
+        assert!(cap_tightens(Some(&prev), GIB));
     }
 
     #[test]
@@ -986,8 +1025,23 @@ mod tests {
         manager
             .add_to_cgroup(&abs_path, pid)
             .expect("add process to test cgroup");
-        // Give the shell time to actually build up the anon allocation.
-        std::thread::sleep(Duration::from_millis(800));
+        // Wait until the shell has actually built up the allocation, or the
+        // cap would sit on the 256 MiB floor and prove nothing.
+        let want = 300 * 1024 * 1024;
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let cur = cgfs::current_bytes(&cgroup).unwrap_or(0);
+            if cur >= want {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = manager.cleanup_cgroup("test-cap-align");
+                panic!("memory.current reached only {cur} bytes, need {want}, after 10s");
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
 
         let res = test_resolution(cgroup.clone());
         effector
