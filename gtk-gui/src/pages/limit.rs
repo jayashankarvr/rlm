@@ -1,7 +1,7 @@
 use crate::widgets::{
     cpu_suffix_label, create_io_unit_dropdown, create_unit_dropdown, get_unit_suffix,
-    limits_description, parse_cpu_value, set_value_with_unit, setup_number_validation,
-    setup_size_validation,
+    limits_description, parse_cpu_value, require_manager, set_value_with_unit,
+    setup_number_validation, setup_size_validation, NO_MANAGER_HINT,
 };
 use adw::prelude::*;
 use gtk::glib;
@@ -213,6 +213,7 @@ pub fn create(manager: Option<Arc<CgroupManager>>) -> gtk::Widget {
     apply_btn.add_css_class("pill");
     apply_btn.set_halign(gtk::Align::Center);
     apply_btn.set_margin_bottom(24);
+    require_manager(&apply_btn, manager.is_some());
 
     let button_box = gtk::Box::new(gtk::Orientation::Vertical, 12);
     button_box.append(&status_label);
@@ -725,11 +726,7 @@ fn apply_limits(state: &Rc<RefCell<LimitState>>) {
     }
 
     let Some(ref manager) = state.manager else {
-        show_status(
-            &state.status_label,
-            "Cannot set up cgroups for your user. Run rlm doctor in a terminal to see why.",
-            true,
-        );
+        show_status(&state.status_label, NO_MANAGER_HINT, true);
         return;
     };
 

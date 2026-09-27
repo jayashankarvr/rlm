@@ -70,6 +70,19 @@ pub fn create_io_unit_dropdown() -> gtk::DropDown {
     unit_dropdown(IO_UNITS)
 }
 
+/// Shown when rlm has no cgroup manager, so nothing can be limited.
+pub const NO_MANAGER_HINT: &str =
+    "Cannot set up cgroups for your user. Run rlm doctor in a terminal to see why.";
+
+/// Make an action button insensitive, with [`NO_MANAGER_HINT`] as its
+/// tooltip, when there is no cgroup manager.
+pub fn require_manager(button: &gtk::Button, has_manager: bool) {
+    if !has_manager {
+        button.set_sensitive(false);
+        button.set_tooltip_text(Some(NO_MANAGER_HINT));
+    }
+}
+
 /// The dim "% of one core" text after a CPU field.
 pub fn cpu_suffix_label() -> gtk::Label {
     let label = gtk::Label::new(Some("% of one core"));
