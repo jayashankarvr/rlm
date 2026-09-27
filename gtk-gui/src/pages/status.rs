@@ -205,6 +205,16 @@ pub struct StatusPage {
     error_page: adw::StatusPage,
     manager: Option<Arc<CgroupManager>>,
     last: RefCell<Option<StatusView>>,
+    /// The list's rows in order, each with the view its trash button acts
+    /// on. Rows are keyed by cgroup: when the same cgroups are listed again
+    /// the rows are updated in place, so focus on a trash button survives
+    /// PIDs and process counts changing.
+    rows: RefCell<Vec<(adw::ActionRow, Rc<RefCell<RowView>>)>>,
+}
+
+/// Whether rows for `old` cgroups can be updated in place to show `new`.
+fn same_cgroups(old: &[String], new: &[RowView]) -> bool {
+    old.len() == new.len() && old.iter().zip(new).all(|(a, b)| *a == b.cgroup)
 }
 
 impl StatusPage {
@@ -267,6 +277,7 @@ impl StatusPage {
             error_page,
             manager,
             last: RefCell::new(None),
+            rows: RefCell::new(Vec::new()),
         });
 
         let weak = Rc::downgrade(&this);
@@ -307,18 +318,38 @@ impl StatusPage {
             }
             StatusView::Empty => self.stack.set_visible_child_name("empty"),
             StatusView::Rows(rows) => {
-                while let Some(child) = self.list_box.first_child() {
-                    self.list_box.remove(&child);
-                }
-                for row in rows {
-                    self.list_box.append(&self.process_row(row));
+                let old: Vec<String> = self
+                    .rows
+                    .borrow()
+                    .iter()
+                    .map(|(_, v)| v.borrow().cgroup.clone())
+                    .collect();
+                if same_cgroups(&old, rows) {
+                    for ((row, shown), view) in self.rows.borrow().iter().zip(rows) {
+                        if row.title() != view.title {
+                            row.set_title(&view.title);
+                        }
+                        if row.subtitle().as_deref() != Some(view.subtitle.as_str()) {
+                            row.set_subtitle(&view.subtitle);
+                        }
+                        shown.replace(view.clone());
+                    }
+                } else {
+                    while let Some(child) = self.list_box.first_child() {
+                        self.list_box.remove(&child);
+                    }
+                    let built: Vec<_> = rows.iter().map(|r| self.process_row(r)).collect();
+                    for (row, _) in &built {
+                        self.list_box.append(row);
+                    }
+                    self.rows.replace(built);
                 }
                 self.stack.set_visible_child_name("list");
             }
         }
     }
 
-    fn process_row(self: &Rc<Self>, view: &RowView) -> adw::ActionRow {
+    fn process_row(self: &Rc<Self>, view: &RowView) -> (adw::ActionRow, Rc<RefCell<RowView>>) {
         let row = adw::ActionRow::new();
         row.set_title(&view.title);
         row.set_subtitle(&view.subtitle);
@@ -331,16 +362,18 @@ impl StatusPage {
         remove_btn.update_property(&[gtk::accessible::Property::Label(&label)]);
 
         let weak = Rc::downgrade(self);
-        let view = view.clone();
+        let shown = Rc::new(RefCell::new(view.clone()));
+        let current = shown.clone();
         remove_btn.connect_clicked(move |_| {
             if let Some(page) = weak.upgrade() {
+                let view = current.borrow().clone();
                 page.remove(&view);
             }
         });
 
         row.add_suffix(&remove_btn);
         row.set_activatable(false);
-        row
+        (row, shown)
     }
 
     fn toast(&self, toast: adw::Toast) {
@@ -491,6 +524,17 @@ mod tests {
         assert_eq!(a, b);
         let c = build_view(Some(Ok(vec![proc("b", "pid-42", false)])));
         assert_ne!(a, c);
+    }
+
+    #[test]
+    fn rows_are_kept_while_the_same_cgroups_are_listed() {
+        let a = row_view(&proc("a", "pid-1", false));
+        let mut b = row_view(&proc("b", "app-b", true));
+        let old = vec!["pid-1".to_string(), "app-b".to_string()];
+        b.title = "b (PID 7, 9 processes)".into();
+        assert!(same_cgroups(&old, &[a.clone(), b.clone()]));
+        assert!(!same_cgroups(&old, &[b.clone(), a.clone()]));
+        assert!(!same_cgroups(&old, &[a]));
     }
 
     #[test]
