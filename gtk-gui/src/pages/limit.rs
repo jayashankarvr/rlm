@@ -1,6 +1,6 @@
 use crate::widgets::{
-    cpu_suffix_label, create_io_unit_dropdown, create_unit_dropdown, get_unit_suffix,
-    limits_description, list_scroller, on_enter, parse_cpu_value, require_manager,
+    cpu_suffix_label, create_io_unit_dropdown, create_unit_dropdown, fit_list_height,
+    get_unit_suffix, limits_description, list_scroller, on_enter, parse_cpu_value, require_manager,
     set_value_with_unit, setup_number_validation, setup_size_validation, status_toast,
     with_action_bar, NO_MANAGER_HINT,
 };
@@ -739,6 +739,7 @@ fn filter_processes(state: &Rc<RefCell<LimitState>>, query: &str) {
     sync_group_buttons(&state_ref, list);
     state_ref.rebuilding.set(false);
     update_summary(&state_ref);
+    fit_list_height(list);
 }
 
 /// Memory in KB as "900 KB", "512 MB" or "1.2 GB".

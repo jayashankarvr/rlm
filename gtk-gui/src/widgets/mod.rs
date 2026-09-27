@@ -104,15 +104,39 @@ pub fn with_action_bar(
     view
 }
 
-/// A scrolled window for a list that is as tall as its rows, up to about
-/// six rows, and scrolls beyond that.
+/// Height of one list row with a subtitle, in pixels.
+const LIST_ROW_HEIGHT: i32 = 56;
+/// Rows a list shows before it scrolls.
+const LIST_VISIBLE_ROWS: i32 = 6;
+
+/// A scrolled window for a list; call [`fit_list_height`] after filling
+/// the list.
 pub fn list_scroller(list: &gtk::ListBox) -> gtk::ScrolledWindow {
     let scroll = gtk::ScrolledWindow::new();
     scroll.set_child(Some(list));
     scroll.set_hscrollbar_policy(gtk::PolicyType::Never);
     scroll.set_propagate_natural_height(true);
-    scroll.set_max_content_height(340);
+    scroll.set_max_content_height(LIST_ROW_HEIGHT * LIST_VISIBLE_ROWS);
+    fit_list_height(list);
     scroll
+}
+
+/// Make the list's scrolled window as tall as its rows, up to about six,
+/// so a short list takes no extra room and a long one scrolls.
+pub fn fit_list_height(list: &gtk::ListBox) {
+    let Some(scroll) = list
+        .ancestor(gtk::ScrolledWindow::static_type())
+        .and_downcast::<gtk::ScrolledWindow>()
+    else {
+        return;
+    };
+    let mut rows = 0;
+    let mut child = list.first_child();
+    while let Some(c) = child {
+        rows += 1;
+        child = c.next_sibling();
+    }
+    scroll.set_min_content_height(LIST_ROW_HEIGHT * rows.clamp(1, LIST_VISIBLE_ROWS));
 }
 
 /// A success toast whose "Open" button shows the Managed Processes page,
