@@ -1,6 +1,6 @@
 use crate::widgets::{
-    cpu_suffix_label, create_io_unit_dropdown, create_unit_dropdown, get_unit_suffix,
-    limits_description, list_scroller, on_enter, parse_cpu_value, require_manager,
+    cpu_suffix_label, create_io_unit_dropdown, create_unit_dropdown, fit_list_height,
+    get_unit_suffix, limits_description, list_scroller, on_enter, parse_cpu_value, require_manager,
     set_value_with_unit, setup_number_validation, setup_size_validation, status_toast,
     with_action_bar, NO_MANAGER_HINT,
 };
@@ -91,7 +91,8 @@ pub fn create(manager: Option<Arc<CgroupManager>>) -> gtk::Widget {
 
     // App list
     let app_list = gtk::ListBox::new();
-    app_list.set_selection_mode(gtk::SelectionMode::None);
+    // The picked app stays highlighted while the command is its command.
+    app_list.set_selection_mode(gtk::SelectionMode::Single);
     app_list.add_css_class("boxed-list");
 
     let scroll = list_scroller(&app_list);
@@ -225,6 +226,19 @@ pub fn create(manager: Option<Arc<CgroupManager>>) -> gtk::Widget {
         run_command(&state_clone);
     });
 
+    // Editing the command away from the picked app's drops the highlight.
+    let app_list_clone = app_list.clone();
+    command_entry.connect_changed(move |entry| {
+        let picked = app_list_clone
+            .selected_row()
+            .and_downcast::<adw::ActionRow>()
+            .and_then(|row| row.subtitle());
+        let text = glib::markup_escape_text(&entry.text());
+        if picked.is_some_and(|sub| sub != text) {
+            app_list_clone.unselect_all();
+        }
+    });
+
     // Enter in a field does what the button does.
     let state_clone = state.clone();
     on_enter(
@@ -296,6 +310,7 @@ fn filter_apps(state: &Rc<RefCell<RunState>>, query: &str) {
         } else {
             "No matching applications"
         });
+        row.set_selectable(false);
         list.append(&row);
     } else {
         for app in filtered {
@@ -311,8 +326,12 @@ fn filter_apps(state: &Rc<RefCell<RunState>>, query: &str) {
             });
 
             list.append(&row);
+            if app.exec == state_ref.command_entry.text().as_str() {
+                list.select_row(Some(&row));
+            }
         }
     }
+    fit_list_height(list);
 }
 
 /// The profile name a dropdown shows, or `None` for "(None)".
@@ -436,13 +455,14 @@ fn run_command(state: &Rc<RefCell<RunState>>) {
         }
     };
 
-    let parts: Vec<&str> = command_text.split_whitespace().collect();
-    if parts.is_empty() {
-        show_status(&state.status_label, "Enter a command", true);
-        return;
-    }
-
-    let program = parts[0];
+    let parts = match split_command(&command_text) {
+        Ok(parts) => parts,
+        Err(message) => {
+            show_status(&state.status_label, &message, true);
+            return;
+        }
+    };
+    let program = parts[0].as_str();
     let args = &parts[1..];
 
     let count = RUN_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -562,6 +582,24 @@ fn run_command(state: &Rc<RefCell<RunState>>) {
     });
 }
 
+/// Split a command line like a shell does (quotes group words), without
+/// running a shell. Always at least one word on success.
+fn split_command(text: &str) -> Result<Vec<String>, String> {
+    if text.trim().is_empty() {
+        return Err("Enter a command".into());
+    }
+    let argv = glib::shell_parse_argv(text)
+        .map_err(|e| format!("Could not read the command: {}", e.message()))?;
+    let parts: Vec<String> = argv
+        .into_iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    if parts.is_empty() {
+        return Err("Enter a command".into());
+    }
+    Ok(parts)
+}
+
 /// What the post-exit cleanup does with a launched app's cgroup on one poll.
 #[derive(Debug, PartialEq, Eq)]
 enum CleanupStep {
@@ -668,6 +706,20 @@ fn find_widget_by_name(widget: &gtk::Widget, name: &str) -> Option<gtk::Widget> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn commands_split_like_a_shell() {
+        assert_eq!(
+            split_command("'/opt/My App/app' --flag").unwrap(),
+            ["/opt/My App/app", "--flag"]
+        );
+        assert_eq!(
+            split_command(r#"sh -c "echo hi; sleep 1""#).unwrap(),
+            ["sh", "-c", "echo hi; sleep 1"]
+        );
+        assert_eq!(split_command("  ").unwrap_err(), "Enter a command");
+        assert!(split_command("app 'open").is_err());
+    }
 
     #[test]
     fn cleanup_keeps_polling_while_the_cgroup_exists() {
