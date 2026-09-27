@@ -376,17 +376,22 @@ pub fn create() -> gtk::Widget {
     page.set_title("Guard");
     page.set_icon_name(Some("security-high-symbolic"));
 
+    // The on/off switch is a control, not part of the status readout, so it
+    // gets its own group (and the spacing that comes with it).
+    let control_group = adw::PreferencesGroup::new();
+    let switch = adw::SwitchRow::new();
+    switch.set_widget_name("guard-switch");
+    switch.set_title("Run the guard");
+    switch.set_subtitle(SWITCH_SUBTITLE);
+    control_group.add(&switch);
+    page.add(&control_group);
+
     let status_group = adw::PreferencesGroup::new();
     status_group.set_title("Status");
     let refresh_btn = gtk::Button::from_icon_name("view-refresh-symbolic");
     refresh_btn.add_css_class("flat");
     refresh_btn.set_tooltip_text(Some("Refresh"));
     status_group.set_header_suffix(Some(&refresh_btn));
-    let switch = adw::SwitchRow::new();
-    switch.set_widget_name("guard-switch");
-    switch.set_title("Run the guard");
-    switch.set_subtitle(SWITCH_SUBTITLE);
-    status_group.add(&switch);
     let status_list = new_list_box("guard-status-list");
     status_group.add(&status_list);
     page.add(&status_group);
