@@ -44,6 +44,15 @@ fn sanitize_cgroup_name(name: &str) -> Result<&str> {
 
 /// Refuse to limit init (PID 1). Constraining PID 1 (systemd/init) can wedge or
 /// freeze the entire system — the opposite of what this tool is for.
+/// Error for a process that already sits in another rlm cgroup. The hint
+/// always names the cgroup: `rlm unlimit --cgroup` works for every rlm
+/// cgroup, while `rlm unlimit --pid` refuses any cgroup other than `pid-N`.
+fn already_limited(pid: u32, cgroup: &str) -> Error {
+    Error::InvalidArgs(format!(
+        "process {pid} is already limited in cgroup '{cgroup}'; run rlm unlimit --cgroup {cgroup} first"
+    ))
+}
+
 fn reject_critical_pid(pid: u32) -> Result<()> {
     if pid <= 1 {
         return Err(Error::InvalidArgs(format!(
@@ -267,10 +276,9 @@ impl CgroupManager {
                 tracing::info!(pid, "updated existing limits");
                 return Ok(warnings);
             }
-            // Process is in a different cgroup (run-* or gtk-*)
-            return Err(Error::InvalidArgs(format!(
-                "process {pid} is already limited in cgroup '{existing_cgroup}'; run rlm unlimit --pid {pid} first"
-            )));
+            // Process is in a shared, run-* or gtk-* cgroup. `unlimit --pid`
+            // refuses those, so the hint names the whole cgroup.
+            return Err(already_limited(pid, &existing_cgroup));
         }
 
         let Prepared {
@@ -321,9 +329,7 @@ impl CgroupManager {
             if let Some(existing_cgroup) = self.find_cgroup_for_pid(*pid) {
                 // Allow if it's already in the same cgroup we're creating
                 if existing_cgroup != safe_name {
-                    return Err(Error::InvalidArgs(format!(
-                        "process {pid} is already limited in cgroup '{existing_cgroup}'; run rlm unlimit --cgroup {existing_cgroup} first"
-                    )));
+                    return Err(already_limited(*pid, &existing_cgroup));
                 }
             }
         }
@@ -752,6 +758,18 @@ mod tests {
     fn rejects_init_and_kernel_pids() {
         assert!(reject_critical_pid(0).is_err()); // kernel/swapper
         assert!(reject_critical_pid(1).is_err()); // init/systemd
+    }
+
+    #[test]
+    fn already_limited_hint_names_the_cgroup() {
+        let msg = already_limited(1234, "app-firefox").to_string();
+        assert!(
+            msg.contains("rlm unlimit --cgroup app-firefox"),
+            "hint must name the shared cgroup: {msg}"
+        );
+        assert!(!msg.contains("--pid"), "--pid does not work here: {msg}");
+        let run = already_limited(99, "run-7").to_string();
+        assert!(run.contains("rlm unlimit --cgroup run-7"), "{run}");
     }
 
     #[test]

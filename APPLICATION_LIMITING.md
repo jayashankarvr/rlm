@@ -173,13 +173,11 @@ A process can be in only one rlm cgroup.
 
 - Limiting a process again with `--pid` or `--name` while it has its own `pid-N` limit replaces that limit with the new values.
 - Limiting processes with `--application` or `--all-pids` into the shared cgroup they are already in updates that cgroup.
-- Any other combination fails. With `--application` or `--all-pids` the error names the cgroup the process is in, for example:
+- Any other combination fails. The error names the cgroup the process is in and how to remove it, for example:
 
 ```
-process 1234 is already limited in cgroup 'pid-1234'; run rlm unlimit --cgroup pid-1234 first
+process 1234 is already limited in cgroup 'app-firefox'; run rlm unlimit --cgroup app-firefox first
 ```
-
-- With `--pid` or `--name` for a process in a shared or `run-*` cgroup, the error currently reads `process 1234 is already limited in cgroup 'app-firefox'; run rlm unlimit --pid 1234 first`. That hint does not work there; use `rlm unlimit --cgroup app-firefox` instead.
 
 Remove the existing limit, then apply the new one:
 
