@@ -16,6 +16,11 @@ pub const NAV_PAGES: [(&str, &str, &str); 5] = [
     ("guard", "Guard", "security-high-symbolic"),
 ];
 
+/// Shown at the top of the content area when the cgroup manager could not
+/// be set up.
+const UNAVAILABLE_BANNER: &str =
+    "Resource limiting is unavailable. Run rlm doctor in a terminal to see why.";
+
 /// The sidebar row index for a page id, or `None` if it isn't a nav page.
 pub fn nav_index(page: &str) -> Option<usize> {
     NAV_PAGES.iter().position(|(id, _, _)| *id == page)
@@ -215,6 +220,13 @@ impl Window {
         let content_header = adw::HeaderBar::new();
         let content_toolbar = adw::ToolbarView::new();
         content_toolbar.add_top_bar(&content_header);
+        if self.manager().is_none() {
+            // Stays up for the whole session: nothing on the Limit or Launch
+            // pages can work until the cause is fixed and the app restarted.
+            let banner = adw::Banner::new(UNAVAILABLE_BANNER);
+            banner.set_revealed(true);
+            content_toolbar.add_top_bar(&banner);
+        }
         let toast_overlay = adw::ToastOverlay::new();
         toast_overlay.set_child(Some(&content_stack));
         content_toolbar.set_content(Some(&toast_overlay));

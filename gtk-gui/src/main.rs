@@ -20,31 +20,21 @@ fn main() -> gtk::glib::ExitCode {
 }
 
 fn build_ui(app: &adw::Application) {
-    // Initialize cgroup manager
-    let (manager, error) = match CgroupManager::new() {
-        Ok(m) => (Some(Arc::new(m)), None),
+    // Launching the app again while it runs brings the open window forward.
+    if let Some(window) = app.active_window() {
+        window.present();
+        return;
+    }
+
+    // Without a cgroup manager the window shows a banner that says so.
+    let manager = match CgroupManager::new() {
+        Ok(m) => Some(Arc::new(m)),
         Err(e) => {
             tracing::error!("Failed to initialize cgroup manager: {e}");
-            (None, Some(e.to_string()))
+            None
         }
     };
 
     let window = window::Window::new(app, manager);
     window.present();
-
-    // Show error dialog if cgroup manager failed
-    if let Some(err_msg) = error {
-        let dialog = adw::MessageDialog::new(
-            Some(&window),
-            Some("Resource Limiting Unavailable"),
-            Some(&format!(
-                "Cannot manage resource limits: {}\n\n\
-                 Run 'rlm doctor' in a terminal for setup instructions.",
-                err_msg
-            )),
-        );
-        dialog.add_response("ok", "OK");
-        dialog.set_default_response(Some("ok"));
-        dialog.present();
-    }
 }
