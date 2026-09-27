@@ -7,11 +7,12 @@ use std::cell::RefCell;
 use std::sync::Arc;
 
 /// The sidebar pages, in display order: (id, title, icon).
-pub const NAV_PAGES: [(&str, &str, &str); 5] = [
+pub const NAV_PAGES: [(&str, &str, &str); 6] = [
     ("status", "Managed Processes", "view-list-symbolic"),
     ("limit", "Limit Running", "power-profile-balanced-symbolic"),
     ("run", "Launch New", "media-playback-start-symbolic"),
     ("profiles", "Profiles", "document-properties-symbolic"),
+    ("guard", "Guard", "security-high-symbolic"),
     ("about", "About", "help-about-symbolic"),
 ];
 
@@ -106,12 +107,14 @@ impl Window {
         let limit_page = pages::limit::create(self.manager());
         let run_page = pages::run::create(self.manager());
         let profiles_page = pages::profiles::create();
+        let guard_page = pages::guard::create();
         let about_page = pages::about::create();
 
         content_stack.add_named(&status_page, Some("status"));
         content_stack.add_named(&limit_page, Some("limit"));
         content_stack.add_named(&run_page, Some("run"));
         content_stack.add_named(&profiles_page, Some("profiles"));
+        content_stack.add_named(&guard_page, Some("guard"));
         content_stack.add_named(&about_page, Some("about"));
 
         // Create sidebar
@@ -131,6 +134,7 @@ impl Window {
         let status_page_clone = status_page.clone();
         let limit_page_clone = limit_page.clone();
         let run_page_clone = run_page.clone();
+        let guard_page_clone = guard_page.clone();
         let manager_clone = self.manager();
         sidebar_list.connect_row_selected(move |_, row| {
             if let Some(row) = row {
@@ -147,6 +151,9 @@ impl Window {
                         }
                         "run" => {
                             pages::run::refresh_profiles(&run_page_clone);
+                        }
+                        "guard" => {
+                            pages::guard::refresh(&guard_page_clone);
                         }
                         _ => {}
                     }
@@ -193,8 +200,8 @@ impl Window {
 
         self.set_content(Some(&split_view));
 
-        // Start auto-refresh for status page
-        self.setup_auto_refresh(&content_stack, &status_page);
+        // Start auto-refresh for the status and guard pages
+        self.setup_auto_refresh(&content_stack, &status_page, &guard_page);
     }
 
     fn create_sidebar_row(id: &str, title: &str, icon_name: &str) -> gtk::ListBoxRow {
@@ -223,16 +230,25 @@ impl Window {
         row
     }
 
-    fn setup_auto_refresh(&self, stack: &gtk::Stack, status_page: &gtk::Widget) {
+    fn setup_auto_refresh(
+        &self,
+        stack: &gtk::Stack,
+        status_page: &gtk::Widget,
+        guard_page: &gtk::Widget,
+    ) {
         let stack_clone = stack.clone();
         let status_page_clone = status_page.clone();
+        let guard_page_clone = guard_page.clone();
         let manager = self.manager();
 
         glib::timeout_add_local(std::time::Duration::from_secs(2), move || {
-            if stack_clone.visible_child().as_ref() == Some(&status_page_clone) {
+            let visible = stack_clone.visible_child();
+            if visible.as_ref() == Some(&status_page_clone) {
                 if let Some(ref mgr) = manager {
                     pages::status::refresh(&status_page_clone, mgr.clone());
                 }
+            } else if visible.as_ref() == Some(&guard_page_clone) {
+                pages::guard::refresh(&guard_page_clone);
             }
             glib::ControlFlow::Continue
         });

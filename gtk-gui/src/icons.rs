@@ -22,6 +22,7 @@ mod tests {
     const SOURCES: &[(&str, &str)] = &[
         ("window.rs", include_str!("window.rs")),
         ("pages/about.rs", include_str!("pages/about.rs")),
+        ("pages/guard.rs", include_str!("pages/guard.rs")),
         ("pages/limit.rs", include_str!("pages/limit.rs")),
         ("pages/profiles.rs", include_str!("pages/profiles.rs")),
         ("pages/run.rs", include_str!("pages/run.rs")),
