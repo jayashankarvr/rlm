@@ -194,13 +194,13 @@ impl Window {
         let status_page = pages::status::StatusPage::new(self.manager());
         let limit_page = pages::limit::create(self.manager());
         let run_page = pages::run::create(self.manager());
-        let profiles_page = pages::profiles::create();
+        let profiles_page = pages::profiles::ProfilesPage::new();
         let guard_page = pages::guard::GuardPage::new();
 
         content_stack.add_named(&status_page.widget(), Some("status"));
         content_stack.add_named(&limit_page, Some("limit"));
         content_stack.add_named(&run_page, Some("run"));
-        content_stack.add_named(&profiles_page, Some("profiles"));
+        content_stack.add_named(&profiles_page.widget(), Some("profiles"));
         content_stack.add_named(&guard_page.widget(), Some("guard"));
 
         // Create sidebar
@@ -239,6 +239,7 @@ impl Window {
         let status_page_clone = status_page.clone();
         let limit_page_clone = limit_page.clone();
         let run_page_clone = run_page.clone();
+        let profiles_page_clone = profiles_page.clone();
         let guard_page_clone = guard_page.clone();
         sidebar_list.connect_row_selected(move |_, row| {
             let Some(row) = row else { return };
@@ -262,6 +263,7 @@ impl Window {
                 "run" => {
                     pages::run::refresh_profiles(&run_page_clone);
                 }
+                "profiles" => profiles_page_clone.refresh(),
                 "guard" => guard_page_clone.refresh(),
                 _ => {}
             }

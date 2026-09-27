@@ -12,6 +12,7 @@ pub const STOCK_ICONS: &[&str] = &[
     "document-edit-symbolic",
     "user-trash-symbolic",
     "dialog-warning-symbolic",
+    "edit-undo-symbolic",
     "adw-external-link-symbolic",
 ];
 
