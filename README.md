@@ -216,9 +216,8 @@ Launch with `rlm-gtk`. Pages:
 - **Launch New**: start a command with limits
 - **Profiles**: create, edit and delete profiles
 - **Guard**: service state, pressure, active interventions and history
-- **About**: version and license
 
-Ctrl+1 to Ctrl+6 switch pages. Ctrl+Q quits. The GUI hides processes on the protect list; use the CLI with `--force` if you really need to limit one.
+The menu button in the sidebar opens Keyboard Shortcuts and About (version and license). Ctrl+1 to Ctrl+5 switch pages. Ctrl+Q quits. The GUI hides processes on the protect list; use the CLI with `--force` if you really need to limit one.
 
 ## Freeze guard
 

@@ -6,12 +6,13 @@ pub const STOCK_ICONS: &[&str] = &[
     "media-playback-start-symbolic",
     "document-properties-symbolic",
     "security-high-symbolic",
-    "help-about-symbolic",
+    "open-menu-symbolic",
     "view-refresh-symbolic",
     "list-add-symbolic",
     "document-edit-symbolic",
     "user-trash-symbolic",
     "dialog-warning-symbolic",
+    "edit-undo-symbolic",
     "adw-external-link-symbolic",
 ];
 
@@ -21,7 +22,6 @@ mod tests {
 
     const SOURCES: &[(&str, &str)] = &[
         ("window.rs", include_str!("window.rs")),
-        ("pages/about.rs", include_str!("pages/about.rs")),
         ("pages/guard.rs", include_str!("pages/guard.rs")),
         ("pages/limit.rs", include_str!("pages/limit.rs")),
         ("pages/profiles.rs", include_str!("pages/profiles.rs")),
