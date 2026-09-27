@@ -197,6 +197,19 @@ pub fn parse_populated(events: &str) -> Option<bool> {
     })
 }
 
+/// Pure parser: the value of the `key` line in a flat keyed file such as
+/// `memory.events`. The first token must equal `key` exactly, so `oom` does
+/// not match `oom_kill`.
+pub fn parse_events_field(content: &str, key: &str) -> Option<u64> {
+    content.lines().find_map(|l| {
+        let mut it = l.split_whitespace();
+        if it.next()? != key {
+            return None;
+        }
+        it.next()?.parse().ok()
+    })
+}
+
 /// Pure parser: extract anon memory value from memory.stat text.
 /// Looks for "anon <value>" line and returns the parsed value, or None if not found.
 pub fn parse_anon(stat: &str) -> Option<u64> {
@@ -240,6 +253,14 @@ mod tests {
         assert_eq!(parse_populated("populated 1\nfrozen 0\n"), Some(true));
         assert_eq!(parse_populated("populated 0\nfrozen 1\n"), Some(false));
         assert_eq!(parse_populated("frozen 0\n"), None);
+    }
+
+    #[test]
+    fn parse_events_field_matches_exact_key() {
+        let ev = "low 0\nhigh 3\nmax 10\noom 1\noom_kill 2\n";
+        assert_eq!(parse_events_field(ev, "oom_kill"), Some(2));
+        assert_eq!(parse_events_field(ev, "oom"), Some(1));
+        assert_eq!(parse_events_field(ev, "oom_group_kill"), None);
     }
 
     #[test]
@@ -341,7 +362,8 @@ mod tests {
         let manager = CgroupManager::new().expect("create CgroupManager");
         let abs_path = manager
             .prepare_cgroup("test-pids-under", &Limit::default())
-            .expect("create test cgroup");
+            .expect("create test cgroup")
+            .path;
         let cgroup = format!(
             "/{}",
             abs_path

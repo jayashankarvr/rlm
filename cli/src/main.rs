@@ -359,7 +359,9 @@ fn run() -> Result<ExitCode> {
 
             if is_shared {
                 // Apply shared limits to all processes
-                manager.apply_limit_to_multiple(&pids, &limit, &cgroup_name)?;
+                for w in manager.apply_limit_to_multiple(&pids, &limit, &cgroup_name)? {
+                    eprintln!("warning: {w}");
+                }
                 println!(
                     "Applied shared limits to {} process(es) in cgroup '{}'",
                     pids.len(),
@@ -396,7 +398,9 @@ fn run() -> Result<ExitCode> {
             } else {
                 // Apply individual limits to each process
                 for pid in &pids {
-                    manager.apply_limit(*pid, &limit)?;
+                    for w in manager.apply_limit(*pid, &limit)? {
+                        eprintln!("warning: {w}");
+                    }
                     println!("applied limits to pid {pid}");
                 }
             }
@@ -608,6 +612,15 @@ fn run() -> Result<ExitCode> {
                     );
                 }
                 println!("\nNote: 'shared' means multiple processes share the same limit pool");
+            }
+
+            let empty = rlm_core::status::empty_cgroups(&manager);
+            if !empty.is_empty() {
+                println!(
+                    "note: {} empty rlm cgroup(s): {}. Remove with: rlm unlimit --cgroup <name>",
+                    empty.len(),
+                    empty.join(", ")
+                );
             }
         }
 
@@ -1005,7 +1018,11 @@ fn run_with_limits(
     let cgroup_name = format!("run-{}-{}", std::process::id(), uniq);
 
     // Create cgroup and set limits BEFORE spawning the process
-    let cgroup_path = manager.prepare_cgroup(&cgroup_name, limit)?;
+    let prepared = manager.prepare_cgroup(&cgroup_name, limit)?;
+    for w in &prepared.warnings {
+        eprintln!("warning: {w}");
+    }
+    let cgroup_path = prepared.path;
 
     // Set up signal handler
     let terminated = Arc::new(AtomicBool::new(false));

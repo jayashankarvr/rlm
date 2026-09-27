@@ -15,139 +15,108 @@ pub struct ProcessStatus {
     pub io_write_bps: Option<u64>,
     pub is_shared: bool,
     pub process_count: Option<usize>,
+    pub populated: bool,
 }
 
-/// Get status of all processes managed by rlm
-pub fn get_managed_processes(manager: &CgroupManager) -> Result<Vec<ProcessStatus>> {
+/// Names of the cgroups under rlm's base that `status` reports on:
+/// "pid-N" (`rlm limit`), "app-*" and "multi-*" (shared limits), "run-*"
+/// (`rlm run`) and "gtk-*" (GUI run). The `unlimit` bucket is never one.
+fn managed_cgroup_names(manager: &CgroupManager) -> Result<Vec<String>> {
     let base = manager.base_path();
     if !base.exists() {
         return Ok(Vec::new());
     }
-
-    let mut results = Vec::new();
-    let mut dead_cgroups = Vec::new();
-
+    let mut names = Vec::new();
     for entry in fs::read_dir(base)? {
         let entry = entry?;
-        let path = entry.path();
-
-        if !path.is_dir() {
+        if !entry.path().is_dir() {
             continue;
         }
-
-        let Some(cgroup_name) = path.file_name().and_then(|n| n.to_str()) else {
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
             continue;
         };
-
-        // Skip the "unlimit" cgroup (holds released processes)
-        if cgroup_name == UNLIMIT_CGROUP_NAME {
+        if name == UNLIMIT_CGROUP_NAME {
             continue;
         }
+        if ["pid-", "app-", "multi-", "run-", "gtk-"]
+            .iter()
+            .any(|p| name.starts_with(p))
+        {
+            names.push(name);
+        }
+    }
+    names.sort();
+    Ok(names)
+}
 
-        // Extract PID from cgroup directory name patterns:
-        // - "pid-XXXX" (CLI limit command - individual)
-        // - "app-XXXX" (CLI limit --application - shared)
-        // - "multi-XXXX" (CLI limit --all-pids - shared)
-        // - "run-XXXX-XXXX" (CLI run command: pid + timestamp)
-        // - "gtk-XXXX-N" (GUI run command)
-        let pid = if let Some(pid_str) = cgroup_name.strip_prefix("pid-") {
-            pid_str.parse::<u32>().ok()
-        } else if cgroup_name.starts_with("app-") || cgroup_name.starts_with("multi-") {
-            // For shared cgroups, read first PID from cgroup.procs
-            read_first_pid(&path)
-        } else if cgroup_name.starts_with("run-") || cgroup_name.starts_with("gtk-") {
-            // For run-* and gtk-* cgroups, read PID from cgroup.procs
-            read_first_pid(&path)
-        } else {
+/// Get status of all processes managed by rlm. Read-only: it never removes
+/// or changes a cgroup, so a GUI refresh loop can call it safely. A cgroup
+/// is listed while it is populated; `pid` is the first PID in its
+/// `cgroup.procs` (0 if none) and `name` that process's comm, or "?".
+pub fn get_managed_processes(manager: &CgroupManager) -> Result<Vec<ProcessStatus>> {
+    let base = manager.base_path();
+    let mut results = Vec::new();
+
+    for cgroup_name in managed_cgroup_names(manager)? {
+        if manager.is_populated(&cgroup_name) != Some(true) {
             continue;
-        };
-
-        let Some(pid) = pid else {
-            // No PID found - cgroup is empty. Only reap it if it isn't freshly
-            // created: another `limit`/`run` invocation may have created the
-            // cgroup and not yet written its PID into cgroup.procs. Reaping it
-            // mid-setup would race-delete a cgroup that's about to be used.
-            // Reaping is merely DEFERRED here, not skipped: a genuinely-dead
-            // fresh cgroup is collected on the next status pass once 2s elapse.
-            if !recently_modified(&path, 2) {
-                dead_cgroups.push(cgroup_name.to_string());
-            }
-            continue;
-        };
-
-        // Check if process still exists
-        let proc_path = format!("/proc/{pid}/comm");
-        let proc_name = match fs::read_to_string(&proc_path) {
-            Ok(s) => s.trim().to_string(),
-            Err(_) => {
-                // Process is dead, mark cgroup for cleanup
-                dead_cgroups.push(cgroup_name.to_string());
-                continue;
-            }
-        };
+        }
+        let path = base.join(&cgroup_name);
 
         let memory_max = parse_memory_max(&path);
         let cpu_quota = parse_cpu_quota(&path);
         let (io_read_bps, io_write_bps) = parse_io_limits(&path);
 
-        // Skip processes with no active limits (all set to max/unlimited)
+        // Skip cgroups with no active limits (all set to max/unlimited)
         if memory_max.is_none()
             && cpu_quota.is_none()
             && io_read_bps.is_none()
             && io_write_bps.is_none()
         {
-            dead_cgroups.push(cgroup_name.to_string());
             continue;
         }
 
-        // Check if this is a shared cgroup
-        let is_shared = cgroup_name.starts_with("app-")
-            || cgroup_name.starts_with("multi-")
-            || cgroup_name.starts_with("run-")
-            || cgroup_name.starts_with("gtk-");
+        let pid = read_first_pid(&path).unwrap_or(0);
+        let name = fs::read_to_string(format!("/proc/{pid}/comm"))
+            .ok()
+            .filter(|_| pid != 0)
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|| "?".to_string());
 
-        // Count processes in shared cgroups
+        let is_shared = !cgroup_name.starts_with("pid-");
         let process_count = if is_shared {
-            if let Ok(content) = fs::read_to_string(path.join("cgroup.procs")) {
-                Some(content.lines().filter(|l| !l.trim().is_empty()).count())
-            } else {
-                None
-            }
+            fs::read_to_string(path.join("cgroup.procs"))
+                .ok()
+                .map(|c| c.lines().filter(|l| !l.trim().is_empty()).count())
         } else {
             None
         };
 
         results.push(ProcessStatus {
             pid,
-            name: proc_name,
-            cgroup_name: cgroup_name.to_string(),
+            name,
+            cgroup_name,
             memory_max,
             cpu_quota,
             io_read_bps,
             io_write_bps,
             is_shared,
             process_count,
+            populated: true,
         });
-    }
-
-    // Clean up dead cgroups
-    for cgroup_name in dead_cgroups {
-        if let Err(e) = manager.cleanup_cgroup(&cgroup_name) {
-            tracing::debug!("Failed to cleanup dead cgroup {}: {}", cgroup_name, e);
-        }
     }
 
     Ok(results)
 }
 
-/// Whether `path` was modified within the last `secs` seconds.
-fn recently_modified(path: &Path, secs: u64) -> bool {
-    fs::metadata(path)
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|t| t.elapsed().ok())
-        .map(|age| age.as_secs() < secs)
-        .unwrap_or(false)
+/// Names of rlm cgroups that hold no process, sorted. `status` reports them
+/// but never removes them.
+pub fn empty_cgroups(manager: &CgroupManager) -> Vec<String> {
+    managed_cgroup_names(manager)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|n| manager.is_populated(n) == Some(false))
+        .collect()
 }
 
 fn read_first_pid(cgroup_path: &Path) -> Option<u32> {
@@ -209,4 +178,46 @@ fn parse_io_limits(cgroup_path: &Path) -> (Option<u64>, Option<u64>) {
     }
 
     (read_bps, write_bps)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    fn cg(dir: &Path, name: &str, procs: &str, populated: bool) {
+        let p = dir.join(name);
+        fs::create_dir(&p).unwrap();
+        fs::write(p.join("cgroup.procs"), procs).unwrap();
+        fs::write(
+            p.join("cgroup.events"),
+            format!("populated {}\nfrozen 0\n", u8::from(populated)),
+        )
+        .unwrap();
+        fs::write(p.join("memory.max"), "104857600\n").unwrap();
+    }
+
+    #[test]
+    fn status_is_read_only() {
+        let dir = tempfile::tempdir().unwrap();
+        cg(dir.path(), "run-1-2", "", false);
+        let m = CgroupManager::at(dir.path().to_path_buf());
+        assert!(get_managed_processes(&m).unwrap().is_empty());
+        assert!(
+            dir.path().join("run-1-2").exists(),
+            "status must never remove cgroups"
+        );
+        assert_eq!(empty_cgroups(&m), vec!["run-1-2".to_string()]);
+    }
+
+    #[test]
+    fn populated_cgroup_is_listed_even_if_its_first_pid_is_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        cg(dir.path(), "app-firefox", "999999999\n", true);
+        let m = CgroupManager::at(dir.path().to_path_buf());
+        let s = get_managed_processes(&m).unwrap();
+        assert_eq!(s.len(), 1);
+        assert_eq!(s[0].name, "?");
+        assert!(s[0].populated);
+    }
 }

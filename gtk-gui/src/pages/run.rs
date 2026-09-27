@@ -432,8 +432,8 @@ fn run_command(state: &Rc<RefCell<RunState>>) {
     let count = RUN_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let cgroup_name = format!("gtk-{}-{}", std::process::id(), count);
 
-    let cgroup_path = match manager.prepare_cgroup(&cgroup_name, &limit) {
-        Ok(p) => p,
+    let (cgroup_path, warnings) = match manager.prepare_cgroup(&cgroup_name, &limit) {
+        Ok(p) => (p.path, p.warnings),
         Err(e) => {
             show_status(
                 &state.status_label,
@@ -473,8 +473,16 @@ fn run_command(state: &Rc<RefCell<RunState>>) {
     *state.running_pid.borrow_mut() = Some(pid);
     *state.cgroup_name.borrow_mut() = Some(cgroup_name.clone());
 
-    // Show success toast
-    state.status_label.set_text("");
+    // Show success toast; non-fatal warnings (e.g. I/O limits) go in the label.
+    if warnings.is_empty() {
+        state.status_label.set_text("");
+    } else {
+        show_status(
+            &state.status_label,
+            &format!("Warning: {}", warnings.join("; ")),
+            true,
+        );
+    }
     let toast = adw::Toast::new(&format!("Started {} (PID {})", program, pid));
     toast.set_timeout(3);
     state.toast_overlay.add_toast(toast);

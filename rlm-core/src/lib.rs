@@ -5,4 +5,4 @@ pub mod process;
 pub mod rules;
 pub mod status;
 
-pub use cgroup::CgroupManager;
+pub use cgroup::{CgroupManager, Prepared};

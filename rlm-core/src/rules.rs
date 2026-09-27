@@ -259,7 +259,10 @@ fn apply(
                 return Ok(false);
             }
             // prepare_cgroup creates the cgroup (idempotent) and (re)sets limits.
-            mgr.prepare_cgroup(&rule.cgroup, &rule.limit)?;
+            let prepared = mgr.prepare_cgroup(&rule.cgroup, &rule.limit)?;
+            for w in &prepared.warnings {
+                tracing::warn!(cgroup = %rule.cgroup, "{w}");
+            }
             match cgroup_inode(mgr, &rule.cgroup) {
                 Some(ino) => ensured.insert(rule.cgroup.clone(), ino),
                 None => ensured.remove(&rule.cgroup),

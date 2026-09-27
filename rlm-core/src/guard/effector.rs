@@ -849,7 +849,8 @@ mod tests {
 
         let abs_path = manager
             .prepare_cgroup("test-freeze-thaw", &Limit::default())
-            .expect("create test cgroup");
+            .expect("create test cgroup")
+            .path;
         let cgroup = format!(
             "/{}",
             abs_path
@@ -1005,7 +1006,8 @@ mod tests {
 
         let abs_path = manager
             .prepare_cgroup("test-cap-align", &Limit::default())
-            .expect("create test cgroup");
+            .expect("create test cgroup")
+            .path;
         let cgroup = format!(
             "/{}",
             abs_path
@@ -1204,7 +1206,8 @@ mod tests {
 
         let abs_path = manager
             .prepare_cgroup("test-chain-restore", &Limit::default())
-            .expect("create test cgroup");
+            .expect("create test cgroup")
+            .path;
         let cgroup = format!(
             "/{}",
             abs_path

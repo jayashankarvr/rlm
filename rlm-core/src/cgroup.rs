@@ -53,6 +53,35 @@ fn reject_critical_pid(pid: u32) -> Result<()> {
     Ok(())
 }
 
+/// Result of [`CgroupManager::prepare_cgroup`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Prepared {
+    /// Absolute path of the cgroup directory.
+    pub path: PathBuf,
+    /// Whether this call created the directory (false when it already existed).
+    pub created: bool,
+    /// Non-fatal problems, such as I/O limits the kernel refused.
+    pub warnings: Vec<String>,
+}
+
+/// One `io.max` line per device, e.g. `8:0 rbps=5242880 wbps=1048576`.
+/// The kernel parses one device per write, so each line is written on its own.
+pub fn io_max_lines(devices: &[(u32, u32)], limit: IoLimit) -> Vec<String> {
+    devices
+        .iter()
+        .map(|(major, minor)| {
+            let mut line = format!("{major}:{minor}");
+            if let Some(rbps) = limit.read_bps {
+                line.push_str(&format!(" rbps={rbps}"));
+            }
+            if let Some(wbps) = limit.write_bps {
+                line.push_str(&format!(" wbps={wbps}"));
+            }
+            line
+        })
+        .collect()
+}
+
 pub struct CgroupManager {
     base_path: PathBuf,
 }
@@ -65,14 +94,20 @@ impl CgroupManager {
             return Err(Error::CgroupsV2NotAvailable(PathBuf::from(CGROUP_ROOT)));
         }
 
-        // Try to find a suitable cgroup path with delegated controllers
-        let base_path = Self::find_delegated_cgroup()?;
-
-        Ok(Self { base_path })
+        Ok(Self {
+            base_path: Self::default_base_path(),
+        })
     }
 
-    /// Find a cgroup path where we have write access and controllers are delegated
-    fn find_delegated_cgroup() -> Result<PathBuf> {
+    /// A manager rooted at `base_path`, with no checks. For tests and
+    /// diagnostics.
+    pub fn at(base_path: PathBuf) -> Self {
+        Self { base_path }
+    }
+
+    /// rlm's base cgroup: `user@UID.service/rlm` when the user's systemd
+    /// service cgroup exists, else `/sys/fs/cgroup/rlm`.
+    pub fn default_base_path() -> PathBuf {
         // Determine our real UID from the kernel via /proc/self/status — NOT from
         // the `$UID` environment variable, which is caller-controllable and must
         // not be allowed to steer which cgroup path we operate on. Parsing as u32
@@ -92,14 +127,13 @@ impl CgroupManager {
 
             if let Some(parent) = user_slice.parent() {
                 if parent.exists() {
-                    return Ok(user_slice);
+                    return user_slice;
                 }
             }
         }
 
         // Fallback: try directly under cgroup root (requires root or delegation)
-        let root_path = PathBuf::from(CGROUP_ROOT).join("rlm");
-        Ok(root_path)
+        PathBuf::from(CGROUP_ROOT).join("rlm")
     }
 
     /// Get the base path (for testing/status)
@@ -107,24 +141,33 @@ impl CgroupManager {
         &self.base_path
     }
 
-    /// Create a cgroup for a process and set limits BEFORE adding the process
-    /// Returns the cgroup path for later cleanup
-    pub fn prepare_cgroup(&self, name: &str, limit: &Limit) -> Result<PathBuf> {
+    /// Create a cgroup for a process and set limits BEFORE adding the process.
+    /// If a memory or CPU limit cannot be set, a cgroup this call created is
+    /// removed again; one that already existed is left alone, so a failed
+    /// limit write never empties a cgroup that holds processes.
+    pub fn prepare_cgroup(&self, name: &str, limit: &Limit) -> Result<Prepared> {
         // Sanitize name to prevent path traversal
         let safe_name = sanitize_cgroup_name(name)?;
-        let cgroup_path = self.base_path.join(safe_name);
-        self.create_cgroup(&cgroup_path)?;
-        // If applying any limit fails, don't leave a half-configured cgroup
-        // directory behind.
-        if let Err(e) = self.set_limits(&cgroup_path, limit) {
-            let _ = self.cleanup_cgroup(safe_name);
-            return Err(e);
+        let path = self.base_path.join(safe_name);
+        let created = self.create_cgroup(&path)?;
+        match self.set_limits(&path, limit) {
+            Ok(warnings) => Ok(Prepared {
+                path,
+                created,
+                warnings,
+            }),
+            Err(e) => {
+                if created {
+                    let _ = self.cleanup_cgroup(safe_name);
+                }
+                Err(e)
+            }
         }
-        Ok(cgroup_path)
     }
 
-    /// Set limits on an existing cgroup
-    fn set_limits(&self, cgroup_path: &Path, limit: &Limit) -> Result<()> {
+    /// Set limits on an existing cgroup. Memory and CPU failures are errors;
+    /// I/O problems come back as warnings.
+    fn set_limits(&self, cgroup_path: &Path, limit: &Limit) -> Result<Vec<String>> {
         if let Some(mem) = &limit.memory {
             self.set_memory_limit(cgroup_path, *mem)?;
         }
@@ -133,13 +176,14 @@ impl CgroupManager {
             self.set_cpu_limit(cgroup_path, *cpu)?;
         }
 
+        let mut warnings = Vec::new();
         if let Some(io) = &limit.io {
             if !io.is_empty() {
-                self.set_io_limit(cgroup_path, *io)?;
+                warnings = self.set_io_limit(cgroup_path, *io);
             }
         }
 
-        Ok(())
+        Ok(warnings)
     }
 
     /// Build a [`Command`] that places the spawned child into `cgroup_path`
@@ -185,13 +229,15 @@ impl CgroupManager {
         Ok(())
     }
 
-    /// Find if a PID is already in an rlm-managed cgroup
+    /// Find if a PID is already in an rlm-managed cgroup. The `unlimit`
+    /// bucket is not a managed cgroup, so released processes can be limited
+    /// again.
     pub fn find_cgroup_for_pid(&self, pid: u32) -> Option<String> {
         let entries = fs::read_dir(&self.base_path).ok()?;
 
         for entry in entries.flatten() {
             let path = entry.path();
-            if !path.is_dir() {
+            if !path.is_dir() || entry.file_name() == UNLIMIT_CGROUP_NAME {
                 continue;
             }
 
@@ -207,8 +253,9 @@ impl CgroupManager {
         None
     }
 
-    /// Apply resource limits to a process (creates cgroup and adds process)
-    pub fn apply_limit(&self, pid: u32, limit: &Limit) -> Result<()> {
+    /// Apply resource limits to a process (creates cgroup and adds process).
+    /// Returns non-fatal warnings.
+    pub fn apply_limit(&self, pid: u32, limit: &Limit) -> Result<Vec<String>> {
         reject_critical_pid(pid)?;
 
         // Check if process is already managed
@@ -216,9 +263,9 @@ impl CgroupManager {
             // If it's in a pid-{pid} cgroup, update the limits
             if existing_cgroup == format!("pid-{pid}") {
                 let cgroup_path = self.base_path.join(&existing_cgroup);
-                self.set_limits(&cgroup_path, limit)?;
+                let warnings = self.set_limits(&cgroup_path, limit)?;
                 tracing::info!(pid, "updated existing limits");
-                return Ok(());
+                return Ok(warnings);
             }
             // Process is in a different cgroup (run-* or gtk-*)
             return Err(Error::InvalidArgs(format!(
@@ -227,13 +274,17 @@ impl CgroupManager {
             )));
         }
 
-        let cgroup_path = self.prepare_cgroup(&format!("pid-{pid}"), limit)?;
+        let Prepared {
+            path: cgroup_path,
+            warnings,
+            ..
+        } = self.prepare_cgroup(&format!("pid-{pid}"), limit)?;
 
         // Try to add process - if it fails because process doesn't exist,
         // clean up the cgroup and return appropriate error
         if let Err(e) = self.add_process(&cgroup_path, pid) {
-            // Clean up the cgroup we just created
-            let _ = self.cleanup_cgroup(&format!("pid-{pid}"));
+            // Remove the cgroup again; it holds nothing we put there.
+            let _ = self.remove_if_empty(&format!("pid-{pid}"));
             // Check if process exists to give better error message
             if !PathBuf::from(format!("/proc/{pid}")).exists() {
                 return Err(Error::ProcessNotFound(pid));
@@ -242,18 +293,19 @@ impl CgroupManager {
         }
 
         tracing::info!(pid, ?cgroup_path, "applied limits");
-        Ok(())
+        Ok(warnings)
     }
 
     /// Apply resource limits to multiple processes (all share the same limit pool)
     /// All processes are added to a single cgroup, so they share the resource limits.
     /// For example, if you limit 10 processes to 4GB memory, they share 4GB total, not 4GB each.
+    /// Returns non-fatal warnings, including PIDs that could not be added.
     pub fn apply_limit_to_multiple(
         &self,
         pids: &[u32],
         limit: &Limit,
         cgroup_name: &str,
-    ) -> Result<()> {
+    ) -> Result<Vec<String>> {
         if pids.is_empty() {
             return Err(Error::InvalidArgs("no processes specified".into()));
         }
@@ -279,7 +331,11 @@ impl CgroupManager {
         }
 
         // Create cgroup and set limits
-        let cgroup_path = self.prepare_cgroup(safe_name, limit)?;
+        let Prepared {
+            path: cgroup_path,
+            created,
+            mut warnings,
+        } = self.prepare_cgroup(safe_name, limit)?;
 
         // Add all processes to the cgroup
         let mut failed_pids = Vec::new();
@@ -292,24 +348,27 @@ impl CgroupManager {
             }
         }
 
-        // If all processes failed, clean up
+        // If all processes failed, remove a cgroup this call created.
         if failed_pids.len() == pids.len() {
-            let _ = self.cleanup_cgroup(safe_name);
+            if created {
+                let _ = self.cleanup_cgroup(safe_name);
+            }
             return Err(Error::InvalidArgs(
                 "failed to add any processes to cgroup".into(),
             ));
         }
 
-        // If some failed, log warning but continue
+        // If some failed, report it but continue
         if !failed_pids.is_empty() {
-            tracing::warn!(
-                failed_count = failed_pids.len(),
-                total_count = pids.len(),
-                "some processes could not be added to cgroup"
-            );
+            warnings.push(format!(
+                "could not add {} of {} processes: {:?}",
+                failed_pids.len(),
+                pids.len(),
+                failed_pids
+            ));
         }
 
-        Ok(())
+        Ok(warnings)
     }
 
     /// Remove limits from a process
@@ -395,6 +454,54 @@ impl CgroupManager {
         )))
     }
 
+    /// Whether the named child cgroup (or a descendant) holds a process, from
+    /// its `cgroup.events`. `None` if unreadable.
+    pub fn is_populated(&self, name: &str) -> Option<bool> {
+        let content = fs::read_to_string(self.base_path.join(name).join("cgroup.events")).ok()?;
+        crate::guard::cgfs::parse_populated(&content)
+    }
+
+    /// The `oom_kill` count from the named cgroup's `memory.events`.
+    pub fn oom_kills(&self, name: &str) -> Option<u64> {
+        let content = fs::read_to_string(self.base_path.join(name).join("memory.events")).ok()?;
+        crate::guard::cgfs::parse_events_field(&content, "oom_kill")
+    }
+
+    /// The named cgroup's `memory.max` in bytes; `None` for `max` or unreadable.
+    pub fn memory_max(&self, name: &str) -> Option<u64> {
+        let content = fs::read_to_string(self.base_path.join(name).join("memory.max")).ok()?;
+        content.trim().parse().ok()
+    }
+
+    /// Remove the named cgroup only if it holds no process. `Ok(false)` when
+    /// it is populated; a cgroup that is already gone counts as removed.
+    /// Never moves processes.
+    pub fn remove_if_empty(&self, name: &str) -> Result<bool> {
+        let safe_name = sanitize_cgroup_name(name)?;
+        if self.is_populated(safe_name) == Some(true) {
+            return Ok(false);
+        }
+        let path = self.base_path.join(safe_name);
+        let mut last_err = None;
+        for _ in 0..3 {
+            match fs::remove_dir(&path) {
+                Ok(()) => {
+                    tracing::info!(?path, "removed empty cgroup");
+                    return Ok(true);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+                Err(e) => {
+                    last_err = Some(e);
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+            }
+        }
+        Err(Error::Cgroup(format!(
+            "failed to remove cgroup '{safe_name}': {}",
+            last_err.map(|e| e.to_string()).unwrap_or_default()
+        )))
+    }
+
     /// Whether a child cgroup with this name currently exists.
     pub fn cgroup_exists(&self, name: &str) -> bool {
         self.base_path.join(name).is_dir()
@@ -441,7 +548,8 @@ impl CgroupManager {
         Ok(())
     }
 
-    fn create_cgroup(&self, path: &Path) -> Result<()> {
+    /// Create the cgroup directory. `Ok(true)` only when this call created it.
+    fn create_cgroup(&self, path: &Path) -> Result<bool> {
         // Ensure base path exists (create_dir_all is idempotent, avoids TOCTOU)
         if let Err(e) = fs::create_dir_all(&self.base_path) {
             if e.kind() == std::io::ErrorKind::PermissionDenied {
@@ -458,8 +566,8 @@ impl CgroupManager {
 
         // Create cgroup directory (handle AlreadyExists to avoid TOCTOU)
         match fs::create_dir(path) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
             Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
                 Err(Error::PermissionDenied {
                     path: path.to_path_buf(),
@@ -550,47 +658,50 @@ impl CgroupManager {
         Ok(())
     }
 
-    fn set_io_limit(&self, cgroup_path: &Path, limit: IoLimit) -> Result<()> {
-        let io_max = cgroup_path.join("io.max");
-
-        let devices = Self::get_real_block_devices()?;
+    /// Write `io.max` one device per write (the kernel rejects a multi-line
+    /// write with EINVAL). Never fails: problems come back as warnings, since
+    /// memory and CPU limits still apply without I/O throttling.
+    fn set_io_limit(&self, cgroup_path: &Path, limit: IoLimit) -> Vec<String> {
+        let devices = match Self::get_real_block_devices() {
+            Ok(d) => d,
+            Err(e) => {
+                return vec![format!(
+                    "I/O limits were not applied (could not list block devices: {e}); memory and CPU limits still apply"
+                )]
+            }
+        };
         if devices.is_empty() {
-            tracing::warn!(
-                "no eligible block devices found; I/O limits were NOT applied \
-                 (memory/CPU limits, if any, still apply)"
-            );
-            return Ok(());
+            return vec![
+                "I/O limits were not applied (no eligible block devices found); memory and CPU limits still apply"
+                    .to_string(),
+            ];
         }
 
-        let mut content = String::new();
-        for (major, minor) in devices {
-            let mut line = format!("{major}:{minor}");
-            if let Some(rbps) = limit.read_bps {
-                line.push_str(&format!(" rbps={rbps}"));
+        let io_max = cgroup_path.join("io.max");
+        let mut warnings = Vec::new();
+        let mut first_err = None;
+        let mut applied = 0;
+        for line in io_max_lines(&devices, limit) {
+            match fs::write(&io_max, &line) {
+                Ok(()) => applied += 1,
+                Err(e) => {
+                    let dev = line.split_whitespace().next().unwrap_or_default();
+                    warnings.push(format!("I/O limit not applied to device {dev}: {e}"));
+                    first_err.get_or_insert(e);
+                }
             }
-            if let Some(wbps) = limit.write_bps {
-                line.push_str(&format!(" wbps={wbps}"));
-            }
-            content.push_str(&line);
-            content.push('\n');
         }
-
-        if let Err(e) = fs::write(&io_max, content) {
-            // I/O throttling (io.max) typically requires root and is often not
-            // permitted under systemd user cgroup delegation. Treat that as a
-            // clear, non-fatal warning so memory/CPU limits still apply, rather
-            // than failing the whole operation. Other errors remain fatal.
-            if e.kind() == std::io::ErrorKind::PermissionDenied {
-                tracing::warn!(
-                    "I/O limits NOT applied: permission denied. I/O throttling usually \
-                     requires root and is commonly unavailable under user cgroup \
-                     delegation; memory/CPU limits (if any) were still applied."
-                );
-                return Ok(());
+        if applied == 0 {
+            if let Some(e) = first_err {
+                warnings = vec![format!(
+                    "I/O limits were not applied to any device ({e}); memory and CPU limits still apply"
+                )];
             }
-            return Err(Error::Cgroup(format!("failed to set io.max: {e}")));
         }
-        Ok(())
+        for w in &warnings {
+            tracing::warn!("{w}");
+        }
+        warnings
     }
 
     /// Get block devices eligible for I/O throttling.
@@ -665,5 +776,67 @@ mod tests {
         assert_eq!(sanitize_cgroup_name("pid-1234").unwrap(), "pid-1234");
         assert_eq!(sanitize_cgroup_name("app_firefox").unwrap(), "app_firefox");
         assert_eq!(sanitize_cgroup_name("run-42-99").unwrap(), "run-42-99");
+    }
+
+    #[test]
+    fn io_max_is_one_line_per_device_without_newlines() {
+        let l = io_max_lines(
+            &[(8, 0), (259, 0)],
+            IoLimit {
+                read_bps: Some(5_242_880),
+                write_bps: Some(1_048_576),
+            },
+        );
+        assert_eq!(
+            l,
+            vec![
+                "8:0 rbps=5242880 wbps=1048576".to_string(),
+                "259:0 rbps=5242880 wbps=1048576".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn released_processes_can_be_limited_again() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, procs) in [("unlimit", "4242\n"), ("pid-7", "7\n")] {
+            std::fs::create_dir(dir.path().join(name)).unwrap();
+            std::fs::write(dir.path().join(name).join("cgroup.procs"), procs).unwrap();
+        }
+        let m = CgroupManager::at(dir.path().to_path_buf());
+        assert_eq!(
+            m.find_cgroup_for_pid(4242),
+            None,
+            "the unlimit bucket is not a managed cgroup"
+        );
+        assert_eq!(m.find_cgroup_for_pid(7).as_deref(), Some("pid-7"));
+    }
+
+    #[test]
+    fn populated_cgroup_is_not_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let cg = dir.path().join("run-1-2");
+        std::fs::create_dir(&cg).unwrap();
+        std::fs::write(cg.join("cgroup.events"), "populated 1\nfrozen 0\n").unwrap();
+        let m = CgroupManager::at(dir.path().to_path_buf());
+        assert_eq!(m.is_populated("run-1-2"), Some(true));
+        assert!(!m.remove_if_empty("run-1-2").unwrap());
+        assert!(cg.exists());
+    }
+
+    #[test]
+    fn oom_kills_and_memory_max_are_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let cg = dir.path().join("run-1-2");
+        std::fs::create_dir(&cg).unwrap();
+        std::fs::write(
+            cg.join("memory.events"),
+            "low 0\nhigh 3\nmax 10\noom 1\noom_kill 2\n",
+        )
+        .unwrap();
+        std::fs::write(cg.join("memory.max"), "157286400\n").unwrap();
+        let m = CgroupManager::at(dir.path().to_path_buf());
+        assert_eq!(m.oom_kills("run-1-2"), Some(2));
+        assert_eq!(m.memory_max("run-1-2"), Some(157_286_400));
     }
 }

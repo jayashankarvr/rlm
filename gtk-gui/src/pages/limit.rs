@@ -720,8 +720,8 @@ fn apply_limits(state: &Rc<RefCell<LimitState>>) {
             };
 
             match manager.apply_limit_to_multiple(&pids, &limit, &cgroup_name) {
-                Ok(()) => {
-                    state.status_label.set_text("");
+                Ok(warnings) => {
+                    show_warnings(&state.status_label, &warnings);
                     let mut msg = if pids.len() == 1 {
                         format!("Limits applied to PID {}", pids[0])
                     } else {
@@ -776,8 +776,8 @@ fn apply_limits(state: &Rc<RefCell<LimitState>>) {
             };
 
             match manager.apply_limit(pid, &limit) {
-                Ok(()) => {
-                    state.status_label.set_text("");
+                Ok(warnings) => {
+                    show_warnings(&state.status_label, &warnings);
                     let toast = adw::Toast::new(&format!("Limits applied to PID {pid}"));
                     toast.set_timeout(3);
                     state.toast_overlay.add_toast(toast);
@@ -785,6 +785,15 @@ fn apply_limits(state: &Rc<RefCell<LimitState>>) {
                 Err(e) => show_status(&state.status_label, &format!("{e}"), true),
             }
         }
+    }
+}
+
+/// Clear the status label, or show non-fatal warnings from a limit call.
+fn show_warnings(label: &gtk::Label, warnings: &[String]) {
+    if warnings.is_empty() {
+        label.set_text("");
+    } else {
+        show_status(label, &format!("Warning: {}", warnings.join("; ")), true);
     }
 }
 
