@@ -33,8 +33,9 @@ struct ScanPlan {
     rules: bool,
 }
 
-/// A calm tick reads only the PSI and meminfo files. The process snapshot is
-/// taken when the policy wants candidates (pressure above Calm) or when
+/// A calm tick with plenty of memory reads only the PSI and meminfo files.
+/// The process snapshot is taken when the policy wants candidates (pressure
+/// above Calm, or memory already scarce so growth rates stay warm) or when
 /// rules are due, and is shared by both. `since_rules_ms` is the time since
 /// the last reconcile, `None` if there has not been one.
 fn plan_scan(

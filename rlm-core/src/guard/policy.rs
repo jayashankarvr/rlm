@@ -46,6 +46,9 @@ struct Growth {
     last_ms: u64,
     /// EWMA of bytes per second (negative while shrinking).
     rate_bps: f64,
+    /// True once a second sample has been seen, so `rate_bps` is a measured
+    /// rate and not the zero placeholder of a first sighting.
+    warm: bool,
 }
 
 /// Self-healing circuit-breaker policy engine.
@@ -283,10 +286,14 @@ impl PolicyEngine {
         actions
     }
 
-    /// True when the next tick with `sample` would be above Calm, so the
-    /// caller should gather targets for it. A disabled engine never wants them.
+    /// True when the caller should gather targets for the next tick: the
+    /// level would be above Calm, or memory is already scarce. Scanning while
+    /// scarce keeps growth rates warm, so a sudden drop below the floor can
+    /// pick the app that is growing instead of the largest one. A disabled
+    /// engine never wants them.
     pub fn wants_candidates(&self, sample: Sample) -> bool {
-        self.cfg.enabled && self.next_level(sample) != Level::Calm
+        self.cfg.enabled
+            && (self.next_level(sample) != Level::Calm || is_scarce(&sample, &self.cfg.trigger))
     }
 
     /// The pressure level as of the last tick.
@@ -380,6 +387,7 @@ impl PolicyEngine {
                     g.rate_bps = 0.5 * g.rate_bps + 0.5 * inst;
                     g.last_bytes = cur;
                     g.last_ms = now_ms;
+                    g.warm = true;
                 }
                 Some(_) => {}
                 None => {
@@ -389,6 +397,7 @@ impl PolicyEngine {
                             last_bytes: cur,
                             last_ms: now_ms,
                             rate_bps: 0.0,
+                            warm: false,
                         },
                     );
                 }
@@ -403,6 +412,14 @@ impl PolicyEngine {
     /// app whose cgroups grow fastest wins when that growth is at least
     /// [`MIN_GROWTH_BPS`]; otherwise the largest app. Ties go to the
     /// lexicographically smaller app name, so the choice is deterministic.
+    ///
+    /// Cold start: when no eligible cgroup has a measured growth rate yet but
+    /// at least one was first seen this tick, nothing is picked. The next
+    /// tick (one sample interval later) has rates, so an idle large app is
+    /// not frozen in place of a smaller one that is growing. The deferral
+    /// lasts one tick at most per new cgroup; if no eligible cgroup reports
+    /// `memory.current` at all, growth can never be measured and the largest
+    /// app is picked at once.
     fn select_app<'a>(
         &self,
         targets: &'a [Target],
@@ -425,6 +442,23 @@ impl PolicyEngine {
                         .all(|m| !self.interventions.contains_key(&m.resolution.cgroup))
             })
             .collect();
+        let any_warm = eligible.iter().any(|(_, ms)| {
+            ms.iter().any(|m| {
+                self.growth
+                    .get(&m.resolution.cgroup)
+                    .is_some_and(|g| g.warm)
+            })
+        });
+        let any_cold = eligible.iter().any(|(_, ms)| {
+            ms.iter().any(|m| {
+                self.growth
+                    .get(&m.resolution.cgroup)
+                    .is_some_and(|g| !g.warm)
+            })
+        });
+        if !any_warm && any_cold {
+            return None;
+        }
         let growth = |ms: &[&Target]| -> f64 {
             ms.iter()
                 .map(|m| {
@@ -585,6 +619,23 @@ mod tests {
             .any(|a| matches!(a, Action::LiftCap { res } if res.cgroup == cg))
     }
 
+    /// Give every target a measured (zero) growth rate, as if the engine had
+    /// already scanned them on an earlier tick. Tests of the ladder use this
+    /// so the cold-start deferral does not shift their first action.
+    fn prime(e: &mut PolicyEngine, ts: &[Target]) {
+        for t in ts {
+            e.growth.insert(
+                t.resolution.cgroup.clone(),
+                Growth {
+                    last_bytes: t.current_bytes.unwrap_or(0),
+                    last_ms: 0,
+                    rate_bps: 0.0,
+                    warm: true,
+                },
+            );
+        }
+    }
+
     /// Default `live_cgroups` for tests that aren't specifically exercising
     /// the liveness-vs-eligibility distinction: every target's cgroup.
     fn live_from(ts: &[Target]) -> std::collections::HashSet<String> {
@@ -643,6 +694,7 @@ mod tests {
             proc(2, "biggest", 4000),
             proc(3, "medium", 1000),
         ];
+        prime(&mut e, &procs);
         let actions = e.tick(1000, high(), &procs, &live_from(&procs));
         // Only the single largest hog is frozen, not the smaller ones.
         assert_eq!(
@@ -668,6 +720,7 @@ mod tests {
     fn frozen_process_thaws_after_freeze_hold() {
         let mut e = PolicyEngine::new(cfg()); // freeze_hold = 5s
         let procs = vec![proc(2, "hog", 4000)];
+        prime(&mut e, &procs);
         let cg = "/app.slice/app-hog-2.scope";
 
         let a0 = e.tick(0, high(), &procs, &live_from(&procs));
@@ -687,6 +740,7 @@ mod tests {
     fn still_high_within_cooldown_caps_instead_of_refreezing() {
         let mut e = PolicyEngine::new(cfg()); // hold=5s, cooldown=60s
         let procs = vec![proc(2, "hog", 4000)];
+        prime(&mut e, &procs);
         let cg = "/app.slice/app-hog-2.scope";
 
         // Freeze at t=0.
@@ -743,6 +797,7 @@ mod tests {
     fn capped_process_lifted_only_after_sustained_calm() {
         let mut e = PolicyEngine::new(cfg()); // calm_hold = 30s
         let procs = vec![proc(2, "hog", 4000)];
+        prime(&mut e, &procs);
         let cg = "/app.slice/app-hog-2.scope";
 
         // Drive a freeze, thaw, then a cap (still hot within cooldown).
@@ -776,6 +831,7 @@ mod tests {
     fn cap_lift_resets_if_calm_is_interrupted() {
         let mut e = PolicyEngine::new(cfg());
         let procs = vec![proc(2, "hog", 4000)];
+        prime(&mut e, &procs);
         let cg = "/app.slice/app-hog-2.scope";
         e.tick(0, high(), &procs, &live_from(&procs));
         e.tick(5_000, high(), &procs, &live_from(&procs));
@@ -799,6 +855,7 @@ mod tests {
     fn escalation_gate_limits_to_one_freeze_per_hold_window() {
         let mut e = PolicyEngine::new(cfg());
         let procs = vec![proc(1, "hog-a", 4000), proc(2, "hog-b", 3000)];
+        prime(&mut e, &procs);
         let cg_a = "/app.slice/app-hog-a-1.scope";
         let cg_b = "/app.slice/app-hog-b-2.scope";
 
@@ -822,6 +879,7 @@ mod tests {
     fn dead_pid_is_pruned_with_liftcap() {
         let mut e = PolicyEngine::new(cfg());
         let procs = vec![proc(2, "hog", 4000)];
+        prime(&mut e, &procs);
         let cg = "/app.slice/app-hog-2.scope";
 
         // Freeze the hog's cgroup.
@@ -850,6 +908,7 @@ mod tests {
     fn intervention_survives_in_live_cgroups_but_absent_from_procs() {
         let mut e = PolicyEngine::new(cfg());
         let procs = vec![proc(2, "hog", 4000)];
+        prime(&mut e, &procs);
         let cg = "/app.slice/app-hog-2.scope";
 
         // Freeze the hog's cgroup.
@@ -891,6 +950,7 @@ mod tests {
         // ordering + content. "/app.slice/app-a-5.scope" sorts before
         // "/app.slice/app-b-3.scope" lexicographically.
         let procs = vec![proc(5, "a", 4000), proc(3, "b", 3500)];
+        prime(&mut e, &procs);
         let cg_a = "/app.slice/app-a-5.scope";
         let cg_b = "/app.slice/app-b-3.scope";
 
@@ -925,6 +985,7 @@ mod tests {
     fn critical_via_mem_floor_triggers_action() {
         let mut e = PolicyEngine::new(cfg());
         let procs = vec![proc(2, "hog", 4000)];
+        prime(&mut e, &procs);
         // No PSI pressure, but MemAvailable below the 400 MB floor -> Critical.
         let a = e.tick(0, sample(0.0, 0.0, 100), &procs, &live_from(&procs));
         assert_eq!(e.level, Level::Critical);
@@ -976,6 +1037,7 @@ mod tests {
         r.verdict = Verdict::CapOnly;
         r.coverage = Coverage::Partial;
         let procs = [p];
+        prime(&mut e, &procs);
         let a = e.tick(0, high(), &procs, &live_from(&procs));
         assert!(
             freeze_targets(&a).is_empty(),
@@ -991,6 +1053,7 @@ mod tests {
         term.resolution.verdict = Verdict::CapOnly;
         term.resolution.coverage = Coverage::Partial;
         let ts = vec![term, target("hog", "/app.slice/hog.scope", 3000)];
+        prime(&mut e, &ts);
         assert!(has_cap_target(
             &e.tick(0, high(), &ts, &live_from(&ts)),
             "/app.slice/term.scope"
@@ -1011,6 +1074,7 @@ mod tests {
             target("chrome", "/app.slice/app-chrome-2.scope", 900),
             target("hog", "/app.slice/app-hog-3.scope", 2000),
         ];
+        prime(&mut e, &ts);
         let mut frozen = freeze_targets(&e.tick(0, high(), &ts, &live_from(&ts)));
         frozen.sort();
         assert_eq!(
@@ -1109,9 +1173,80 @@ mod tests {
     }
 
     #[test]
-    fn candidates_are_wanted_only_above_calm() {
+    fn candidates_are_wanted_above_calm_or_when_scarce() {
         let e = PolicyEngine::new(cfg());
         assert!(!e.wants_candidates(calm()));
         assert!(e.wants_candidates(sample(12.0, 0.0, 8_000)));
+        // Calm PSI but under 20% of RAM available: scan so growth stays warm.
+        assert!(e.wants_candidates(sample(0.0, 0.0, 3_000)));
+    }
+
+    /// Regression (final review I1): available memory drops below the floor
+    /// in one step with no stall first, so the Critical tick is the first
+    /// scan. An idle 6 GB app must not be frozen in place of a 3 GB app
+    /// that is growing: the first tick defers, the next picks the grower.
+    #[test]
+    fn cold_start_defers_then_picks_grower_not_largest() {
+        let mut e = PolicyEngine::new(cfg());
+        for step in 0..5u64 {
+            e.tick(step * 1_000, calm(), &[], &HashSet::new());
+        }
+        let crit = sample(0.0, 0.0, 300);
+        let t0 = vec![
+            target("chrome", "/app.slice/chrome.scope", 6000),
+            target("hog", "/app.slice/hog.scope", 3000),
+        ];
+        let a0 = e.tick(5_000, crit, &t0, &live_from(&t0));
+        assert_eq!(e.level, Level::Critical);
+        assert!(
+            freeze_targets(&a0).is_empty(),
+            "no growth data yet, must defer: {a0:?}"
+        );
+        let t1 = vec![
+            target("chrome", "/app.slice/chrome.scope", 6000),
+            target("hog", "/app.slice/hog.scope", 3200),
+        ];
+        assert_eq!(
+            freeze_targets(&e.tick(6_000, crit, &t1, &live_from(&t1))),
+            vec!["/app.slice/hog.scope"]
+        );
+    }
+
+    /// With scarce-but-calm ticks feeding growth, the grower is picked on
+    /// the very first Critical tick.
+    #[test]
+    fn scarce_calm_ticks_warm_growth_for_first_critical_tick() {
+        let mut e = PolicyEngine::new(cfg());
+        let scarce_calm = sample(0.0, 0.0, 3_000);
+        assert!(e.wants_candidates(scarce_calm));
+        let t0 = vec![
+            target("chrome", "/app.slice/chrome.scope", 6000),
+            target("hog", "/app.slice/hog.scope", 2000),
+        ];
+        assert!(freeze_targets(&e.tick(0, scarce_calm, &t0, &live_from(&t0))).is_empty());
+        let t1 = vec![
+            target("chrome", "/app.slice/chrome.scope", 6000),
+            target("hog", "/app.slice/hog.scope", 3000),
+        ];
+        assert_eq!(
+            freeze_targets(&e.tick(1_000, sample(0.0, 0.0, 300), &t1, &live_from(&t1))),
+            vec!["/app.slice/hog.scope"]
+        );
+    }
+
+    /// Without any memory.current reading, growth can never be measured, so
+    /// the guard does not wait and falls back to the largest app.
+    #[test]
+    fn no_current_bytes_does_not_defer() {
+        let mut e = PolicyEngine::new(cfg());
+        let mut big = target("big", "/app.slice/b.scope", 3000);
+        big.current_bytes = None;
+        let mut small = target("small", "/app.slice/s.scope", 1000);
+        small.current_bytes = None;
+        let ts = vec![big, small];
+        assert_eq!(
+            freeze_targets(&e.tick(0, high(), &ts, &live_from(&ts))),
+            vec!["/app.slice/b.scope"]
+        );
     }
 }
