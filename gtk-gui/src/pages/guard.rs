@@ -217,10 +217,17 @@ pub fn pressure_summary(sample: Option<&Sample>, t: &GuardTrigger) -> String {
     }
 }
 
-/// The Policy row in plain words, from the configured trigger.
-pub fn policy_summary(t: &GuardTrigger) -> String {
+/// The Policy row in plain words, from the guard config. Below the free
+/// memory floor the guard acts without waiting for stalls (the level is
+/// Critical there), so the wording does not claim stalls are always needed.
+pub fn policy_summary(g: &GuardConfig) -> String {
+    if !g.enabled {
+        return "Freezing and capping are off (guard.enabled is false); saved rules still apply"
+            .to_string();
+    }
+    let t = &g.trigger;
     format!(
-        "Steps in when free memory drops below {}% (or {}) and apps are stalling",
+        "Steps in when apps stall and free memory is below {}%, or at once below {}",
         t.act_below_available_pct,
         mb_text(t.mem_available_floor_mb)
     )
@@ -274,7 +281,7 @@ pub fn build_view(
         sample.map_or_else(|| pressure_unavailable().to_string(), |s| pressure_line(&s));
     let policy = cfg.as_ref().map_or_else(
         |_| "The guard will not start until the config is fixed".to_string(),
-        |c| policy_summary(&c.trigger),
+        policy_summary,
     );
 
     let mut protect: Vec<(String, &'static str)> = BUILTIN_PROTECT
@@ -820,8 +827,16 @@ mod tests {
     #[test]
     fn policy_and_config_in_plain_words() {
         assert_eq!(
-            policy_summary(&GuardTrigger::default()),
-            "Steps in when free memory drops below 20% (or 400 MB) and apps are stalling"
+            policy_summary(&GuardConfig::default()),
+            "Steps in when apps stall and free memory is below 20%, or at once below 400 MB"
+        );
+        let off = GuardConfig {
+            enabled: false,
+            ..GuardConfig::default()
+        };
+        assert_eq!(
+            policy_summary(&off),
+            "Freezing and capping are off (guard.enabled is false); saved rules still apply"
         );
         let s = sample(0.0, 0.0, 8000, 16000);
         let v = build_view(
