@@ -15,6 +15,10 @@ use std::sync::Arc;
 /// application is selected, which fills the field with a comma-separated list.
 const MAX_PID_LEN: usize = 65536;
 
+/// Rows the list shows at most, per mode; a search finds the rest.
+const MAX_APP_ROWS: usize = 30;
+const MAX_PROCESS_ROWS: usize = 50;
+
 struct LimitState {
     pid_entry: adw::EntryRow,
     memory_entry: adw::EntryRow,
@@ -27,6 +31,8 @@ struct LimitState {
     status_label: gtk::Label,
     toast_overlay: adw::ToastOverlay,
     process_list: gtk::ListBox,
+    /// "Showing N of M" under the list when it is capped.
+    cap_label: gtk::Label,
     manager: Option<Arc<CgroupManager>>,
     all_processes: RefCell<Vec<rlm_core::process::ProcessInfo>>,
     limit_mode: RefCell<LimitMode>, // Individual or Application
@@ -138,6 +144,12 @@ pub fn create(manager: Option<Arc<CgroupManager>>) -> gtk::Widget {
     scroll.set_max_content_height(200);
 
     search_group.add(&scroll);
+
+    let cap_label = gtk::Label::new(None);
+    cap_label.add_css_class("dim-label");
+    cap_label.set_margin_top(6);
+    cap_label.set_visible(false);
+    search_group.add(&cap_label);
     page.add(&search_group);
 
     // Profile selection group
@@ -237,6 +249,7 @@ pub fn create(manager: Option<Arc<CgroupManager>>) -> gtk::Widget {
         status_label: status_label.clone(),
         toast_overlay: toast_overlay.clone(),
         process_list: process_list.clone(),
+        cap_label: cap_label.clone(),
         manager: manager.clone(),
         all_processes: RefCell::new(Vec::new()),
         limit_mode: RefCell::new(LimitMode::Individual),
@@ -471,10 +484,12 @@ fn load_all_processes(state: &Rc<RefCell<LimitState>>) {
                 .map(|c| c.guard.selection.protect)
                 .unwrap_or_default(),
         );
-        let processes: Vec<_> = processes
+        let mut processes: Vec<_> = processes
             .into_iter()
             .filter(|p| !common::is_protected(&protect, &p.name, p.exe_name()))
             .collect();
+        // Biggest memory users first: those are the ones worth limiting.
+        processes.sort_by(|a, b| b.rss_kb.cmp(&a.rss_kb).then_with(|| a.name.cmp(&b.name)));
         state.borrow().all_processes.replace(processes);
     }
 }
@@ -510,20 +525,19 @@ fn filter_processes(state: &Rc<RefCell<LimitState>>, query: &str) {
 
     let processes = state_ref.all_processes.borrow();
     let query_lower = query.to_lowercase();
+    let (total, shown);
 
     if mode == LimitMode::Application {
         // Group processes by executable
         let groups = rlm_core::process::group_by_executable(&processes);
 
-        let filtered_groups: Vec<_> = if query.is_empty() {
-            groups.iter().take(20).collect()
-        } else {
-            groups
-                .iter()
-                .filter(|g| g.name.to_lowercase().contains(&query_lower))
-                .take(20)
-                .collect()
-        };
+        let matching: Vec<_> = groups
+            .iter()
+            .filter(|g| g.name.to_lowercase().contains(&query_lower))
+            .collect();
+        total = matching.len();
+        let filtered_groups: Vec<_> = matching.into_iter().take(MAX_APP_ROWS).collect();
+        shown = filtered_groups.len();
 
         if filtered_groups.is_empty() {
             let row = adw::ActionRow::new();
@@ -537,7 +551,12 @@ fn filter_processes(state: &Rc<RefCell<LimitState>>, query: &str) {
             for group in filtered_groups {
                 let row = adw::ExpanderRow::new();
                 row.set_title(&glib::markup_escape_text(&group.name));
-                row.set_subtitle(&format!("{} process(es)", group.processes.len()));
+                let count = group.processes.len();
+                row.set_subtitle(&format!(
+                    "{count} {}, {}",
+                    if count == 1 { "process" } else { "processes" },
+                    format_memory(group.rss_kb())
+                ));
                 let row_name = format!("group-{}", group.name.replace('/', "_"));
                 row.set_widget_name(&row_name);
                 state_ref
@@ -568,7 +587,11 @@ fn filter_processes(state: &Rc<RefCell<LimitState>>, query: &str) {
                 for proc in &group.processes {
                     let proc_row = adw::ActionRow::new();
                     proc_row.set_title(&glib::markup_escape_text(&proc.name));
-                    proc_row.set_subtitle(&format!("PID: {}", proc.pid));
+                    proc_row.set_subtitle(&format!(
+                        "PID {}, {}",
+                        proc.pid,
+                        format_memory(proc.rss_kb)
+                    ));
                     proc_row.set_widget_name(&format!("proc-{}", proc.pid));
                     row.add_row(&proc_row);
                 }
@@ -578,19 +601,15 @@ fn filter_processes(state: &Rc<RefCell<LimitState>>, query: &str) {
         }
     } else {
         // Individual mode - show processes as before
-        let filtered: Vec<_> = if query.is_empty() {
-            processes.iter().take(50).collect()
-        } else {
-            // Allow searching by PID or name
-            let query_pid: Option<u32> = query.parse().ok();
-            processes
-                .iter()
-                .filter(|p| {
-                    p.name.to_lowercase().contains(&query_lower) || query_pid == Some(p.pid)
-                })
-                .take(50)
-                .collect()
-        };
+        // Search by PID or name
+        let query_pid: Option<u32> = query.parse().ok();
+        let matching: Vec<_> = processes
+            .iter()
+            .filter(|p| p.name.to_lowercase().contains(&query_lower) || query_pid == Some(p.pid))
+            .collect();
+        total = matching.len();
+        let filtered: Vec<_> = matching.into_iter().take(MAX_PROCESS_ROWS).collect();
+        shown = filtered.len();
 
         if filtered.is_empty() {
             let row = adw::ActionRow::new();
@@ -604,13 +623,21 @@ fn filter_processes(state: &Rc<RefCell<LimitState>>, query: &str) {
             for proc in filtered {
                 let row = adw::ActionRow::new();
                 row.set_title(&glib::markup_escape_text(&proc.name));
-                row.set_subtitle(&format!("PID: {}", proc.pid));
+                row.set_subtitle(&format!("PID {}, {}", proc.pid, format_memory(proc.rss_kb)));
                 row.set_activatable(true);
                 row.set_widget_name(&format!("proc-{}", proc.pid));
 
                 list.append(&row);
             }
         }
+    }
+
+    match cap_note(shown, total, !query.is_empty()) {
+        Some(note) => {
+            state_ref.cap_label.set_text(&note);
+            state_ref.cap_label.set_visible(true);
+        }
+        None => state_ref.cap_label.set_visible(false),
     }
 
     // Keep the PID field as it was and highlight the rows that match it.
@@ -639,6 +666,30 @@ fn filter_processes(state: &Rc<RefCell<LimitState>>, query: &str) {
     }
     sync_group_buttons(&state_ref, list);
     state_ref.rebuilding.set(false);
+}
+
+/// Memory in KB as "900 KB", "512 MB" or "1.2 GB".
+fn format_memory(kb: u64) -> String {
+    const MB: u64 = 1024;
+    const GB: u64 = 1024 * 1024;
+    if kb >= GB {
+        format!("{:.1} GB", kb as f64 / GB as f64)
+    } else if kb >= MB {
+        format!("{} MB", (kb + MB / 2) / MB)
+    } else {
+        format!("{kb} KB")
+    }
+}
+
+/// The note under a capped list, or `None` when every match is shown.
+fn cap_note(shown: usize, total: usize, searching: bool) -> Option<String> {
+    (shown < total).then(|| {
+        if searching {
+            format!("Showing {shown} of {total} matches; type more to narrow the search")
+        } else {
+            format!("Showing {shown} of {total}; type to search")
+        }
+    })
 }
 
 /// Show each application row's selection on its button: "Selected" in the
@@ -977,6 +1028,24 @@ fn find_widget_by_name(widget: &gtk::Widget, name: &str) -> Option<gtk::Widget> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn memory_is_shown_in_a_readable_unit() {
+        assert_eq!(format_memory(900), "900 KB");
+        assert_eq!(format_memory(512 * 1024), "512 MB");
+        assert_eq!(format_memory(1536), "2 MB");
+        assert_eq!(format_memory(1024 * 1024 * 3 / 2), "1.5 GB");
+    }
+
+    #[test]
+    fn capped_lists_say_how_many_are_hidden() {
+        assert_eq!(cap_note(50, 50, false), None);
+        assert_eq!(
+            cap_note(50, 312, false).as_deref(),
+            Some("Showing 50 of 312; type to search")
+        );
+        assert!(cap_note(30, 40, true).unwrap().contains("type more"));
+    }
 
     #[test]
     fn application_pid_list_keeps_its_commas() {
