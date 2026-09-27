@@ -58,7 +58,11 @@ pub fn create(manager: Option<Arc<CgroupManager>>) -> gtk::Widget {
     // Main heading group
     let header_group = adw::PreferencesGroup::new();
     header_group.set_title("Limit Running Process");
-    header_group.set_description(Some("Limit processes that are already running. Limits last until you remove them or the processes exit."));
+    header_group.set_description(Some(
+        "Limit processes that are already running. Limits last until you remove them or the processes exit. \
+         Memory a process already uses is not counted, only what it allocates from now on; \
+         to cap an app's whole memory, start it from Launch New.",
+    ));
     page.add(&header_group);
 
     // Status label for feedback
