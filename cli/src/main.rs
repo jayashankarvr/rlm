@@ -951,6 +951,14 @@ fn guard_enable() -> Result<ExitCode> {
             if let Some(dir) = path.parent() {
                 std::fs::create_dir_all(dir)?;
             }
+            // A 0.1 unit may carry the user's edits; keep a copy before replacing it.
+            if let Ok(old) = std::fs::read_to_string(&path) {
+                if !old.starts_with(guard_unit::GENERATED_MARKER) {
+                    let backup = path.with_extension("service.bak");
+                    std::fs::write(&backup, old)?;
+                    println!("saved the previous unit as {}", backup.display());
+                }
+            }
             std::fs::write(&path, contents)?;
             println!("wrote {}", path.display());
             unit_written = true;

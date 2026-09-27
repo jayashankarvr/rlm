@@ -56,15 +56,26 @@ fn invalidate_service_cache() {
     *SERVICE_CACHE.lock().unwrap() = None;
 }
 
-/// Whether the switch should show the guard as on.
-pub fn switch_on(s: &ServiceState) -> bool {
-    s.enabled == "enabled" || s.active == "active"
+/// Whether the switch should show the guard as on, or `None` when systemd
+/// gave no usable answer and the switch should stay where it is.
+pub fn switch_on(s: &ServiceState) -> Option<bool> {
+    if s.active == "unknown" || s.active == "timeout" {
+        return None;
+    }
+    Some(s.enabled == "enabled" || s.active == "active")
 }
+
+const SWITCH_SUBTITLE: &str =
+    "Starts now and at every login; freezes or caps a runaway app under memory pressure";
 
 thread_local! {
     /// Set while `populate` moves the switch, so that change does not run
     /// `rlm guard enable`/`disable` as if the user had flipped it.
     static SYNCING_SWITCH: Cell<bool> = const { Cell::new(false) };
+    /// The last failed toggle: the state it asked for and the error. Shown
+    /// under the switch until the service reaches that state.
+    static TOGGLE_ERROR: std::cell::RefCell<Option<(bool, String)>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// The `rlm` binary to run: the one next to `rlm-gtk` if present (they are
@@ -101,7 +112,8 @@ fn run_guard_verb(verb: &str) -> std::result::Result<(), String> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GuardView {
     pub service: String,
-    pub switch_on: bool,
+    pub switch_on: Option<bool>,
+    pub failed: bool,
     pub config: std::result::Result<(), String>,
     pub pressure: String,
     pub policy: String,
@@ -150,6 +162,7 @@ pub fn build_view(
     GuardView {
         service: service_desc,
         switch_on: switch_on(service),
+        failed: service.active == "failed",
         config,
         pressure,
         policy,
@@ -202,10 +215,28 @@ fn populate(
     history_list: &gtk::ListBox,
     protect_list: &gtk::ListBox,
 ) {
-    if switch.is_sensitive() && switch.is_active() != view.switch_on {
-        SYNCING_SWITCH.with(|f| f.set(true));
-        switch.set_active(view.switch_on);
-        SYNCING_SWITCH.with(|f| f.set(false));
+    if switch.is_sensitive() {
+        if let Some(on) = view.switch_on {
+            if switch.is_active() != on {
+                SYNCING_SWITCH.with(|f| f.set(true));
+                switch.set_active(on);
+                SYNCING_SWITCH.with(|f| f.set(false));
+            }
+        }
+        let error = TOGGLE_ERROR.with(|e| {
+            let mut e = e.borrow_mut();
+            if matches!((&*e, view.switch_on), (Some((want, _)), Some(on)) if *want == on) {
+                *e = None;
+            }
+            e.as_ref().map(|(_, msg)| msg.clone())
+        });
+        match error {
+            Some(msg) => switch.set_subtitle(&msg),
+            None if view.failed => {
+                switch.set_subtitle("The guard is not running: its last start failed (see Service)")
+            }
+            None => switch.set_subtitle(SWITCH_SUBTITLE),
+        }
     }
 
     clear(status_list);
@@ -286,9 +317,7 @@ pub fn create() -> gtk::Widget {
     let switch = adw::SwitchRow::new();
     switch.set_widget_name("guard-switch");
     switch.set_title("Run the guard");
-    switch.set_subtitle(
-        "Starts now and at every login; freezes or caps a runaway app under memory pressure",
-    );
+    switch.set_subtitle(SWITCH_SUBTITLE);
     status_group.add(&switch);
     let status_list = new_list_box("guard-status-list");
     status_group.add(&status_list);
@@ -340,7 +369,11 @@ pub fn create() -> gtk::Widget {
         }
         let verb = if row.is_active() { "enable" } else { "disable" };
         row.set_sensitive(false);
-        row.set_subtitle(if verb == "enable" { "Turning on..." } else { "Turning off..." });
+        row.set_subtitle(if verb == "enable" {
+            "Turning on..."
+        } else {
+            "Turning off..."
+        });
         let row = row.clone();
         let widget = widget_for_switch.clone();
         glib::MainContext::default().spawn_local(async move {
@@ -349,12 +382,12 @@ pub fn create() -> gtk::Widget {
                 .unwrap_or_else(|_| Err("rlm guard command panicked".to_string()));
             invalidate_service_cache();
             row.set_sensitive(true);
-            match result {
-                Ok(()) => row.set_subtitle(
-                    "Starts now and at every login; freezes or caps a runaway app under memory pressure",
-                ),
-                Err(e) => row.set_subtitle(&format!("Could not {verb} the guard: {e}")),
-            }
+            let want = verb == "enable";
+            TOGGLE_ERROR.with(|slot| {
+                *slot.borrow_mut() = result
+                    .err()
+                    .map(|e| (want, format!("Could not {verb} the guard: {e}")));
+            });
             refresh(&widget);
         });
     });
@@ -432,11 +465,13 @@ mod tests {
 
     #[test]
     fn switch_is_on_when_enabled_or_running() {
-        assert!(switch_on(&svc("active", "enabled")));
-        assert!(switch_on(&svc("active", "disabled")));
-        assert!(switch_on(&svc("inactive", "enabled")));
-        assert!(!switch_on(&svc("inactive", "disabled")));
-        assert!(!switch_on(&svc("inactive", "not-found")));
+        assert_eq!(switch_on(&svc("active", "enabled")), Some(true));
+        assert_eq!(switch_on(&svc("active", "disabled")), Some(true));
+        assert_eq!(switch_on(&svc("inactive", "enabled")), Some(true));
+        assert_eq!(switch_on(&svc("inactive", "disabled")), Some(false));
+        assert_eq!(switch_on(&svc("inactive", "not-found")), Some(false));
+        assert_eq!(switch_on(&svc("unknown", "unknown")), None);
+        assert_eq!(switch_on(&svc("timeout", "timeout")), None);
     }
 
     #[test]
