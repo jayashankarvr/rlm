@@ -892,34 +892,6 @@ fn run_guard(action: GuardAction) -> Result<ExitCode> {
     }
 }
 
-/// Best-effort path to name alongside a config error: the user config if it
-/// exists, else the system config, else the user path anyway (the most
-/// likely place someone would go fix it). The error message itself may
-/// already name the specific file that failed to parse; this is a fallback
-/// for errors (like a bad guard value) that don't carry a path of their own.
-fn config_error_path() -> String {
-    let user = dirs::config_dir().map(|d| d.join("rlm").join("config.yaml"));
-    if let Some(p) = &user {
-        if p.exists() {
-            return p.display().to_string();
-        }
-    }
-    let system = std::path::Path::new("/etc/rlm/config.yaml");
-    if system.exists() {
-        return system.display().to_string();
-    }
-    user.map(|p| p.display().to_string())
-        .unwrap_or_else(|| "/etc/rlm/config.yaml".to_string())
-}
-
-/// Format a config-load/validation error for display: the file believed to
-/// be at fault (see [`config_error_path`]) alongside the error's own
-/// message. Pure (no I/O), so the "path + message" contract is testable
-/// without touching the real filesystem.
-fn config_error_line(path: &str, e: &Error) -> String {
-    format!("invalid ({path}): {e}")
-}
-
 /// Validate every imported profile before any of them are written. On
 /// failure nothing is saved: the whole import is rejected, naming every
 /// invalid profile (sorted by name), so `rlm import` can't leave a config
@@ -977,7 +949,13 @@ fn guard_status() -> ExitCode {
     );
     match &config_err {
         None => println!("Config:   ok"),
-        Some(e) => println!("Config:   {}", config_error_line(&config_error_path(), e)),
+        Some(e) => println!(
+            "Config:   {}",
+            rlm_core::guard::report::config_error_line(
+                &rlm_core::guard::report::config_error_path(),
+                e
+            )
+        ),
     }
 
     let sampler =
@@ -1047,7 +1025,13 @@ fn guard_test() -> ExitCode {
     let cfg = match Config::load_validated() {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("error: {}", config_error_line(&config_error_path(), &e));
+            eprintln!(
+                "error: {}",
+                rlm_core::guard::report::config_error_line(
+                    &rlm_core::guard::report::config_error_path(),
+                    &e
+                )
+            );
             return ExitCode::FAILURE;
         }
     };
@@ -1296,20 +1280,6 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(e.contains("rlm unlimit --cgroup app-firefox"), "{e}");
-    }
-
-    /// `guard status`/`guard test` must surface a bad config with both the
-    /// file believed to be at fault and the underlying message (extra item
-    /// #1: previously they called `Config::load().unwrap_or_default()` and
-    /// silently showed defaults). This is the pure formatting half of that
-    /// fix, testable without touching the real filesystem.
-    #[test]
-    fn config_error_line_includes_path_and_message() {
-        let e = Error::Config("guard: bad value".into());
-        assert_eq!(
-            config_error_line("/x/config.yaml", &e),
-            "invalid (/x/config.yaml): config error: guard: bad value"
-        );
     }
 
     #[test]

@@ -5,7 +5,7 @@
 use super::history::HistoryEvent;
 use super::journal::{JournalAction, JournalEntry};
 use super::types::Sample;
-use common::GuardTrigger;
+use common::{Error, GuardTrigger};
 
 /// One line describing a pressure sample: source, PSI averages, and
 /// available memory. `available unknown` replaces the MB figures when
@@ -57,6 +57,36 @@ pub fn intervention_line(e: &JournalEntry) -> String {
 pub fn history_line(e: &HistoryEvent, now: u64) -> String {
     let age = super::history::format_age(now, e.ts);
     format!("{age:>9}  {:<6}  {}  {}", e.kind.word(), e.app, e.detail)
+}
+
+/// Best-effort path to name alongside a config error: the user config if it
+/// exists, else the system config, else the user path anyway (the most
+/// likely place someone would go fix it). The error message itself may
+/// already name the specific file that failed to parse; this is a fallback
+/// for errors (like a bad guard value) that don't carry a path of their own.
+/// Shared by the CLI (`rlm guard status`/`rlm guard test`) and the GUI Guard
+/// page so both name the same file.
+pub fn config_error_path() -> String {
+    let user = dirs::config_dir().map(|d| d.join("rlm").join("config.yaml"));
+    if let Some(p) = &user {
+        if p.exists() {
+            return p.display().to_string();
+        }
+    }
+    let system = std::path::Path::new("/etc/rlm/config.yaml");
+    if system.exists() {
+        return system.display().to_string();
+    }
+    user.map(|p| p.display().to_string())
+        .unwrap_or_else(|| "/etc/rlm/config.yaml".to_string())
+}
+
+/// Format a config-load/validation error for display: the file believed to
+/// be at fault (see [`config_error_path`]) alongside the error's own
+/// message. Pure (no I/O), so the "path + message" contract is testable
+/// without touching the real filesystem.
+pub fn config_error_line(path: &str, e: &Error) -> String {
+    format!("invalid ({path}): {e}")
 }
 
 /// The `Pressure:` line's text when `Sampler::sample` returned `None`:
@@ -122,6 +152,21 @@ mod tests {
         assert_eq!(
             pressure_unavailable(),
             "unavailable (neither app.slice nor system PSI could be read)"
+        );
+    }
+
+    /// `guard status`/`guard test` (and the GUI Guard page) must surface a
+    /// bad config with both the file believed to be at fault and the
+    /// underlying message. This is the pure formatting half of that
+    /// contract, testable without touching the real filesystem. Moved here
+    /// (Task 13 fix round 1, R20) from the CLI so the GUI can share it
+    /// instead of re-deriving its own wording.
+    #[test]
+    fn config_error_line_includes_path_and_message() {
+        let e = Error::Config("guard: bad value".into());
+        assert_eq!(
+            config_error_line("/x/config.yaml", &e),
+            "invalid (/x/config.yaml): config error: guard: bad value"
         );
     }
 }
