@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.2] - 2026-09-27
+
+### Fixed
+
+- GUI, Limit Running: selecting an application no longer merges its PIDs into one bogus PID (for example 2894 and 52896 became 289452896). The PID field keeps the comma-separated list, a long list is never cut inside a number, and a bad entry is reported instead of guessed.
+- GUI: the Mode dropdown shows its value in full; switching modes clears the PID field; the space above Apply Limits and Run Command is back to normal; long text in search, command and profile name fields no longer crashes on non-ASCII characters.
+- GUI, Guard page: the on/off switch is spaced from the status list, and the protected process list scrolls in its own box.
+- GUI: "Also save as a rule for rlm-guard" says after saving whether to restart or turn on the guard, since rlm-guard loads rules when it starts.
+
+### Changed
+
+- GUI: every page's section descriptions and messages were rewritten to match what the app does. The placeholder Credits section is gone, and the About license notice covers 2025-2026.
+
 ## [0.2.1] - 2026-09-27
 
 ### Upgrading from 0.2.0

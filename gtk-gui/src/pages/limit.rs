@@ -10,7 +10,9 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 // Field length limits
-const MAX_PID_LEN: usize = 10;
+/// Longest text the PID field keeps: room for a few hundred PIDs when an
+/// application is selected, which fills the field with a comma-separated list.
+const MAX_PID_LEN: usize = 65536;
 
 struct LimitState {
     pid_entry: adw::EntryRow,
@@ -28,7 +30,6 @@ struct LimitState {
     all_processes: RefCell<Vec<rlm_core::process::ProcessInfo>>,
     profiles: RefCell<Vec<String>>,
     limit_mode: RefCell<LimitMode>,    // Individual or Application
-    selected_pids: RefCell<Vec<u32>>,  // For multi-select in application mode
     save_rule_check: gtk::CheckButton, // Persist as a rule (application mode only)
 }
 
@@ -48,24 +49,28 @@ pub fn create(manager: Option<Arc<CgroupManager>>) -> gtk::Widget {
     // Main heading group
     let header_group = adw::PreferencesGroup::new();
     header_group.set_title("Limit Running Process");
-    header_group.set_description(Some("Apply resource limits to a running process"));
+    header_group.set_description(Some("Limit processes that are already running. Limits last until you remove them or the processes exit."));
     page.add(&header_group);
 
     // Status label for feedback
     let status_label = gtk::Label::new(None);
-    status_label.set_margin_top(12);
-    status_label.set_margin_bottom(12);
     status_label.set_wrap(true);
+    // Only take up room when there is a message; an empty label would push
+    // the button further down the page.
+    status_label.set_visible(false);
+    status_label.connect_label_notify(|l| l.set_visible(!l.label().is_empty()));
 
     // Limit mode selection
     let mode_group = adw::PreferencesGroup::new();
     mode_group.set_title("Limit Mode");
+    mode_group.set_description(Some(
+        "Individual limits one process. Application puts several processes under one shared limit.",
+    ));
 
     let mode_row = adw::ComboRow::new();
     mode_row.set_title("Mode");
-    mode_row.set_subtitle(
-        "Individual: each process gets its own limit. Application: all processes share limits",
-    );
+    // No subtitle: a long one squeezes the selected value down to "A...".
+    // The group description and the hint under Find Process explain the modes.
 
     let mode_list = gtk::StringList::new(&["Individual", "Application (Shared)"]);
     mode_row.set_model(Some(&mode_list));
@@ -77,6 +82,7 @@ pub fn create(manager: Option<Arc<CgroupManager>>) -> gtk::Widget {
     // Target process group
     let target_group = adw::PreferencesGroup::new();
     target_group.set_title("Target Process");
+    target_group.set_description(Some("Type a PID, or pick from the list below"));
 
     let pid_entry = adw::EntryRow::new();
     pid_entry.set_title("Process ID");
@@ -123,7 +129,7 @@ pub fn create(manager: Option<Arc<CgroupManager>>) -> gtk::Widget {
     // Profile selection group
     let profile_group = adw::PreferencesGroup::new();
     profile_group.set_title("Quick Apply");
-    profile_group.set_description(Some("Use a saved profile"));
+    profile_group.set_description(Some("Choosing a profile fills in the limits below"));
 
     let profiles = load_profile_names();
     let profile_list =
@@ -142,8 +148,8 @@ pub fn create(manager: Option<Arc<CgroupManager>>) -> gtk::Widget {
 
     // Limits group
     let limits_group = adw::PreferencesGroup::new();
-    limits_group.set_title("Custom Limits");
-    limits_group.set_description(Some("Or set manually"));
+    limits_group.set_title("Limits");
+    limits_group.set_description(Some("Set at least one. Empty fields stay unlimited."));
 
     // Memory with unit dropdown
     let memory_entry = adw::EntryRow::new();
@@ -189,8 +195,7 @@ pub fn create(manager: Option<Arc<CgroupManager>>) -> gtk::Widget {
     page.add(&limits_group);
 
     // Persist-as-rule toggle (only meaningful in application mode; hidden otherwise)
-    let save_rule_check =
-        gtk::CheckButton::with_label("Save as persistent rule (re-apply across reboots)");
+    let save_rule_check = gtk::CheckButton::with_label("Also save as a rule for rlm-guard");
     save_rule_check.set_halign(gtk::Align::Center);
     save_rule_check.set_visible(false);
 
@@ -199,7 +204,6 @@ pub fn create(manager: Option<Arc<CgroupManager>>) -> gtk::Widget {
     apply_btn.add_css_class("suggested-action");
     apply_btn.add_css_class("pill");
     apply_btn.set_halign(gtk::Align::Center);
-    apply_btn.set_margin_top(24);
     apply_btn.set_margin_bottom(24);
 
     let button_box = gtk::Box::new(gtk::Orientation::Vertical, 12);
@@ -228,7 +232,6 @@ pub fn create(manager: Option<Arc<CgroupManager>>) -> gtk::Widget {
         all_processes: RefCell::new(Vec::new()),
         profiles: RefCell::new(profiles),
         limit_mode: RefCell::new(LimitMode::Individual),
-        selected_pids: RefCell::new(Vec::new()),
         save_rule_check: save_rule_check.clone(),
     }));
 
@@ -247,6 +250,9 @@ pub fn create(manager: Option<Arc<CgroupManager>>) -> gtk::Widget {
             LimitMode::Application
         };
         state_clone.borrow().limit_mode.replace(mode);
+        // A PID list from Application mode means nothing in Individual mode
+        // (and the reverse), so start each mode with an empty selection.
+        state_clone.borrow().pid_entry.set_text("");
         update_mode_info(&mode_info_label_clone, mode);
         // The "save as rule" toggle only applies to application (shared) mode.
         state_clone
@@ -270,8 +276,11 @@ pub fn create(manager: Option<Arc<CgroupManager>>) -> gtk::Widget {
     search_entry.connect_search_changed(move |entry| {
         let text = entry.text();
         // Limit search query length
-        if text.len() > 100 {
-            entry.set_text(&text[..100]);
+        if text.chars().count() > 100 {
+            // Cut on a character boundary; a byte slice panics inside a
+            // multibyte character.
+            let cut: String = text.chars().take(100).collect();
+            entry.set_text(&cut);
             return;
         }
         filter_processes(&state_clone, text.as_str());
@@ -308,8 +317,6 @@ pub fn create(manager: Option<Arc<CgroupManager>>) -> gtk::Widget {
                 }
             }
 
-            state.selected_pids.replace(selected_pids.clone());
-
             // Update PID entry with comma-separated list
             if !selected_pids.is_empty() {
                 let pids_str = selected_pids
@@ -343,22 +350,51 @@ pub fn create(manager: Option<Arc<CgroupManager>>) -> gtk::Widget {
 fn setup_pid_validation(entry: &adw::EntryRow) {
     entry.connect_changed(move |e| {
         let text = e.text();
-        if text.len() > MAX_PID_LEN {
-            e.set_text(&text[..MAX_PID_LEN]);
+        let cleaned = clean_pid_input(&text);
+        if cleaned != text.as_str() {
+            e.set_text(&cleaned);
             return;
         }
-        // Only allow digits
-        let filtered: String = text.chars().filter(|c| c.is_ascii_digit()).collect();
-        if filtered != text.as_str() {
-            e.set_text(&filtered);
-        }
         // Visual feedback
-        if !text.is_empty() && text.parse::<u32>().is_err() {
+        if !text.is_empty() && parse_pid_list(&text).is_none() {
             e.add_css_class("error");
         } else {
             e.remove_css_class("error");
         }
     });
+}
+
+/// Keep only what a PID or a comma-separated PID list can contain (digits,
+/// commas and spaces), capped at [`MAX_PID_LEN`]. Commas must survive:
+/// selecting an application writes its PIDs as "2894,52896", and dropping
+/// the comma would turn that into the single PID 289452896. A cap cuts at
+/// the last comma, never inside a number, for the same reason.
+fn clean_pid_input(text: &str) -> String {
+    let kept: String = text
+        .chars()
+        .filter(|c| c.is_ascii_digit() || *c == ',' || *c == ' ')
+        .collect();
+    if kept.len() <= MAX_PID_LEN {
+        return kept;
+    }
+    let cut = &kept[..MAX_PID_LEN];
+    match cut.rfind(',') {
+        Some(i) => cut[..i].to_string(),
+        None => cut.to_string(),
+    }
+}
+
+/// Parse "123" or "123, 456" into PIDs. `None` if any entry is not a
+/// positive number; empty entries (a trailing comma) are ignored.
+fn parse_pid_list(text: &str) -> Option<Vec<u32>> {
+    let mut pids = Vec::new();
+    for part in text.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        match part.parse::<u32>() {
+            Ok(pid) if pid > 0 => pids.push(pid),
+            _ => return None,
+        }
+    }
+    Some(pids)
 }
 
 fn load_profile_names() -> Vec<String> {
@@ -420,10 +456,10 @@ fn load_all_processes(state: &Rc<RefCell<LimitState>>) {
 fn update_mode_info(label: &gtk::Label, mode: LimitMode) {
     match mode {
         LimitMode::Individual => {
-            label.set_text("Select a single process. Each process gets its own limits.");
+            label.set_text("Select one process. It gets its own limits.");
         }
         LimitMode::Application => {
-            label.set_text("Select multiple processes. All selected processes will share the same limits (combined pool).");
+            label.set_text("Select an application or several processes. They share one set of limits: 4G for 10 processes is 4G in total.");
         }
     }
 }
@@ -475,15 +511,10 @@ fn filter_processes(state: &Rc<RefCell<LimitState>>, query: &str) {
                 select_all_btn.add_css_class("suggested-action");
 
                 let group_pids: Vec<u32> = group.processes.iter().map(|p| p.pid).collect();
-                let state_clone = state.clone();
                 let list_clone = list.clone();
                 let pid_entry_clone = state_ref.pid_entry.clone();
                 select_all_btn.connect_clicked(move |_| {
                     // Select all processes in this group
-                    state_clone
-                        .borrow()
-                        .selected_pids
-                        .replace(group_pids.clone());
                     let pids_str = group_pids
                         .iter()
                         .map(|p| p.to_string())
@@ -632,7 +663,11 @@ fn apply_limits(state: &Rc<RefCell<LimitState>>) {
     }
 
     let Some(ref manager) = state.manager else {
-        show_status(&state.status_label, "Cgroup manager unavailable", true);
+        show_status(
+            &state.status_label,
+            "Cannot set up cgroups for your user. Run rlm doctor in a terminal to see why.",
+            true,
+        );
         return;
     };
 
@@ -691,20 +726,17 @@ fn apply_limits(state: &Rc<RefCell<LimitState>>) {
                 return;
             }
 
-            // Parse comma-separated PIDs or use selected PIDs
-            let pids: Vec<u32> = if !pid_text.contains(',') {
-                // Single PID or use selected
-                if let Ok(pid) = pid_text.parse::<u32>() {
-                    vec![pid]
-                } else {
-                    state.selected_pids.borrow().clone()
+            // The field holds one PID or the selected application's list.
+            let pids: Vec<u32> = match parse_pid_list(&pid_text) {
+                Some(pids) => pids,
+                None => {
+                    show_status(
+                        &state.status_label,
+                        "Invalid PID list (use numbers separated by commas)",
+                        true,
+                    );
+                    return;
                 }
-            } else {
-                // Comma-separated PIDs
-                pid_text
-                    .split(',')
-                    .filter_map(|s| s.trim().parse::<u32>().ok())
-                    .collect()
             };
 
             if pids.is_empty() {
@@ -744,7 +776,7 @@ fn apply_limits(state: &Rc<RefCell<LimitState>>) {
 
                     // Persist as a rule if requested. A rule matches by executable
                     // basename, so only save when every selected PID is the same
-                    // app — otherwise the saved match_exe would be misleading.
+                    // app, otherwise the saved match_exe would be misleading.
                     if state.save_rule_check.is_active() {
                         match common_exe_basename(&state.all_processes.borrow(), &pids) {
                             Some(exe) => match save_app_rule(
@@ -754,7 +786,20 @@ fn apply_limits(state: &Rc<RefCell<LimitState>>) {
                                 io_read.clone(),
                                 io_write.clone(),
                             ) {
-                                Ok(()) => msg.push_str(&format!("; saved persistent rule '{exe}'")),
+                                Ok(()) => {
+                                    // rlm-guard reads rules at startup, so say how to
+                                    // load the new one, as `rlm limit --save` does.
+                                    let active =
+                                        rlm_core::guard::service::query().active == "active";
+                                    msg.push_str(&format!(
+                                        "; saved rule '{exe}' ({})",
+                                        if active {
+                                            "restart the guard to load it"
+                                        } else {
+                                            "turn the guard on to enforce it"
+                                        }
+                                    ))
+                                }
                                 Err(e) => msg.push_str(&format!("; could not save rule: {e}")),
                             },
                             None => msg.push_str(
@@ -764,7 +809,7 @@ fn apply_limits(state: &Rc<RefCell<LimitState>>) {
                     }
 
                     let toast = adw::Toast::new(&msg);
-                    toast.set_timeout(3);
+                    toast.set_timeout(6);
                     state.toast_overlay.add_toast(toast);
                 }
                 Err(e) => show_status(&state.status_label, &format!("{e}"), true),
@@ -777,12 +822,17 @@ fn apply_limits(state: &Rc<RefCell<LimitState>>) {
                 return;
             }
 
-            let pid: u32 = match pid_text.parse() {
+            let pid: u32 = match pid_text.trim().parse() {
                 Ok(p) if p > 0 => p,
                 _ => {
+                    let several = pid_text.trim().contains([',', ' ']);
                     show_status(
                         &state.status_label,
-                        "Invalid PID (must be positive number)",
+                        if several {
+                            "Individual mode takes one PID; to limit several processes together, switch to Application mode"
+                        } else {
+                            "Enter a positive PID"
+                        },
                         true,
                     );
                     return;
@@ -847,4 +897,42 @@ fn find_widget_by_name(widget: &gtk::Widget, name: &str) -> Option<gtk::Widget> 
         child = c.next_sibling();
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn application_pid_list_keeps_its_commas() {
+        assert_eq!(clean_pid_input("2894,52896"), "2894,52896");
+        assert_eq!(clean_pid_input("12a, 3-4"), "12, 34");
+        assert_eq!(parse_pid_list("2894,52896"), Some(vec![2894, 52896]));
+        assert_eq!(parse_pid_list(" 7 , 8,"), Some(vec![7, 8]));
+        assert_eq!(parse_pid_list(""), Some(vec![]));
+        assert_eq!(parse_pid_list("0"), None);
+        assert_eq!(parse_pid_list("99999999999"), None);
+    }
+
+    #[test]
+    fn long_application_lists_are_not_cut_to_one_pid() {
+        let list = (1000..1300)
+            .map(|p| p.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        assert_eq!(clean_pid_input(&list), list);
+        assert_eq!(parse_pid_list(&list).map(|p| p.len()), Some(300));
+    }
+
+    #[test]
+    fn capping_a_huge_list_never_splits_a_pid() {
+        let list = (100_000..120_000)
+            .map(|p| p.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let kept = clean_pid_input(&list);
+        assert!(kept.len() <= MAX_PID_LEN);
+        let pids = parse_pid_list(&kept).unwrap();
+        assert!(pids.iter().all(|p| (100_000..120_000).contains(p)));
+    }
 }

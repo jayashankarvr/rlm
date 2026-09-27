@@ -65,7 +65,9 @@ pub fn create() -> gtk::Widget {
 
     let license_row = adw::ActionRow::new();
     license_row.set_title("Apache License 2.0");
-    license_row.set_subtitle("Open source license allowing commercial use");
+    license_row.set_subtitle(
+        "SPDX: Apache-2.0. The full text is in the LICENSE file of the source repository.",
+    );
     license_group.add(&license_row);
 
     let license_text = gtk::TextView::new();
@@ -87,21 +89,10 @@ pub fn create() -> gtk::Widget {
     license_group.add(&license_scroll);
     page.add(&license_group);
 
-    // Credits group
-    let credits_group = adw::PreferencesGroup::new();
-    credits_group.set_title("Credits");
-
-    let credits_row = adw::ActionRow::new();
-    credits_row.set_title("RLM Contributors");
-    credits_row.set_subtitle("Thank you to all contributors!");
-    credits_group.add(&credits_row);
-
-    page.add(&credits_group);
-
     page.upcast()
 }
 
-const LICENSE_TEXT: &str = r#"Copyright 2025 Jayashankar
+const LICENSE_TEXT: &str = r#"Copyright 2025-2026 Jayashankar
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.

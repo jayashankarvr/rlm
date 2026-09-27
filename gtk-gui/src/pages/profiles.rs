@@ -24,7 +24,7 @@ pub fn create() -> gtk::Widget {
     // Profiles group
     let profiles_group = adw::PreferencesGroup::new();
     profiles_group.set_title("Saved Profiles");
-    profiles_group.set_description(Some("Reusable limit configurations"));
+    profiles_group.set_description(Some("Named sets of limits. Pick one under Profile on Limit Running or Launch New, or use rlm run --profile."));
     profiles_group.set_header_suffix(Some(&add_btn));
 
     page.add(&profiles_group);
@@ -81,7 +81,7 @@ fn refresh_profiles(state: &Rc<RefCell<ProfilesState>>) {
         }
         Err(e) => {
             let error_row = adw::ActionRow::new();
-            error_row.set_title("Error loading profiles");
+            error_row.set_title("Could not load profiles");
             error_row.set_subtitle(&e.to_string());
             group.add(&error_row);
         }
@@ -236,7 +236,7 @@ fn show_profile_dialog(parent: &adw::PreferencesPage, state: &Rc<RefCell<Profile
     // Limits group
     let limits_group = adw::PreferencesGroup::new();
     limits_group.set_title("Resource Limits");
-    limits_group.set_description(Some("Leave empty to skip"));
+    limits_group.set_description(Some("Leave a field empty to leave that resource unlimited"));
 
     // Memory with unit dropdown
     let memory_entry = adw::EntryRow::new();
@@ -498,14 +498,14 @@ fn show_edit_profile_dialog(parent: &adw::PreferencesPage, name: &str, profile: 
 
     let name_label = adw::ActionRow::new();
     name_label.set_title(name);
-    name_label.set_subtitle("Name cannot be changed");
+    name_label.set_subtitle("To rename, create a new profile and delete this one");
     name_group.add(&name_label);
     form_box.append(&name_group);
 
     // Limits group
     let limits_group = adw::PreferencesGroup::new();
     limits_group.set_title("Resource Limits");
-    limits_group.set_description(Some("Leave empty to skip"));
+    limits_group.set_description(Some("Leave a field empty to leave that resource unlimited"));
 
     // Helper to extract numeric value and unit index from limit string
     fn parse_limit(limit: Option<&String>) -> (String, u32) {
@@ -695,8 +695,11 @@ fn save_profile_to_config(name: &str, profile: Profile, state: &Rc<RefCell<Profi
 fn setup_name_validation(entry: &adw::EntryRow) {
     entry.connect_changed(move |e| {
         let text = e.text();
-        if text.len() > MAX_NAME_LEN {
-            e.set_text(&text[..MAX_NAME_LEN]);
+        if text.chars().count() > MAX_NAME_LEN {
+            // Cut on a character boundary; a byte slice panics inside a
+            // multibyte character.
+            let cut: String = text.chars().take(MAX_NAME_LEN).collect();
+            e.set_text(&cut);
             return;
         }
         // Visual feedback for empty or whitespace-only name

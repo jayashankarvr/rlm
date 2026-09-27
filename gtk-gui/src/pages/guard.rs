@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 const HISTORY_SHOWN: usize = 20;
 
 /// `service::query` spawns two `systemctl --user` calls, each with its own
-/// 1s timeout (see `rlm_core::guard::service::SYSTEMCTL_TIMEOUT`) — cheap
+/// 1s timeout (see `rlm_core::guard::service::SYSTEMCTL_TIMEOUT`); cheap
 /// once, but the auto-refresh timer (`window.rs`) calls `refresh` every 2s,
 /// which would otherwise spawn `systemctl` every 2s on the GTK main thread.
 /// Cache the service state and only re-query every `SERVICE_QUERY_INTERVAL`;
@@ -376,23 +376,34 @@ pub fn create() -> gtk::Widget {
     page.set_title("Guard");
     page.set_icon_name(Some("security-high-symbolic"));
 
-    let status_group = adw::PreferencesGroup::new();
-    status_group.set_title("Status");
-    let refresh_btn = gtk::Button::from_icon_name("view-refresh-symbolic");
-    refresh_btn.add_css_class("flat");
-    refresh_btn.set_tooltip_text(Some("Refresh"));
-    status_group.set_header_suffix(Some(&refresh_btn));
+    // The on/off switch is a control, not part of the status readout, so it
+    // gets its own group (and the spacing that comes with it).
+    let control_group = adw::PreferencesGroup::new();
     let switch = adw::SwitchRow::new();
     switch.set_widget_name("guard-switch");
     switch.set_title("Run the guard");
     switch.set_subtitle(SWITCH_SUBTITLE);
-    status_group.add(&switch);
+    control_group.add(&switch);
+    page.add(&control_group);
+
+    let status_group = adw::PreferencesGroup::new();
+    status_group.set_title("Status");
+    status_group.set_description(Some(
+        "Service and config state, memory pressure, and when the guard acts",
+    ));
+    let refresh_btn = gtk::Button::from_icon_name("view-refresh-symbolic");
+    refresh_btn.add_css_class("flat");
+    refresh_btn.set_tooltip_text(Some("Refresh"));
+    status_group.set_header_suffix(Some(&refresh_btn));
     let status_list = new_list_box("guard-status-list");
     status_group.add(&status_list);
     page.add(&status_group);
 
     let interventions_group = adw::PreferencesGroup::new();
     interventions_group.set_title("Active interventions");
+    interventions_group.set_description(Some(
+        "Apps the guard has frozen or capped right now. They are restored when pressure eases or the guard stops.",
+    ));
     let interventions_list = new_list_box("guard-interventions-list");
     interventions_group.add(&interventions_list);
     page.add(&interventions_group);
@@ -409,10 +420,17 @@ pub fn create() -> gtk::Widget {
     let protect_group = adw::PreferencesGroup::new();
     protect_group.set_title("Protected processes");
     protect_group.set_description(Some(
-        "The guard never freezes or caps these. Add names under guard.selection.protect in ~/.config/rlm/config.yaml.",
+        "The guard never freezes these; an app that shares a scope with one can only be capped. Add names under guard.selection.protect in ~/.config/rlm/config.yaml.",
     ));
     let protect_list = new_list_box("guard-protect-list");
-    protect_group.add(&protect_list);
+    // The built-in list alone is 40+ names; scroll inside a fixed-height box
+    // so it does not push the rest of the page down.
+    let protect_scroll = gtk::ScrolledWindow::new();
+    protect_scroll.set_hscrollbar_policy(gtk::PolicyType::Never);
+    protect_scroll.set_min_content_height(240);
+    protect_scroll.set_max_content_height(240);
+    protect_scroll.set_child(Some(&protect_list));
+    protect_group.add(&protect_scroll);
     page.add(&protect_group);
 
     let widget = page.upcast::<gtk::Widget>();
