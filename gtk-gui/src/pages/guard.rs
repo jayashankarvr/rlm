@@ -428,8 +428,6 @@ impl GuardPage {
         let service_row = status_row(&status_list, "Service");
         let config_row = status_row(&status_list, "Config");
         let config_icon = gtk::Image::from_icon_name("dialog-warning-symbolic");
-        config_icon.set_visible(false);
-        config_row.add_prefix(&config_icon);
         let pressure_row = status_row(&status_list, "Pressure");
         let policy_row = status_row(&status_list, "Policy");
         status_group.add(&status_list);
@@ -543,11 +541,15 @@ impl GuardPage {
         match &view.config {
             Ok(()) => {
                 self.config_row.set_subtitle("Valid");
-                self.config_icon.set_visible(false);
+                if self.config_icon.parent().is_some() {
+                    self.config_row.remove(&self.config_icon);
+                }
             }
             Err(e) => {
                 self.config_row.set_subtitle(e);
-                self.config_icon.set_visible(true);
+                if self.config_icon.parent().is_none() {
+                    self.config_row.add_prefix(&self.config_icon);
+                }
             }
         }
         self.pressure_row.set_subtitle(&view.pressure);

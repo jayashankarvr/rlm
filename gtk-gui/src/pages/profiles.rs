@@ -68,7 +68,8 @@ pub fn check_form(name: &str, profile: &Profile) -> Result<(), FormProblem> {
         profile.io_read.as_deref(),
         profile.io_write.as_deref(),
     )
-    .map_err(|e| FormProblem::Invalid(e.to_string()))?;
+    // Only the first line: later lines are CLI hints about argument syntax.
+    .map_err(|e| FormProblem::Invalid(e.to_string().lines().next().unwrap_or("").to_string()))?;
     if name.trim().is_empty() {
         return Err(FormProblem::NoName);
     }
@@ -76,6 +77,15 @@ pub fn check_form(name: &str, profile: &Profile) -> Result<(), FormProblem> {
         return Err(FormProblem::NoLimits);
     }
     Ok(())
+}
+
+/// Whether two profiles set the same limits and match the same executables.
+fn same_limits(a: &Profile, b: &Profile) -> bool {
+    a.match_exe == b.match_exe
+        && a.memory == b.memory
+        && a.cpu == b.cpu
+        && a.io_read == b.io_read
+        && a.io_write == b.io_write
 }
 
 /// Every profile to list, sorted by name, with where it comes from.
@@ -86,13 +96,12 @@ pub fn listed_profiles(config: &Config) -> Vec<(String, Profile, Origin)> {
         .profile_names()
         .into_iter()
         .filter_map(|name| {
-            let origin = match (
-                presets.contains_key(&name),
-                config.profiles.contains_key(&name),
-            ) {
-                (true, false) => Origin::Builtin,
-                (true, true) => Origin::ChangedBuiltin,
-                (false, _) => Origin::User,
+            // A saved copy of a preset that matches it exactly still counts
+            // as the preset.
+            let origin = match (presets.get(&name), config.profiles.get(&name)) {
+                (Some(preset), Some(mine)) if !same_limits(preset, mine) => Origin::ChangedBuiltin,
+                (Some(_), _) => Origin::Builtin,
+                (None, _) => Origin::User,
             };
             let profile = all.get(&name)?.clone();
             Some((name, profile, origin))
@@ -364,7 +373,7 @@ impl ProfilesPage {
             .title(title)
             .modal(true)
             .default_width(450)
-            .default_height(460)
+            .default_height(580)
             .build();
         if let Some(ref win) = parent_window {
             dialog.set_transient_for(Some(win));
@@ -618,10 +627,13 @@ mod tests {
 
         // Below the 8 MiB floor and a zero CPU both fail to parse.
         let tiny = profile_from_fields(("1", "M"), "", ("", "M"), ("", "M"));
-        assert!(matches!(
-            check_form("Web", &tiny),
-            Err(FormProblem::Invalid(_))
-        ));
+        match check_form("Web", &tiny) {
+            Err(FormProblem::Invalid(msg)) => {
+                assert!(msg.contains("8M minimum"), "{msg}");
+                assert!(!msg.contains('\n'), "CLI hint leaked: {msg}");
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
         let zero_cpu = profile_from_fields(("", "M"), "0", ("", "M"), ("", "M"));
         assert!(matches!(
             check_form("", &zero_cpu),
@@ -646,6 +658,9 @@ mod tests {
                 ..Profile::default()
             },
         );
+        config
+            .profiles
+            .insert("Heavy".into(), builtin_presets()["Heavy"].clone());
         let listed = listed_profiles(&config);
         let origin = |n: &str| listed.iter().find(|(name, _, _)| name == n).map(|e| e.2);
         assert_eq!(origin("Heavy"), Some(Origin::Builtin));
