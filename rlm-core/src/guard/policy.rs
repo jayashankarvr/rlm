@@ -274,7 +274,7 @@ impl PolicyEngine {
         {
             let message = match &victim_name {
                 Some(name) => format!(
-                    "rlm-guard: memory pressure {:?} — acting on {}",
+                    "rlm-guard: memory pressure {:?}, acting on {}",
                     self.level, name
                 ),
                 None => format!("rlm-guard: memory pressure {:?}", self.level),
