@@ -48,9 +48,9 @@ pub struct StatusFields {
 ///
 /// - `Uid:` line is `Uid:\t<real>\t<effective>\t<saved>\t<fs>`; we take the
 ///   first (real) field.
-/// - `Name:` is the comm, truncated to 15 chars by the kernel — that's fine,
+/// - `Name:` is the comm, truncated to 15 chars by the kernel; that is fine:
 ///   it matches the protect-list which also compares against comm.
-/// - `VmSwap:` may be absent (e.g. kernel thread / no swap) — treated as 0.
+/// - `VmSwap:` may be absent (e.g. kernel thread / no swap) and then counts as 0.
 ///
 /// Returns `None` only if the required `Uid:` or `Name:` lines are missing.
 pub fn parse_status(status: &str) -> Option<StatusFields> {
@@ -103,6 +103,13 @@ pub struct ProcessGroup {
     pub name: String,
     pub executable: Option<PathBuf>,
     pub processes: Vec<ProcessInfo>,
+}
+
+impl ProcessGroup {
+    /// Memory of all processes in the group (RSS + swap), in KB.
+    pub fn rss_kb(&self) -> u64 {
+        self.processes.iter().map(|p| p.rss_kb).sum()
+    }
 }
 
 /// Read process stat file to get PPID and session
@@ -312,7 +319,8 @@ pub fn find_by_name_for_uid(name: &str, uid: u32) -> Result<NameMatches> {
     Ok(NameMatches { pids, other_users })
 }
 
-/// Group processes by executable path (same application)
+/// Group processes by executable basename (same application), largest
+/// memory first. Apps with a single process get a group of their own.
 pub fn group_by_executable(processes: &[ProcessInfo]) -> Vec<ProcessGroup> {
     let mut groups: HashMap<String, Vec<ProcessInfo>> = HashMap::new();
 
@@ -338,12 +346,11 @@ pub fn group_by_executable(processes: &[ProcessInfo]) -> Vec<ProcessGroup> {
                 processes: procs,
             }
         })
-        .filter(|group| group.processes.len() > 1) // Only groups with multiple processes
         .collect();
+    // Biggest memory users first: those are the apps worth limiting.
     groups.sort_by(|a, b| {
-        b.processes
-            .len()
-            .cmp(&a.processes.len())
+        b.rss_kb()
+            .cmp(&a.rss_kb())
             .then_with(|| a.name.cmp(&b.name))
     });
     groups
@@ -499,26 +506,29 @@ mod tests {
     }
 
     #[test]
-    fn groups_are_ordered_by_size_then_name() {
-        let p = |pid: u32, exe: &str| ProcessInfo {
+    fn groups_are_ordered_by_memory_then_name() {
+        let p = |pid: u32, exe: &str, rss_kb: u64| ProcessInfo {
             pid,
             name: exe.into(),
             executable: Some(format!("/bin/{exe}").into()),
+            rss_kb,
             ..Default::default()
         };
         let procs = vec![
-            p(1, "b"),
-            p(2, "b"),
-            p(3, "a"),
-            p(4, "a"),
-            p(5, "c"),
-            p(6, "c"),
-            p(7, "c"),
+            p(1, "b", 100),
+            p(2, "b", 100),
+            p(3, "a", 150),
+            p(4, "a", 50),
+            p(5, "c", 10),
+            p(6, "c", 10),
+            p(7, "c", 10),
+            p(8, "d", 900),
         ];
-        let names: Vec<String> = group_by_executable(&procs)
-            .into_iter()
-            .map(|g| g.name)
-            .collect();
-        assert_eq!(names, vec!["c", "a", "b"]);
+        let groups = group_by_executable(&procs);
+        let names: Vec<&str> = groups.iter().map(|g| g.name.as_str()).collect();
+        // Single-process apps are listed too; equal memory sorts by name.
+        assert_eq!(names, vec!["d", "a", "b", "c"]);
+        assert_eq!(groups[0].rss_kb(), 900);
+        assert_eq!(groups[1].rss_kb(), 200);
     }
 }

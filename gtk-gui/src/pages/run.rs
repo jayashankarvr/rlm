@@ -1,6 +1,8 @@
 use crate::widgets::{
-    create_unit_dropdown, get_unit_suffix, parse_cpu_value, set_value_with_unit,
-    setup_number_validation,
+    cpu_suffix_label, create_io_unit_dropdown, create_unit_dropdown, fit_list_height,
+    get_unit_suffix, limits_description, list_scroller, on_enter, parse_cpu_value, require_manager,
+    set_value_with_unit, setup_number_validation, setup_size_validation, status_toast,
+    with_action_bar, NO_MANAGER_HINT,
 };
 use adw::prelude::*;
 use gtk::glib;
@@ -26,7 +28,6 @@ struct RunState {
     toast_overlay: adw::ToastOverlay,
     app_list: gtk::ListBox,
     manager: Option<Arc<CgroupManager>>,
-    profiles: RefCell<Vec<String>>,
     all_apps: RefCell<Vec<rlm_core::desktop::DesktopApp>>,
     running_pid: RefCell<Option<u32>>,
     cgroup_name: RefCell<Option<String>>,
@@ -90,13 +91,11 @@ pub fn create(manager: Option<Arc<CgroupManager>>) -> gtk::Widget {
 
     // App list
     let app_list = gtk::ListBox::new();
-    app_list.set_selection_mode(gtk::SelectionMode::None);
+    // The picked app stays highlighted while the command is its command.
+    app_list.set_selection_mode(gtk::SelectionMode::Single);
     app_list.add_css_class("boxed-list");
 
-    let scroll = gtk::ScrolledWindow::new();
-    scroll.set_child(Some(&app_list));
-    scroll.set_min_content_height(150);
-    scroll.set_max_content_height(200);
+    let scroll = list_scroller(&app_list);
 
     apps_group.add(&scroll);
     page.add(&apps_group);
@@ -124,15 +123,14 @@ pub fn create(manager: Option<Arc<CgroupManager>>) -> gtk::Widget {
     // Limits group
     let limits_group = adw::PreferencesGroup::new();
     limits_group.set_title("Limits");
-    limits_group.set_description(Some("Set at least one. Empty fields stay unlimited."));
+    limits_group.set_description(Some(&limits_description()));
 
     // Memory with unit dropdown
     let memory_entry = adw::EntryRow::new();
     memory_entry.set_title("Memory");
-    memory_entry.set_input_purpose(gtk::InputPurpose::Digits);
-    setup_number_validation(&memory_entry);
+    memory_entry.set_input_purpose(gtk::InputPurpose::Number);
+    setup_size_validation(&memory_entry);
     let memory_unit = create_unit_dropdown();
-    memory_unit.set_selected(1); // Default to MB
     memory_entry.add_suffix(&memory_unit);
     limits_group.add(&memory_entry);
 
@@ -141,29 +139,24 @@ pub fn create(manager: Option<Arc<CgroupManager>>) -> gtk::Widget {
     cpu_entry.set_title("CPU");
     cpu_entry.set_input_purpose(gtk::InputPurpose::Digits);
     setup_number_validation(&cpu_entry);
-    let cpu_suffix = gtk::Label::new(Some("%"));
-    cpu_suffix.add_css_class("dim-label");
-    cpu_suffix.set_margin_start(4);
-    cpu_entry.add_suffix(&cpu_suffix);
+    cpu_entry.add_suffix(&cpu_suffix_label());
     limits_group.add(&cpu_entry);
 
     // I/O Read with unit dropdown
     let io_read_entry = adw::EntryRow::new();
     io_read_entry.set_title("I/O Read");
-    io_read_entry.set_input_purpose(gtk::InputPurpose::Digits);
-    setup_number_validation(&io_read_entry);
-    let io_read_unit = create_unit_dropdown();
-    io_read_unit.set_selected(1); // Default to MB
+    io_read_entry.set_input_purpose(gtk::InputPurpose::Number);
+    setup_size_validation(&io_read_entry);
+    let io_read_unit = create_io_unit_dropdown();
     io_read_entry.add_suffix(&io_read_unit);
     limits_group.add(&io_read_entry);
 
     // I/O Write with unit dropdown
     let io_write_entry = adw::EntryRow::new();
     io_write_entry.set_title("I/O Write");
-    io_write_entry.set_input_purpose(gtk::InputPurpose::Digits);
-    setup_number_validation(&io_write_entry);
-    let io_write_unit = create_unit_dropdown();
-    io_write_unit.set_selected(1); // Default to MB
+    io_write_entry.set_input_purpose(gtk::InputPurpose::Number);
+    setup_size_validation(&io_write_entry);
+    let io_write_unit = create_io_unit_dropdown();
     io_write_entry.add_suffix(&io_write_unit);
     limits_group.add(&io_write_entry);
 
@@ -174,15 +167,7 @@ pub fn create(manager: Option<Arc<CgroupManager>>) -> gtk::Widget {
     run_btn.add_css_class("suggested-action");
     run_btn.add_css_class("pill");
     run_btn.set_halign(gtk::Align::Center);
-    run_btn.set_margin_bottom(24);
-
-    let button_box = gtk::Box::new(gtk::Orientation::Vertical, 12);
-    button_box.append(&status_label);
-    button_box.append(&run_btn);
-
-    let button_group = adw::PreferencesGroup::new();
-    button_group.add(&button_box);
-    page.add(&button_group);
+    require_manager(&run_btn, manager.is_some());
 
     // Store state
     let state = Rc::new(RefCell::new(RunState {
@@ -198,7 +183,6 @@ pub fn create(manager: Option<Arc<CgroupManager>>) -> gtk::Widget {
         toast_overlay: toast_overlay.clone(),
         app_list: app_list.clone(),
         manager: manager.clone(),
-        profiles: RefCell::new(profiles),
         all_apps: RefCell::new(Vec::new()),
         running_pid: RefCell::new(None),
         cgroup_name: RefCell::new(None),
@@ -233,7 +217,7 @@ pub fn create(manager: Option<Arc<CgroupManager>>) -> gtk::Widget {
     // Profile selection handler
     let state_clone = state.clone();
     profile_dropdown.connect_selected_notify(move |dropdown| {
-        apply_profile(&state_clone, dropdown.selected() as usize);
+        apply_profile(&state_clone, selected_profile(dropdown).as_deref());
     });
 
     // Run button handler
@@ -242,7 +226,33 @@ pub fn create(manager: Option<Arc<CgroupManager>>) -> gtk::Widget {
         run_command(&state_clone);
     });
 
-    toast_overlay.set_child(Some(&page));
+    // Editing the command away from the picked app's drops the highlight.
+    let app_list_clone = app_list.clone();
+    command_entry.connect_changed(move |entry| {
+        let picked = app_list_clone
+            .selected_row()
+            .and_downcast::<adw::ActionRow>()
+            .and_then(|row| row.subtitle());
+        let text = glib::markup_escape_text(&entry.text());
+        if picked.is_some_and(|sub| sub != text) {
+            app_list_clone.unselect_all();
+        }
+    });
+
+    // Enter in a field does what the button does.
+    let state_clone = state.clone();
+    on_enter(
+        &[
+            &command_entry,
+            &memory_entry,
+            &cpu_entry,
+            &io_read_entry,
+            &io_write_entry,
+        ],
+        move || run_command(&state_clone),
+    );
+
+    toast_overlay.set_child(Some(&with_action_bar(&page, &status_label, &run_btn)));
     toast_overlay.upcast()
 }
 
@@ -300,6 +310,7 @@ fn filter_apps(state: &Rc<RefCell<RunState>>, query: &str) {
         } else {
             "No matching applications"
         });
+        row.set_selectable(false);
         list.append(&row);
     } else {
         for app in filtered {
@@ -315,35 +326,58 @@ fn filter_apps(state: &Rc<RefCell<RunState>>, query: &str) {
             });
 
             list.append(&row);
+            if app.exec == state_ref.command_entry.text().as_str() {
+                list.select_row(Some(&row));
+            }
         }
     }
+    fit_list_height(list);
 }
 
-fn apply_profile(state: &Rc<RefCell<RunState>>, index: usize) {
-    let state = state.borrow();
-    let profiles = state.profiles.borrow();
+/// The profile name a dropdown shows, or `None` for "(None)".
+fn selected_profile(dropdown: &gtk::DropDown) -> Option<String> {
+    if dropdown.selected() == 0 {
+        return None;
+    }
+    dropdown
+        .selected_item()
+        .and_downcast::<gtk::StringObject>()
+        .map(|s| s.string().to_string())
+}
 
-    if index == 0 || index >= profiles.len() {
+/// Fill the limit fields from a profile. Every field is cleared first, so
+/// a limit the profile leaves unset does not keep an earlier profile's value.
+fn apply_profile(state: &Rc<RefCell<RunState>>, name: Option<&str>) {
+    let Some(name) = name else {
         return;
-    }
-
-    let profile_name = &profiles[index];
-    if let Ok(config) = common::Config::load() {
-        if let Some(profile) = config.get_profile(profile_name) {
-            if let Some(ref mem) = profile.memory {
-                set_value_with_unit(&state.memory_entry, &state.memory_unit, mem);
-            }
-            if let Some(ref cpu) = profile.cpu {
-                state.cpu_entry.set_text(&parse_cpu_value(cpu));
-            }
-            if let Some(ref ior) = profile.io_read {
-                set_value_with_unit(&state.io_read_entry, &state.io_read_unit, ior);
-            }
-            if let Some(ref iow) = profile.io_write {
-                set_value_with_unit(&state.io_write_entry, &state.io_write_unit, iow);
-            }
+    };
+    let Some(profile) = common::Config::load()
+        .ok()
+        .and_then(|config| config.get_profile(name))
+    else {
+        return;
+    };
+    let state = state.borrow();
+    let fill = |entry: &adw::EntryRow, unit: &gtk::DropDown, value: &Option<String>| {
+        entry.set_text("");
+        if let Some(value) = value {
+            set_value_with_unit(entry, unit, value);
         }
-    }
+    };
+    fill(&state.memory_entry, &state.memory_unit, &profile.memory);
+    state.cpu_entry.set_text(
+        &profile
+            .cpu
+            .as_deref()
+            .map(parse_cpu_value)
+            .unwrap_or_default(),
+    );
+    fill(&state.io_read_entry, &state.io_read_unit, &profile.io_read);
+    fill(
+        &state.io_write_entry,
+        &state.io_write_unit,
+        &profile.io_write,
+    );
 }
 
 fn run_command(state: &Rc<RefCell<RunState>>) {
@@ -370,11 +404,7 @@ fn run_command(state: &Rc<RefCell<RunState>>) {
     }
 
     let Some(ref manager) = state.manager else {
-        show_status(
-            &state.status_label,
-            "Cannot set up cgroups for your user. Run rlm doctor in a terminal to see why.",
-            true,
-        );
+        show_status(&state.status_label, NO_MANAGER_HINT, true);
         return;
     };
 
@@ -425,13 +455,14 @@ fn run_command(state: &Rc<RefCell<RunState>>) {
         }
     };
 
-    let parts: Vec<&str> = command_text.split_whitespace().collect();
-    if parts.is_empty() {
-        show_status(&state.status_label, "Enter a command", true);
-        return;
-    }
-
-    let program = parts[0];
+    let parts = match split_command(&command_text) {
+        Ok(parts) => parts,
+        Err(message) => {
+            show_status(&state.status_label, &message, true);
+            return;
+        }
+    };
+    let program = parts[0].as_str();
     let args = &parts[1..];
 
     let count = RUN_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -489,8 +520,7 @@ fn run_command(state: &Rc<RefCell<RunState>>) {
             true,
         );
     }
-    let toast = adw::Toast::new(&format!("Started {} (PID {})", program, pid));
-    toast.set_timeout(3);
+    let toast = status_toast(&format!("Started {} (PID {})", program, pid), 5);
     state.toast_overlay.add_toast(toast);
 
     // Monitor process exit. glib reaps the child here; std must not wait on it.
@@ -550,6 +580,24 @@ fn run_command(state: &Rc<RefCell<RunState>>) {
         toast.set_timeout(5);
         toast_overlay.add_toast(toast);
     });
+}
+
+/// Split a command line like a shell does (quotes group words), without
+/// running a shell. Always at least one word on success.
+fn split_command(text: &str) -> Result<Vec<String>, String> {
+    if text.trim().is_empty() {
+        return Err("Enter a command".into());
+    }
+    let argv = glib::shell_parse_argv(text)
+        .map_err(|e| format!("Could not read the command: {}", e.message()))?;
+    let parts: Vec<String> = argv
+        .into_iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    if parts.is_empty() {
+        return Err("Enter a command".into());
+    }
+    Ok(parts)
 }
 
 /// What the post-exit cleanup does with a launched app's cgroup on one poll.
@@ -617,10 +665,26 @@ pub fn refresh_profiles(widget: &gtk::Widget) {
     if let Some(dropdown) = find_widget_by_name(widget, "run-profile-dropdown") {
         if let Some(dropdown) = dropdown.downcast_ref::<gtk::DropDown>() {
             let profiles = load_profile_names();
+            let current = selected_profile(dropdown);
+            let unchanged = dropdown.model().is_some_and(|m| {
+                m.n_items() as usize == profiles.len()
+                    && profiles.iter().enumerate().all(|(i, name)| {
+                        m.item(i as u32)
+                            .and_downcast::<gtk::StringObject>()
+                            .is_some_and(|s| s.string() == name.as_str())
+                    })
+            });
+            if unchanged {
+                return;
+            }
             let profile_list =
                 gtk::StringList::new(&profiles.iter().map(|s| s.as_str()).collect::<Vec<_>>());
             dropdown.set_model(Some(&profile_list));
-            dropdown.set_selected(0);
+            // Keep the chosen profile selected while it still exists.
+            let keep = current
+                .and_then(|c| profiles.iter().position(|p| *p == c))
+                .unwrap_or(0);
+            dropdown.set_selected(keep as u32);
         }
     }
 }
@@ -642,6 +706,20 @@ fn find_widget_by_name(widget: &gtk::Widget, name: &str) -> Option<gtk::Widget> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn commands_split_like_a_shell() {
+        assert_eq!(
+            split_command("'/opt/My App/app' --flag").unwrap(),
+            ["/opt/My App/app", "--flag"]
+        );
+        assert_eq!(
+            split_command(r#"sh -c "echo hi; sleep 1""#).unwrap(),
+            ["sh", "-c", "echo hi; sleep 1"]
+        );
+        assert_eq!(split_command("  ").unwrap_err(), "Enter a command");
+        assert!(split_command("app 'open").is_err());
+    }
 
     #[test]
     fn cleanup_keeps_polling_while_the_cgroup_exists() {
