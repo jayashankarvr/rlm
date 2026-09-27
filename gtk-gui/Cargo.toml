@@ -49,3 +49,6 @@ tracing.workspace = true
 gtk = { package = "gtk4", version = "0.9.6" }
 adw = { package = "libadwaita", version = "0.7.1", features = ["v1_4"] }
 open = "5"
+
+[dev-dependencies]
+tempfile = "3"

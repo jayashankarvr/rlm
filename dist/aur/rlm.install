@@ -5,3 +5,14 @@ post_install() {
 post_upgrade() {
   echo "rlm: restart the guard to use the new version: systemctl --user restart rlm-guard"
 }
+pre_remove() {
+  # Stop the guard in every running user session before its binary goes away,
+  # so it can undo any freeze or cap it holds (it does that on SIGTERM).
+  if [ -d /run/systemd/system ]; then
+    for uid in $(loginctl list-users --no-legend 2>/dev/null | awk '{print $1}'); do
+      user=$(id -nu "$uid" 2>/dev/null) || continue
+      systemctl --user -M "$user@" disable --now rlm-guard.service >/dev/null 2>&1 || true
+    done
+    systemctl --global disable rlm-guard.service >/dev/null 2>&1 || true
+  fi
+}

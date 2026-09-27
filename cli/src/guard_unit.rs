@@ -21,14 +21,29 @@ pub const SYSTEM_UNIT_DIRS: &[&str] = &[
     "/lib/systemd/user",
 ];
 
-/// `path` as an `ExecStart` argument, double-quoted when it contains
-/// whitespace.
+/// `path` as an `ExecStart` argument. systemd expands `%` specifiers and
+/// `$` variables and processes C-style escapes in `ExecStart=`, so `%` and
+/// `$` are doubled and `\`, `"` and `'` are backslash-escaped. The result is
+/// double-quoted when the path has whitespace or quotes.
 pub fn exec_arg(path: &Path) -> String {
     let s = path.display().to_string();
-    if s.chars().any(char::is_whitespace) {
-        format!("\"{s}\"")
+    let mut out = String::with_capacity(s.len() + 2);
+    for c in s.chars() {
+        match c {
+            '%' => out.push_str("%%"),
+            '$' => out.push_str("$$"),
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\'' => out.push_str("\\'"),
+            c => out.push(c),
+        }
+    }
+    if s.chars()
+        .any(|c| c.is_whitespace() || c == '"' || c == '\'')
+    {
+        format!("\"{out}\"")
     } else {
-        s
+        out
     }
 }
 
@@ -59,7 +74,9 @@ fn is_executable(p: &Path) -> bool {
 }
 
 /// The `rlm-guard` next to the running `rlm` first, then the first one on
-/// `path_env`.
+/// `path_env`. Relative `PATH` entries (including empty ones and `.`) are
+/// skipped: they depend on the working directory, and the result ends up in
+/// a unit's `ExecStart`.
 pub fn find_guard_binary(current_exe: Option<&Path>, path_env: Option<&OsStr>) -> Option<PathBuf> {
     let sibling = current_exe
         .and_then(Path::parent)
@@ -67,6 +84,7 @@ pub fn find_guard_binary(current_exe: Option<&Path>, path_env: Option<&OsStr>) -
     let on_path = path_env
         .into_iter()
         .flat_map(std::env::split_paths)
+        .filter(|dir| dir.is_absolute())
         .map(|dir| dir.join("rlm-guard"));
     sibling
         .into_iter()
@@ -141,6 +159,50 @@ pub fn plan_enable(
     }
 }
 
+/// Error for `rlm guard enable` when `systemctl --user is-enabled` reports
+/// the unit as masked (`masked` or `masked-runtime`). A masked user unit is
+/// a symlink to `/dev/null` at the user unit path, which would otherwise read
+/// as an empty user-written unit and be kept as "your own".
+pub fn masked_error(enabled: &str) -> Option<String> {
+    let runtime = match enabled {
+        "masked" => false,
+        "masked-runtime" => true,
+        _ => return None,
+    };
+    let unmask = if runtime {
+        "systemctl --user unmask --runtime rlm-guard"
+    } else {
+        "systemctl --user unmask rlm-guard"
+    };
+    Some(format!(
+        "the rlm-guard unit is masked, so systemd will not start it. Unmask it with: {unmask} and then rerun: rlm guard enable"
+    ))
+}
+
+/// Write `contents` to `path` through a temporary file in the same
+/// directory and a rename, so an interrupted write never leaves a truncated
+/// unit behind. The temporary name does not end in `.service`, so systemd
+/// ignores it if it is left over.
+pub fn write_atomically(path: &Path, contents: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let dir = path.parent().unwrap_or(Path::new("."));
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let tmp = dir.join(format!(".{name}.tmp-{}", std::process::id()));
+    let result = std::fs::File::create(&tmp)
+        .and_then(|mut f| {
+            f.write_all(contents.as_bytes())?;
+            f.sync_all()
+        })
+        .and_then(|()| std::fs::rename(&tmp, path));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
 /// Note for `rlm guard enable` when the service was already running before
 /// the command. `systemctl enable --now` does not restart a running unit,
 /// so the old process keeps going until the user restarts it.
@@ -174,6 +236,34 @@ mod tests {
     }
 
     #[test]
+    fn masked_units_get_an_unmask_hint() {
+        assert_eq!(masked_error("enabled"), None);
+        assert_eq!(masked_error("disabled"), None);
+        assert_eq!(masked_error("not-found"), None);
+        let m = masked_error("masked").unwrap();
+        assert!(m.contains("masked"));
+        assert!(m.contains("systemctl --user unmask rlm-guard"));
+        assert!(masked_error("masked-runtime")
+            .unwrap()
+            .contains("systemctl --user unmask --runtime rlm-guard"));
+    }
+
+    #[test]
+    fn write_atomically_replaces_the_file_and_leaves_no_temp() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("rlm-guard.service");
+        std::fs::write(&p, "old contents that are longer than the new ones\n").unwrap();
+        write_atomically(&p, "new\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "new\n");
+        let names: Vec<_> = std::fs::read_dir(d.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("rlm-guard.service")]);
+        assert!(write_atomically(&d.path().join("missing/rlm-guard.service"), "x").is_err());
+    }
+
+    #[test]
     fn render_replaces_only_exec_start_and_marks_the_file() {
         let out = render_user_unit(UNIT_TEMPLATE, Path::new("/home/u/.cargo/bin/rlm-guard"));
         assert!(out.starts_with(GENERATED_MARKER));
@@ -191,6 +281,34 @@ mod tests {
         assert_eq!(
             exec_arg(Path::new("/usr/bin/rlm-guard")),
             "/usr/bin/rlm-guard"
+        );
+    }
+
+    #[test]
+    fn exec_arg_escapes_systemd_syntax() {
+        assert_eq!(
+            exec_arg(Path::new("/opt/100%/rlm-guard")),
+            "/opt/100%%/rlm-guard"
+        );
+        assert_eq!(
+            exec_arg(Path::new("/opt/a$b/rlm-guard")),
+            "/opt/a$$b/rlm-guard"
+        );
+        assert_eq!(
+            exec_arg(Path::new(r"/opt/a\b/rlm-guard")),
+            r"/opt/a\\b/rlm-guard"
+        );
+        assert_eq!(
+            exec_arg(Path::new(r#"/opt/say "hi"/rlm-guard"#)),
+            r#""/opt/say \"hi\"/rlm-guard""#
+        );
+        assert_eq!(
+            exec_arg(Path::new("/opt/it's/rlm-guard")),
+            r#""/opt/it\'s/rlm-guard""#
+        );
+        assert_eq!(
+            exec_arg(Path::new(r"/opt/my 50% \dir/rlm-guard")),
+            r#""/opt/my 50%% \\dir/rlm-guard""#
         );
     }
 
@@ -216,6 +334,27 @@ mod tests {
         let on_path = find_guard_binary(Some(&none.path().join("rlm")), Some(b.path().as_os_str()));
         assert_eq!(on_path, Some(b.path().join("rlm-guard")));
         assert_eq!(find_guard_binary(None, None), None);
+    }
+
+    #[test]
+    fn relative_path_entries_are_skipped() {
+        let d = tempfile::tempdir().unwrap();
+        exe(d.path());
+        // The same directory spelled relative to the working directory.
+        let cwd = std::env::current_dir().unwrap();
+        let mut rel = PathBuf::new();
+        for _ in cwd.components().skip(1) {
+            rel.push("..");
+        }
+        rel.push(d.path().strip_prefix("/").unwrap());
+        assert!(rel.join("rlm-guard").is_file());
+        let path = std::env::join_paths([Path::new(""), Path::new("."), &rel]).unwrap();
+        assert_eq!(find_guard_binary(None, Some(&path)), None);
+        let path = std::env::join_paths([rel.as_path(), d.path()]).unwrap();
+        assert_eq!(
+            find_guard_binary(None, Some(&path)),
+            Some(d.path().join("rlm-guard"))
+        );
     }
 
     #[test]

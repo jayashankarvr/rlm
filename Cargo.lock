@@ -1214,6 +1214,7 @@ dependencies = [
  "open",
  "rlmctl-common",
  "rlmctl-core",
+ "tempfile",
  "tracing",
 ]
 
