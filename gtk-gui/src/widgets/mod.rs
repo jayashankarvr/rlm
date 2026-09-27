@@ -258,8 +258,9 @@ fn scaled_decimal(bytes: u64, unit: u64, decimals: u32) -> String {
 /// unit in `suffixes` (unit letters such as `['M', 'G']`), so that sending
 /// the number with that unit gives the same byte count. A number written
 /// in one of the offered units is kept as written; otherwise the largest
-/// unit that shows it with at most three decimals is used. `None` when the
-/// value is empty or not a size.
+/// unit that shows it with at most three decimals is used, then the largest
+/// that shows it exactly with four to nine. `None` when the value is empty
+/// or not a size.
 pub fn split_size(value: &str, suffixes: &[char]) -> Option<(String, usize)> {
     let value = value.trim();
     let bytes = common::parse_size(value).ok()?;
@@ -277,13 +278,14 @@ pub fn split_size(value: &str, suffixes: &[char]) -> Option<(String, usize)> {
     let reads_back = |text: &str, suffix: char| {
         common::parse_size(&format!("{text}{suffix}")).ok() == Some(bytes)
     };
-    // The largest unit with a short number, then the smallest unit with as
-    // many decimals as parse_size reads.
-    let short = (0..suffixes.len())
-        .rev()
-        .flat_map(|idx| (0..=3).map(move |d| (idx, d)));
-    let long = (4..=9).map(|d| (0, d));
-    for (idx, d) in short.chain(long) {
+    // The largest unit with a short number; failing that, the largest unit
+    // that shows it exactly with up to the nine decimals parse_size reads.
+    let by_unit = |decimals: std::ops::RangeInclusive<u32>| {
+        (0..suffixes.len())
+            .rev()
+            .flat_map(move |idx| decimals.clone().map(move |d| (idx, d)))
+    };
+    for (idx, d) in by_unit(0..=3).chain(by_unit(4..=9)) {
         let text = scaled_decimal(bytes, unit_bytes(suffixes[idx]), d);
         if reads_back(&text, suffixes[idx]) {
             return Some((text, idx));
@@ -479,6 +481,19 @@ mod tests {
         assert_eq!(split_size("8388608", mem), Some(("8".into(), 0)));
         assert_eq!(split_size("1536K", mem), Some(("1.5".into(), 0)));
         for v in ["1T", "512K", "8388608", "1536K", "100K", "1.3T", "7"] {
+            round_trips(v, mem);
+        }
+    }
+
+    #[test]
+    fn inexact_sizes_use_the_largest_exact_unit() {
+        let mem = &['M', 'G'];
+        // One byte over 1 GiB: 1.000000001 G rather than 1024.000001 M.
+        assert_eq!(
+            split_size("1073741825", mem),
+            Some(("1.000000001".into(), 1))
+        );
+        for v in ["1073741825", "8388609", "1099511627777"] {
             round_trips(v, mem);
         }
     }
