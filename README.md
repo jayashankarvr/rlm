@@ -50,7 +50,7 @@ The release packages and the tarball for the CLI and guard are built on Ubuntu 2
 | Arch (AUR)          | current       | current |
 | openSUSE Tumbleweed | current       | current |
 
-On Ubuntu 22.04, Debian 12 and RHEL 9 the libadwaita version is too old for the GUI; use the CLI there. On a distro with cgroup v2 but an older glibc (RHEL 9, Fedora 31 to 35), build the CLI and guard with `cargo install rlmctl` instead of using the packages. Older versions may work with the `systemd.unified_cgroup_hierarchy=1` kernel boot parameter.
+The GUI needs libadwaita 1.4, which Ubuntu 22.04, Debian 12 and RHEL 9 do not ship; use the CLI there. On a distro with cgroup v2 but an older glibc (RHEL 9, Fedora 31 to 35), build the CLI and guard with `cargo install rlmctl` instead of using the packages. A distro that still boots with cgroup v1 may work with the `systemd.unified_cgroup_hierarchy=1` kernel boot parameter.
 
 ## Install
 

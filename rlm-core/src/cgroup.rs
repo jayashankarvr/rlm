@@ -42,8 +42,6 @@ fn sanitize_cgroup_name(name: &str) -> Result<&str> {
     Ok(name)
 }
 
-/// Refuse to limit init (PID 1). Constraining PID 1 (systemd/init) can wedge or
-/// freeze the entire system — the opposite of what this tool is for.
 /// Error for a process that already sits in another rlm cgroup. The hint
 /// always names the cgroup: `rlm unlimit --cgroup` works for every rlm
 /// cgroup, while `rlm unlimit --pid` refuses any cgroup other than `pid-N`.
@@ -53,6 +51,8 @@ fn already_limited(pid: u32, cgroup: &str) -> Error {
     ))
 }
 
+/// Refuse to limit init (PID 1). Constraining PID 1 (systemd/init) can wedge or
+/// freeze the entire system, the opposite of what this tool is for.
 fn reject_critical_pid(pid: u32) -> Result<()> {
     if pid <= 1 {
         return Err(Error::InvalidArgs(format!(
