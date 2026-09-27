@@ -1,8 +1,8 @@
 use crate::widgets::{
-    cpu_suffix_label, cpu_value, create_io_unit_dropdown, create_unit_dropdown, fit_list_height,
-    form_limit, icon_button, limits_description, list_scroller, on_enter, parse_cpu_value,
-    require_manager, set_value_with_unit, setup_number_validation, setup_size_validation,
-    size_value, status_toast, with_action_bar, NO_MANAGER_HINT,
+    cpu_suffix_label, cpu_value, create_io_unit_dropdown, create_unit_dropdown, fill_limits,
+    fit_list_height, form_limit, icon_button, limits_description, list_scroller, on_enter,
+    require_manager, setup_number_validation, setup_size_validation, size_value, status_toast,
+    unshown_note, with_action_bar, NO_MANAGER_HINT,
 };
 use adw::prelude::*;
 use gtk::glib;
@@ -366,26 +366,17 @@ fn apply_profile(state: &Rc<RefCell<RunState>>, name: Option<&str>) {
         return;
     };
     let state = state.borrow();
-    let fill = |entry: &adw::EntryRow, unit: &gtk::DropDown, value: &Option<String>| {
-        entry.set_text("");
-        if let Some(value) = value {
-            set_value_with_unit(entry, unit, value);
-        }
-    };
-    fill(&state.memory_entry, &state.memory_unit, &profile.memory);
-    state.cpu_entry.set_text(
-        &profile
-            .cpu
-            .as_deref()
-            .map(parse_cpu_value)
-            .unwrap_or_default(),
+    let unshown = fill_limits(
+        (&state.memory_entry, &state.memory_unit),
+        &state.cpu_entry,
+        (&state.io_read_entry, &state.io_read_unit),
+        (&state.io_write_entry, &state.io_write_unit),
+        &profile,
     );
-    fill(&state.io_read_entry, &state.io_read_unit, &profile.io_read);
-    fill(
-        &state.io_write_entry,
-        &state.io_write_unit,
-        &profile.io_write,
-    );
+    match unshown_note(name, &unshown) {
+        Some(note) => show_status(&state.status_label, &note, true),
+        None => state.status_label.set_text(""),
+    }
 }
 
 fn run_command(state: &Rc<RefCell<RunState>>) {

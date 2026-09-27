@@ -4,14 +4,13 @@
 
 use crate::pages::{plain_toast, show_toast};
 use crate::widgets::{
-    cpu_suffix_label, create_io_unit_dropdown, create_unit_dropdown, form_limit, get_unit_suffix,
-    icon_button, parse_cpu_value, set_value_with_unit, setup_number_validation,
-    setup_size_validation,
+    cpu_suffix_label, create_io_unit_dropdown, create_unit_dropdown, fill_limits, form_limit,
+    get_unit_suffix, icon_button, setup_number_validation, setup_size_validation, unshown_fields,
 };
 use adw::prelude::*;
 use common::{builtin_presets, Config, Profile};
 use gtk::glib;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 // Field length limits
@@ -164,8 +163,8 @@ fn remove_profile(name: &str) -> common::Result<()> {
 }
 
 /// A size limit entry with its unit dropdown (MB/GB for memory, KB/s to
-/// GB/s for I/O), filled from `value` exactly as it is stored.
-fn unit_entry(title: &str, value: Option<&String>, io: bool) -> (adw::EntryRow, gtk::DropDown) {
+/// GB/s for I/O).
+fn unit_entry(title: &str, io: bool) -> (adw::EntryRow, gtk::DropDown) {
     let entry = adw::EntryRow::new();
     entry.set_title(title);
     entry.set_input_purpose(gtk::InputPurpose::Number);
@@ -175,11 +174,30 @@ fn unit_entry(title: &str, value: Option<&String>, io: bool) -> (adw::EntryRow, 
     } else {
         create_unit_dropdown()
     };
-    if let Some(v) = value {
-        set_value_with_unit(&entry, &unit, v);
-    }
     entry.add_suffix(&unit);
     (entry, unit)
+}
+
+/// The profile to save from the dialog: each limit the user did not edit
+/// (`edited`: memory, CPU, I/O read, I/O write) keeps its stored text
+/// exactly, even one the form could not show or would write differently
+/// ("1536K" shows as 1.5 MB), so saving never deletes or changes it. The
+/// match_exe list, which the dialog does not show, is kept too.
+pub fn keep_unedited(form: Profile, stored: &Profile, edited: [bool; 4]) -> Profile {
+    let pick = |from_form: Option<String>, from_store: &Option<String>, edited: bool| {
+        if edited {
+            from_form
+        } else {
+            from_store.clone()
+        }
+    };
+    Profile {
+        match_exe: stored.match_exe.clone(),
+        memory: pick(form.memory, &stored.memory, edited[0]),
+        cpu: pick(form.cpu, &stored.cpu, edited[1]),
+        io_read: pick(form.io_read, &stored.io_read, edited[2]),
+        io_write: pick(form.io_write, &stored.io_write, edited[3]),
+    }
 }
 
 pub struct ProfilesPage {
@@ -431,7 +449,7 @@ impl ProfilesPage {
             .as_ref()
             .map(|(_, p, _)| p.clone())
             .unwrap_or_default();
-        let (memory_entry, memory_unit) = unit_entry("Memory", current.memory.as_ref(), false);
+        let (memory_entry, memory_unit) = unit_entry("Memory", false);
         limits_group.add(&memory_entry);
 
         let cpu_entry = adw::EntryRow::new();
@@ -439,17 +457,54 @@ impl ProfilesPage {
         cpu_entry.set_input_purpose(gtk::InputPurpose::Digits);
         setup_number_validation(&cpu_entry);
         cpu_entry.add_suffix(&cpu_suffix_label());
-        if let Some(ref v) = current.cpu {
-            cpu_entry.set_text(&parse_cpu_value(v));
-        }
         limits_group.add(&cpu_entry);
 
-        let (io_read_entry, io_read_unit) = unit_entry("I/O Read", current.io_read.as_ref(), true);
+        let (io_read_entry, io_read_unit) = unit_entry("I/O Read", true);
         limits_group.add(&io_read_entry);
-        let (io_write_entry, io_write_unit) =
-            unit_entry("I/O Write", current.io_write.as_ref(), true);
+        let (io_write_entry, io_write_unit) = unit_entry("I/O Write", true);
         limits_group.add(&io_write_entry);
         form_box.append(&limits_group);
+
+        let unshown = fill_limits(
+            (&memory_entry, &memory_unit),
+            &cpu_entry,
+            (&io_read_entry, &io_read_unit),
+            (&io_write_entry, &io_write_unit),
+            &current,
+        );
+        if !unshown.is_empty() {
+            let kept = if unshown.len() == 1 {
+                "It is kept as saved unless you type a new value."
+            } else {
+                "They are kept as saved unless you type new values."
+            };
+            let note = gtk::Label::new(Some(&format!(
+                "{} cannot be shown here. {kept}",
+                unshown_fields(&unshown)
+            )));
+            note.add_css_class("dim-label");
+            note.set_wrap(true);
+            note.set_xalign(0.0);
+            form_box.append(&note);
+        }
+
+        // Which limits the user has changed. Connected after the fields are
+        // filled, and before the validation below, so it is set first.
+        let edited: Rc<[Cell<bool>; 4]> = Rc::new(Default::default());
+        let fields = [
+            (&memory_entry, Some(&memory_unit)),
+            (&cpu_entry, None),
+            (&io_read_entry, Some(&io_read_unit)),
+            (&io_write_entry, Some(&io_write_unit)),
+        ];
+        for (i, (entry, unit)) in fields.into_iter().enumerate() {
+            let flags = edited.clone();
+            entry.connect_changed(move |_| flags[i].set(true));
+            if let Some(unit) = unit {
+                let flags = edited.clone();
+                unit.connect_selected_notify(move |_| flags[i].set(true));
+            }
+        }
 
         let error_label = gtk::Label::new(None);
         error_label.add_css_class("error");
@@ -463,9 +518,7 @@ impl ProfilesPage {
         content.append(&form_scroll);
         dialog.set_content(Some(&content));
 
-        // The form's current contents as a profile. Editing keeps the
-        // profile's match_exe list, which this dialog does not show.
-        let match_exe = current.match_exe.clone();
+        // The form's current contents as a profile; see keep_unedited.
         let read_form = {
             let name_entry = name_entry.clone();
             let memory_entry = memory_entry.clone();
@@ -475,14 +528,17 @@ impl ProfilesPage {
             let io_read_unit = io_read_unit.clone();
             let io_write_entry = io_write_entry.clone();
             let io_write_unit = io_write_unit.clone();
+            let edited = edited.clone();
+            let current = current.clone();
             Rc::new(move || {
-                let mut profile = profile_from_fields(
+                let form = profile_from_fields(
                     (&memory_entry.text(), &get_unit_suffix(&memory_unit)),
                     &cpu_entry.text(),
                     (&io_read_entry.text(), &get_unit_suffix(&io_read_unit)),
                     (&io_write_entry.text(), &get_unit_suffix(&io_write_unit)),
                 );
-                profile.match_exe = match_exe.clone();
+                let flags = [0, 1, 2, 3].map(|i| edited[i].get());
+                let profile = keep_unedited(form, &current, flags);
                 (name_entry.text().trim().to_string(), profile)
             })
         };
@@ -681,6 +737,30 @@ mod tests {
         assert_eq!(existing_name(&names, "browser"), Some("Browser".into()));
         assert_eq!(existing_name(&names, "MINE"), Some("mine".into()));
         assert_eq!(existing_name(&names, "Web"), None);
+    }
+
+    #[test]
+    fn saving_keeps_the_limits_the_user_did_not_edit() {
+        let stored = Profile {
+            match_exe: vec!["firefox".into()],
+            memory: Some("1536K".into()),
+            cpu: Some("50.5%".into()),
+            io_read: Some("10M".into()),
+            io_write: None,
+        };
+        // The form shows memory as 1.5 MB and cannot show the CPU value.
+        let form = profile_from_fields(("1.5", "M"), "", ("20", "M"), ("", "M"));
+        let saved = keep_unedited(form, &stored, [false, false, true, false]);
+        assert_eq!(saved.memory.as_deref(), Some("1536K"));
+        assert_eq!(saved.cpu.as_deref(), Some("50.5%"));
+        assert_eq!(saved.io_read.as_deref(), Some("20M"));
+        assert_eq!(saved.io_write, None);
+        assert_eq!(saved.match_exe, ["firefox"]);
+        // Clearing an edited field removes that limit.
+        let cleared = profile_from_fields(("", "M"), "", ("", "M"), ("", "M"));
+        let saved = keep_unedited(cleared, &stored, [true, true, false, false]);
+        assert_eq!(saved.memory, None);
+        assert_eq!(saved.cpu, None);
     }
 
     #[test]

@@ -213,14 +213,19 @@ pub fn get_unit_suffix(dropdown: &gtk::DropDown) -> String {
 }
 
 /// Parse a value like "4G", "1.5GiB" or "512MB" and set entry + dropdown.
-/// An empty or unreadable value clears the entry.
-pub fn set_value_with_unit(entry: &adw::EntryRow, dropdown: &gtk::DropDown, value: &str) {
+/// A value that cannot be shown clears the entry and returns false, so the
+/// caller can say so rather than drop it silently.
+pub fn set_value_with_unit(entry: &adw::EntryRow, dropdown: &gtk::DropDown, value: &str) -> bool {
     match split_size(value, &dropdown_suffixes(dropdown)) {
-        Some((number, idx)) => {
+        Some((number, idx)) if number.len() <= MAX_LIMIT_LEN => {
             entry.set_text(&number);
             dropdown.set_selected(idx as u32);
+            true
         }
-        None => entry.set_text(""),
+        _ => {
+            entry.set_text("");
+            false
+        }
     }
 }
 
@@ -365,9 +370,79 @@ pub fn form_limit(
         .map_err(|e| e.to_string().lines().next().unwrap_or("").to_string())
 }
 
-/// Parse a CPU value like "75%" and return just the number
-pub fn parse_cpu_value(value: &str) -> String {
-    value.trim().trim_end_matches('%').to_string()
+/// The number a CPU field shows for a stored value like "75%", or `None`
+/// when the field cannot show it (it takes whole numbers only, so "50.5%"
+/// cannot be shown).
+pub fn cpu_number(value: &str) -> Option<String> {
+    let number = value.trim().trim_end_matches('%').trim();
+    (!number.is_empty()
+        && number.len() <= MAX_LIMIT_LEN
+        && number.chars().all(|c| c.is_ascii_digit()))
+    .then(|| number.to_string())
+}
+
+/// Fill a form's limit fields from `profile`. A limit the profile leaves
+/// unset empties its field. Returns each (field, stored value) that the
+/// field cannot show; that field is left empty.
+pub fn fill_limits(
+    memory: (&adw::EntryRow, &gtk::DropDown),
+    cpu: &adw::EntryRow,
+    io_read: (&adw::EntryRow, &gtk::DropDown),
+    io_write: (&adw::EntryRow, &gtk::DropDown),
+    profile: &common::Profile,
+) -> Vec<(&'static str, String)> {
+    let mut unshown = Vec::new();
+    let sizes = [
+        ("Memory", memory, &profile.memory),
+        ("I/O Read", io_read, &profile.io_read),
+        ("I/O Write", io_write, &profile.io_write),
+    ];
+    for (label, (entry, unit), value) in sizes {
+        entry.set_text("");
+        if let Some(value) = value {
+            if !set_value_with_unit(entry, unit, value) {
+                unshown.push((label, value.clone()));
+            }
+        }
+    }
+    cpu.set_text("");
+    if let Some(value) = &profile.cpu {
+        match cpu_number(value) {
+            Some(number) => cpu.set_text(&number),
+            None => unshown.push(("CPU", value.clone())),
+        }
+    }
+    unshown
+}
+
+/// "Memory (4X)" or "Memory (4X) and CPU (50.5%)".
+pub fn unshown_fields(unshown: &[(&str, String)]) -> String {
+    let items: Vec<String> = unshown
+        .iter()
+        .map(|(label, value)| format!("{label} ({value})"))
+        .collect();
+    match items.split_last() {
+        None => String::new(),
+        Some((last, [])) => last.clone(),
+        Some((last, rest)) => format!("{} and {last}", rest.join(", ")),
+    }
+}
+
+/// What to say when profile `name` has values its fields cannot show, or
+/// `None` when every value was shown.
+pub fn unshown_note(name: &str, unshown: &[(&str, String)]) -> Option<String> {
+    if unshown.is_empty() {
+        return None;
+    }
+    let those = if unshown.len() == 1 {
+        "that field was"
+    } else {
+        "those fields were"
+    };
+    Some(format!(
+        "Profile '{name}': {} cannot be shown here, so {those} left empty",
+        unshown_fields(unshown)
+    ))
 }
 
 #[cfg(test)]
@@ -433,6 +508,27 @@ mod tests {
     fn limits_description_names_the_core_count() {
         assert!(limits_description_for(1).contains("has 1 core."));
         assert!(limits_description_for(8).contains("100% is one core; this computer has 8 cores."));
+    }
+
+    #[test]
+    fn cpu_fields_show_whole_percentages_only() {
+        assert_eq!(cpu_number("75%").as_deref(), Some("75"));
+        assert_eq!(cpu_number(" 150 % ").as_deref(), Some("150"));
+        assert_eq!(cpu_number("50.5%"), None);
+        assert_eq!(cpu_number("%"), None);
+    }
+
+    #[test]
+    fn values_that_cannot_be_shown_are_named() {
+        assert_eq!(unshown_note("web", &[]), None);
+        assert_eq!(
+            unshown_note("web", &[("CPU", "50.5%".into())]).unwrap(),
+            "Profile 'web': CPU (50.5%) cannot be shown here, so that field was left empty"
+        );
+        assert_eq!(
+            unshown_note("web", &[("Memory", "4X".into()), ("CPU", "50.5%".into())]).unwrap(),
+            "Profile 'web': Memory (4X) and CPU (50.5%) cannot be shown here, so those fields were left empty"
+        );
     }
 
     #[test]
