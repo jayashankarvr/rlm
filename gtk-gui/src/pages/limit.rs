@@ -778,7 +778,7 @@ fn apply_limits(state: &Rc<RefCell<LimitState>>) {
 
                     // Persist as a rule if requested. A rule matches by executable
                     // basename, so only save when every selected PID is the same
-                    // app — otherwise the saved match_exe would be misleading.
+                    // app, otherwise the saved match_exe would be misleading.
                     if state.save_rule_check.is_active() {
                         match common_exe_basename(&state.all_processes.borrow(), &pids) {
                             Some(exe) => match save_app_rule(
