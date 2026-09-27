@@ -6,6 +6,7 @@
 //! every intervention so nothing is left frozen.
 
 use common::Config;
+use rlm_core::guard::history;
 use rlm_core::guard::sampler::{live_cgroups, strip_cgroup_root, targets_from_procs};
 use rlm_core::guard::{cgfs, journal_path, Effector, Journal, PolicyEngine, Sampler, SystemdUser};
 use rlm_core::rules::RulesEnforcer;
@@ -192,6 +193,7 @@ fn run(config: Config) -> common::Result<()> {
     let start = Instant::now();
     let mut warned_no_psi = false;
     let mut last_rules_ms: Option<u64> = None;
+    let hist = history::history_path();
 
     tracing::info!(
         uid,
@@ -233,8 +235,14 @@ fn run(config: Config) -> common::Result<()> {
                 let targets = targets_from_procs(&procs, &cgfs::current_bytes);
                 let live = live_cgroups(&engine.intervened_cgroups());
                 for action in engine.tick(now_ms, sample, &targets, &live) {
-                    if let Err(e) = effector.apply(&action) {
+                    let result = effector.apply(&action).map_err(|e| e.to_string());
+                    if let Err(e) = &result {
                         tracing::warn!(?action, "action failed: {e}");
+                    }
+                    if let Some(ev) = history::event_for(&action, &result, history::unix_now()) {
+                        if let Err(e) = history::append(&hist, &ev) {
+                            tracing::debug!("history write failed: {e}");
+                        }
                     }
                 }
             }

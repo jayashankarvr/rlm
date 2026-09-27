@@ -70,8 +70,8 @@ impl Sampler {
 
     /// Read current pressure. Prefers the user's app.slice PSI (what the
     /// processes the guard can act on actually feel) and falls back to system
-    /// PSI only when that file is missing. `None` if neither is readable (e.g.
-    /// a kernel built without `CONFIG_PSI`).
+    /// PSI when that file is missing OR unreadable/unparseable. `None` if
+    /// neither is readable (e.g. a kernel built without `CONFIG_PSI`).
     pub fn sample(&self) -> Option<Sample> {
         let app = fs::read_to_string(app_slice_pressure_path(self.uid)).ok();
         let sys = fs::read_to_string("/proc/pressure/memory").ok();

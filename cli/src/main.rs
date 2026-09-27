@@ -212,7 +212,8 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum GuardAction {
-    /// Show current memory pressure and active guard interventions
+    /// Show whether the guard is running and its current memory pressure and
+    /// active interventions
     Status,
     /// Enable and start the guard user service
     Enable,
@@ -220,6 +221,12 @@ enum GuardAction {
     Disable,
     /// Dry-run: print what the guard would do right now, without acting
     Test,
+    /// Show recent guard interventions (freeze, thaw, cap, lift, and failures)
+    History {
+        /// Number of most recent entries to show
+        #[arg(short = 'n', long, default_value_t = 20)]
+        lines: usize,
+    },
 }
 
 #[derive(Subcommand)]
@@ -676,15 +683,41 @@ fn run_guard(manager: &CgroupManager, action: GuardAction) -> Result<ExitCode> {
     match action {
         GuardAction::Enable => systemctl(&["enable", "--now", "rlm-guard"]),
         GuardAction::Disable => systemctl(&["disable", "--now", "rlm-guard"]),
-        GuardAction::Status => {
-            guard_status(manager);
-            Ok(ExitCode::SUCCESS)
-        }
-        GuardAction::Test => {
-            guard_test(manager);
+        GuardAction::Status => Ok(guard_status()),
+        GuardAction::Test => Ok(guard_test(manager)),
+        GuardAction::History { lines } => {
+            guard_history(lines);
             Ok(ExitCode::SUCCESS)
         }
     }
+}
+
+/// Best-effort path to name alongside a config error: the user config if it
+/// exists, else the system config, else the user path anyway (the most
+/// likely place someone would go fix it). The error message itself may
+/// already name the specific file that failed to parse; this is a fallback
+/// for errors (like a bad guard value) that don't carry a path of their own.
+fn config_error_path() -> String {
+    let user = dirs::config_dir().map(|d| d.join("rlm").join("config.yaml"));
+    if let Some(p) = &user {
+        if p.exists() {
+            return p.display().to_string();
+        }
+    }
+    let system = std::path::Path::new("/etc/rlm/config.yaml");
+    if system.exists() {
+        return system.display().to_string();
+    }
+    user.map(|p| p.display().to_string())
+        .unwrap_or_else(|| "/etc/rlm/config.yaml".to_string())
+}
+
+/// Format a config-load/validation error for display: the file believed to
+/// be at fault (see [`config_error_path`]) alongside the error's own
+/// message. Pure (no I/O), so the "path + message" contract is testable
+/// without touching the real filesystem.
+fn config_error_line(path: &str, e: &Error) -> String {
+    format!("invalid ({path}): {e}")
 }
 
 fn systemctl(args: &[&str]) -> Result<ExitCode> {
@@ -706,25 +739,40 @@ fn current_uid() -> u32 {
     unsafe { libc::getuid() }
 }
 
-fn guard_status(manager: &CgroupManager) {
-    let cfg = Config::load().unwrap_or_default();
-    let rlm_base = rlm_core::guard::sampler::strip_cgroup_root(manager.base_path());
-    if rlm_base.is_none() {
-        tracing::error!(
-            "base_path {:?} isn't under /sys/fs/cgroup; escalation target resolution disabled",
-            manager.base_path()
-        );
-    }
-    let sampler =
-        rlm_core::guard::Sampler::new(cfg.guard, std::process::id(), current_uid(), rlm_base);
+/// Print the guard's service state, config validity, current pressure,
+/// policy, active interventions, and recent history. Does not need a
+/// [`CgroupManager`]: unlike `guard test`, it never resolves escalation
+/// targets (`rlm_base = None`), only reads pressure.
+///
+/// Returns [`ExitCode::FAILURE`] when the config is invalid: everything
+/// still prints (using a best-effort fallback config for the pressure/policy
+/// lines) so the output stays informative, but scripts checking the exit
+/// code see the failure instead of it being silently swallowed.
+fn guard_status() -> ExitCode {
+    let (cfg, config_err) = match Config::load_validated() {
+        Ok(c) => (c, None),
+        Err(e) => (Config::load().unwrap_or_default(), Some(e)),
+    };
 
-    match sampler.sample() {
-        Some(s) => println!(
-            "Memory pressure ({}): some(avg10)={:.1}%  full(avg10)={:.1}%  available {} MB of {} MB",
-            s.source, s.some_avg10, s.full_avg10, s.mem_available_mb, s.mem_total_mb
-        ),
-        None => println!("Memory pressure: PSI unavailable (/proc/pressure/memory)"),
+    println!(
+        "Service:  {}",
+        rlm_core::guard::service::describe(&rlm_core::guard::service::query())
+    );
+    match &config_err {
+        None => println!("Config:   ok"),
+        Some(e) => println!("Config:   {}", config_error_line(&config_error_path(), e)),
     }
+
+    let sampler =
+        rlm_core::guard::Sampler::new(cfg.guard.clone(), std::process::id(), current_uid(), None);
+    match sampler.sample() {
+        Some(s) => println!("Pressure: {}", rlm_core::guard::report::pressure_line(&s)),
+        None => println!("Pressure: unavailable (no PSI)"),
+    }
+    println!(
+        "Policy:   {}",
+        rlm_core::guard::report::trigger_line(&cfg.guard.trigger)
+    );
 
     // Active interventions come from the guard's own write-ahead journal.
     // We use `Journal::read_entries` rather than `Journal::open` here
@@ -741,28 +789,47 @@ fn guard_status(manager: &CgroupManager) {
         &rlm_core::guard::cgfs::boot_id(),
     );
     if entries.is_empty() {
-        println!("\nNo active guard interventions.");
-        return;
+        println!("Interventions: none");
+    } else {
+        println!("Interventions:");
+        for e in &entries {
+            println!("  {}", rlm_core::guard::report::intervention_line(e));
+        }
     }
 
-    println!("\nActive guard interventions:");
-    for e in &entries {
-        let state = match e.action {
-            rlm_core::guard::journal::JournalAction::Freeze => "frozen".to_string(),
-            rlm_core::guard::journal::JournalAction::Cap => {
-                format!("capped our_high={}", e.our_high.as_deref().unwrap_or("?"))
-            }
-        };
-        println!("  {} [{state}]", e.cgroup);
+    let recent =
+        rlm_core::guard::history::read_recent(&rlm_core::guard::history::history_path(), 5);
+    if recent.is_empty() {
+        println!("History:  none recorded yet");
+    } else {
+        println!("History:");
+        let now = rlm_core::guard::history::unix_now();
+        for e in &recent {
+            println!("  {}", rlm_core::guard::report::history_line(e, now));
+        }
+    }
+
+    println!("Full history: rlm guard history (also: journalctl --user -u rlm-guard)");
+
+    if config_err.is_some() {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
     }
 }
 
-fn guard_test(manager: &CgroupManager) {
+fn guard_test(manager: &CgroupManager) -> ExitCode {
     // Single-shot preview: ticks a FRESH engine once at now_ms=0, so it shows
     // what the guard's *first* action would be right now (the escalation gate is
     // open and no prior interventions exist). It does not simulate recovery or
     // cooldown behavior, and applies nothing.
-    let cfg = Config::load().unwrap_or_default();
+    let cfg = match Config::load_validated() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("error: {}", config_error_line(&config_error_path(), &e));
+            return ExitCode::FAILURE;
+        }
+    };
     let rlm_base = rlm_core::guard::sampler::strip_cgroup_root(manager.base_path());
     if rlm_base.is_none() {
         tracing::error!(
@@ -779,8 +846,8 @@ fn guard_test(manager: &CgroupManager) {
     let mut engine = rlm_core::guard::PolicyEngine::new(cfg.guard);
 
     let Some(sample) = sampler.sample() else {
-        println!("PSI unavailable; cannot evaluate guard actions.");
-        return;
+        println!("Pressure: unavailable (no PSI); cannot evaluate guard actions.");
+        return ExitCode::SUCCESS;
     };
     let snapshot = rlm_core::process::list_for_uid(current_uid()).unwrap_or_default();
     let procs = sampler.candidates(&snapshot);
@@ -789,12 +856,8 @@ fn guard_test(manager: &CgroupManager) {
     // A fresh engine holds no interventions, so nothing needs a liveness check.
     let live = std::collections::HashSet::new();
     println!(
-        "Memory pressure ({}): some={:.1}%  full={:.1}%  available {} MB of {} MB  |  {} eligible process(es)",
-        sample.source,
-        sample.some_avg10,
-        sample.full_avg10,
-        sample.mem_available_mb,
-        sample.mem_total_mb,
+        "{}  |  {} eligible process(es)",
+        rlm_core::guard::report::pressure_line(&sample),
         procs.len()
     );
 
@@ -806,6 +869,21 @@ fn guard_test(manager: &CgroupManager) {
         for a in &actions {
             println!("  {a:?}");
         }
+    }
+    ExitCode::SUCCESS
+}
+
+/// Print up to `lines` most recent guard interventions, newest last.
+fn guard_history(lines: usize) {
+    let events =
+        rlm_core::guard::history::read_recent(&rlm_core::guard::history::history_path(), lines);
+    if events.is_empty() {
+        println!("no guard interventions recorded yet");
+        return;
+    }
+    let now = rlm_core::guard::history::unix_now();
+    for e in &events {
+        println!("{}", rlm_core::guard::report::history_line(e, now));
     }
 }
 
@@ -1005,5 +1083,19 @@ mod tests {
         assert!(parse_pid_list("1,abc,3").is_err());
         assert!(parse_pid_list("1,,3").is_err()); // empty element
         assert!(parse_pid_list("-1").is_err()); // negative
+    }
+
+    /// `guard status`/`guard test` must surface a bad config with both the
+    /// file believed to be at fault and the underlying message (extra item
+    /// #1: previously they called `Config::load().unwrap_or_default()` and
+    /// silently showed defaults). This is the pure formatting half of that
+    /// fix, testable without touching the real filesystem.
+    #[test]
+    fn config_error_line_includes_path_and_message() {
+        let e = Error::Config("guard: bad value".into());
+        assert_eq!(
+            config_error_line("/x/config.yaml", &e),
+            "invalid (/x/config.yaml): config error: guard: bad value"
+        );
     }
 }
