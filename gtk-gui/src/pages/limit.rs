@@ -7,7 +7,7 @@ use crate::widgets::{
 use adw::prelude::*;
 use gtk::glib;
 use rlm_core::CgroupManager;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -55,6 +55,12 @@ struct LimitState {
 enum LimitMode {
     Individual,
     Application,
+}
+
+thread_local! {
+    /// Set while [`refresh_profiles`] replaces the profile list, so the
+    /// selection changes that causes do not refill the limit fields.
+    static REFRESHING_PROFILES: Cell<bool> = const { Cell::new(false) };
 }
 
 pub fn create(manager: Option<Arc<CgroupManager>>) -> gtk::Widget {
@@ -363,6 +369,9 @@ pub fn create(manager: Option<Arc<CgroupManager>>) -> gtk::Widget {
     // Profile selection handler
     let state_clone = state.clone();
     profile_dropdown.connect_selected_notify(move |dropdown| {
+        if REFRESHING_PROFILES.with(Cell::get) {
+            return;
+        }
         apply_profile(&state_clone, selected_profile(dropdown).as_deref());
     });
 
@@ -1071,12 +1080,16 @@ pub fn refresh_profiles(widget: &gtk::Widget) {
             }
             let profile_list =
                 gtk::StringList::new(&profiles.iter().map(|s| s.as_str()).collect::<Vec<_>>());
-            dropdown.set_model(Some(&profile_list));
-            // Keep the chosen profile selected while it still exists.
+            // Keep the chosen profile selected while it still exists,
+            // without filling the limits in again: the user may have edited
+            // them since choosing it.
             let keep = current
                 .and_then(|c| profiles.iter().position(|p| *p == c))
                 .unwrap_or(0);
+            REFRESHING_PROFILES.with(|f| f.set(true));
+            dropdown.set_model(Some(&profile_list));
             dropdown.set_selected(keep as u32);
+            REFRESHING_PROFILES.with(|f| f.set(false));
         }
     }
 }
