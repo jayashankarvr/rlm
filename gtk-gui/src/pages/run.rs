@@ -503,6 +503,17 @@ fn run_command(state: &Rc<RefCell<RunState>>) {
                 "The launcher exited; {} process(es) keep running with limits in {name}",
                 manager_clone.pids_in_cgroup(&name).len()
             ));
+            // Remove the cgroup once the processes the launcher left behind
+            // have exited too, so it does not linger empty.
+            let manager = manager_clone.clone();
+            let name = name.clone();
+            glib::timeout_add_seconds_local(5, move || {
+                if manager.is_populated(&name) == Some(true) {
+                    return glib::ControlFlow::Continue;
+                }
+                let _ = manager.remove_if_empty(&name);
+                glib::ControlFlow::Break
+            });
         } else {
             let _ = manager_clone.remove_if_empty(&name);
         }
