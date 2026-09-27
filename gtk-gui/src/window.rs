@@ -75,7 +75,7 @@ impl Window {
         self.add_action(&quit_action);
         app.set_accels_for_action("win.quit", &["<Control>q"]);
 
-        // Page navigation shortcuts (Ctrl+1 through Ctrl+5). Selecting the
+        // Page navigation shortcuts (Ctrl+1 through Ctrl+6). Selecting the
         // sidebar row (rather than switching the stack directly) keeps the
         // highlight in sync with the visible page.
         for (i, (id, _, _)) in NAV_PAGES.iter().enumerate() {

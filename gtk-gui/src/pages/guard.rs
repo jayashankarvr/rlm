@@ -10,13 +10,42 @@ use adw::prelude::*;
 use common::{Config, GuardConfig, BUILTIN_PROTECT};
 use rlm_core::guard::history::{history_path, read_recent, unix_now, HistoryEvent};
 use rlm_core::guard::journal::JournalEntry;
-use rlm_core::guard::report::{history_line, intervention_line, pressure_line, trigger_line};
+use rlm_core::guard::report::{
+    config_error_line, config_error_path, history_line, intervention_line, pressure_line,
+    pressure_unavailable, trigger_line,
+};
 use rlm_core::guard::service::{describe, query, ServiceState};
 use rlm_core::guard::{cgfs, journal_path, Journal, Sample, Sampler};
 use rlm_core::process::current_uid;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 /// How many recent history entries `refresh`/`create` fetch and show.
 const HISTORY_SHOWN: usize = 20;
+
+/// `service::query` spawns two `systemctl --user` calls, each with its own
+/// 1s timeout (see `rlm_core::guard::service::SYSTEMCTL_TIMEOUT`) — cheap
+/// once, but the auto-refresh timer (`window.rs`) calls `refresh` every 2s,
+/// which would otherwise spawn `systemctl` every 2s on the GTK main thread.
+/// Cache the service state and only re-query every `SERVICE_QUERY_INTERVAL`;
+/// pressure and history still refresh on the full 2s cadence.
+const SERVICE_QUERY_INTERVAL: Duration = Duration::from_secs(10);
+
+static SERVICE_CACHE: Mutex<Option<(Instant, ServiceState)>> = Mutex::new(None);
+
+/// The guard's systemd state, re-read at most once every
+/// [`SERVICE_QUERY_INTERVAL`]; a cached value is returned in between.
+fn cached_service_state() -> ServiceState {
+    let mut cache = SERVICE_CACHE.lock().unwrap();
+    if let Some((last, state)) = cache.as_ref() {
+        if last.elapsed() < SERVICE_QUERY_INTERVAL {
+            return state.clone();
+        }
+    }
+    let state = query();
+    *cache = Some((Instant::now(), state.clone()));
+    state
+}
 
 /// Everything the Guard page renders, computed once from plain data so it
 /// can be unit-tested without a display.
@@ -46,7 +75,7 @@ pub fn build_view(
 ) -> GuardView {
     let service_desc = describe(service);
     let config = cfg.as_ref().map(|_| ()).map_err(Clone::clone);
-    let pressure = sample.map_or_else(|| "unavailable (no PSI)".to_string(), |s| pressure_line(&s));
+    let pressure = sample.map_or_else(|| pressure_unavailable().to_string(), |s| pressure_line(&s));
     let policy = cfg.as_ref().map_or_else(
         |_| "guard config invalid; the guard will not start".to_string(),
         |c| trigger_line(&c.trigger),
@@ -83,10 +112,11 @@ pub fn build_view(
 /// a pressure sample, active-intervention journal entries and recent
 /// history. Every call here is read-only.
 fn gather() -> GuardView {
-    let service = query();
-    let cfg = Config::load_validated()
-        .map(|c| c.guard)
-        .map_err(|e| e.to_string());
+    let service = cached_service_state();
+    let cfg = match Config::load_validated() {
+        Ok(c) => Ok(c.guard),
+        Err(e) => Err(config_error_line(&config_error_path(), &e)),
+    };
     let sampler_cfg = cfg.clone().unwrap_or_default();
     let sample = Sampler::new(sampler_cfg, std::process::id(), current_uid(), None).sample();
     let entries = Journal::read_entries(&journal_path(), &cgfs::boot_id());
@@ -281,7 +311,7 @@ mod tests {
         let mut sorted = names.clone();
         sorted.sort_by_key(|n| n.to_lowercase());
         assert_eq!(names, sorted);
-        assert_eq!(v.pressure, "unavailable (no PSI)");
+        assert_eq!(v.pressure, pressure_unavailable());
     }
 
     #[test]
