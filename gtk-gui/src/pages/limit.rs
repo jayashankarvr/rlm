@@ -1,7 +1,8 @@
 use crate::widgets::{
     cpu_suffix_label, create_io_unit_dropdown, create_unit_dropdown, get_unit_suffix,
-    limits_description, on_enter, parse_cpu_value, require_manager, set_value_with_unit,
-    setup_number_validation, setup_size_validation, status_toast, with_action_bar, NO_MANAGER_HINT,
+    limits_description, list_scroller, on_enter, parse_cpu_value, require_manager,
+    set_value_with_unit, setup_number_validation, setup_size_validation, status_toast,
+    with_action_bar, NO_MANAGER_HINT,
 };
 use adw::prelude::*;
 use gtk::glib;
@@ -138,10 +139,7 @@ pub fn create(manager: Option<Arc<CgroupManager>>) -> gtk::Widget {
     process_list.set_selection_mode(gtk::SelectionMode::Multiple);
     process_list.add_css_class("boxed-list");
 
-    let scroll = gtk::ScrolledWindow::new();
-    scroll.set_child(Some(&process_list));
-    scroll.set_min_content_height(180);
-    scroll.set_max_content_height(200);
+    let scroll = list_scroller(&process_list);
 
     search_group.add(&scroll);
 

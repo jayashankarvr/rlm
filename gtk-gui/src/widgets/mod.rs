@@ -104,6 +104,17 @@ pub fn with_action_bar(
     view
 }
 
+/// A scrolled window for a list that is as tall as its rows, up to about
+/// six rows, and scrolls beyond that.
+pub fn list_scroller(list: &gtk::ListBox) -> gtk::ScrolledWindow {
+    let scroll = gtk::ScrolledWindow::new();
+    scroll.set_child(Some(list));
+    scroll.set_hscrollbar_policy(gtk::PolicyType::Never);
+    scroll.set_propagate_natural_height(true);
+    scroll.set_max_content_height(340);
+    scroll
+}
+
 /// A success toast whose "Open" button shows the Managed Processes page,
 /// where the new limits can be seen and removed.
 pub fn status_toast(text: &str, timeout: u32) -> adw::Toast {
