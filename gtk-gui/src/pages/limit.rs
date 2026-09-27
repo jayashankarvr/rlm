@@ -8,6 +8,7 @@ use adw::prelude::*;
 use gtk::glib;
 use rlm_core::CgroupManager;
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Instant;
@@ -37,6 +38,9 @@ struct LimitState {
     cap_label: gtk::Label,
     manager: Option<Arc<CgroupManager>>,
     all_processes: RefCell<Vec<rlm_core::process::ProcessInfo>>,
+    /// Each listed PID's start time when it was listed, so applying can
+    /// skip a process that has exited (or whose PID was reused) since.
+    start_times: RefCell<HashMap<u32, u64>>,
     limit_mode: RefCell<LimitMode>, // Individual or Application
     /// PIDs of each application row in Application mode, keyed by the row's
     /// widget name, so selecting a row can fill in all of its processes.
@@ -268,6 +272,7 @@ pub fn create(manager: Option<Arc<CgroupManager>>) -> gtk::Widget {
         cap_label: cap_label.clone(),
         manager: manager.clone(),
         all_processes: RefCell::new(Vec::new()),
+        start_times: RefCell::new(HashMap::new()),
         limit_mode: RefCell::new(LimitMode::Application),
         group_pids: RefCell::new(std::collections::HashMap::new()),
         rebuilding: std::cell::Cell::new(false),
@@ -402,7 +407,18 @@ pub fn create(manager: Option<Arc<CgroupManager>>) -> gtk::Widget {
 
     // Toasts show over the page, above the action bar, never covering it.
     toast_overlay.set_child(Some(&page));
-    with_action_bar(&toast_overlay, &status_label, &apply_btn).upcast()
+    let widget: gtk::Widget = with_action_bar(&toast_overlay, &status_label, &apply_btn).upcast();
+
+    // Reload the list each time the page is shown (the window's stack maps
+    // only the visible page), so it never offers processes from hours ago.
+    // filter_processes keeps the PID field and highlights its rows again.
+    let state_clone = state.clone();
+    let search_entry_clone = search_entry.clone();
+    widget.connect_map(move |_| {
+        load_all_processes(&state_clone);
+        filter_processes(&state_clone, search_entry_clone.text().as_str());
+    });
+    widget
 }
 
 fn setup_pid_validation(entry: &adw::EntryRow) {
@@ -519,7 +535,71 @@ fn load_all_processes(state: &Rc<RefCell<LimitState>>) {
             .collect();
         // Biggest memory users first: those are the ones worth limiting.
         processes.sort_by(|a, b| b.rss_kb.cmp(&a.rss_kb).then_with(|| a.name.cmp(&b.name)));
-        state.borrow().all_processes.replace(processes);
+        let fresh: HashMap<u32, u64> = processes
+            .iter()
+            .filter_map(|p| rlm_core::process::start_time(p.pid).map(|t| (p.pid, t)))
+            .collect();
+        let state = state.borrow();
+        // The PID field survives a reload, so its PIDs keep the start time
+        // they were chosen with; applying then skips any that changed.
+        let keep = parse_pid_list(&state.pid_entry.text()).unwrap_or_default();
+        let merged = merge_start_times(&state.start_times.borrow(), fresh, &keep);
+        state.start_times.replace(merged);
+        state.all_processes.replace(processes);
+    }
+}
+
+/// Start times after a reload: `fresh` for every listed process, except
+/// that a PID in `keep` (the PID field) holds on to the time it had in
+/// `old`, so a process that exited while selected is not mistaken for a
+/// new one that reused its PID.
+fn merge_start_times(
+    old: &HashMap<u32, u64>,
+    mut fresh: HashMap<u32, u64>,
+    keep: &[u32],
+) -> HashMap<u32, u64> {
+    for pid in keep {
+        if let Some(t) = old.get(pid) {
+            fresh.insert(*pid, *t);
+        }
+    }
+    fresh
+}
+
+/// Split `pids` into those still worth limiting and a count of those that
+/// have exited: a PID with a start time in `listed` counts only while
+/// `now` gives the same time. PIDs never listed (typed by hand) are kept.
+fn live_pids(
+    pids: &[u32],
+    listed: &HashMap<u32, u64>,
+    now: impl Fn(u32) -> Option<u64>,
+) -> (Vec<u32>, usize) {
+    let mut kept = Vec::new();
+    let mut gone = 0;
+    for pid in pids {
+        match listed.get(pid) {
+            Some(t) if now(*pid) != Some(*t) => gone += 1,
+            _ => kept.push(*pid),
+        }
+    }
+    (kept, gone)
+}
+
+/// The error when every selected process has exited since the list loaded.
+fn exited_error(gone: usize) -> &'static str {
+    if gone == 1 {
+        "The selected process has exited; nothing was limited"
+    } else {
+        "The selected processes have all exited; nothing was limited"
+    }
+}
+
+/// "; 2 processes had exited and were skipped", or nothing when none were.
+fn skipped_note(gone: usize) -> String {
+    match gone {
+        0 => String::new(),
+        1 => "; 1 process had exited and was skipped".to_string(),
+        n => format!("; {n} processes had exited and were skipped"),
     }
 }
 
@@ -920,6 +1000,16 @@ fn apply_limits(state: &Rc<RefCell<LimitState>>) {
                 return;
             }
 
+            let (pids, gone) = live_pids(
+                &pids,
+                &state.start_times.borrow(),
+                rlm_core::process::start_time,
+            );
+            if pids.is_empty() {
+                show_status(&state.status_label, exited_error(gone), true);
+                return;
+            }
+
             // Generate cgroup name from first process or application name
             let cgroup_name = if pids.len() == 1 {
                 format!("pid-{}", pids[0])
@@ -950,6 +1040,7 @@ fn apply_limits(state: &Rc<RefCell<LimitState>>) {
                     } else {
                         format!("Shared limits applied to {} process(es)", pids.len())
                     };
+                    msg.push_str(&skipped_note(gone));
 
                     // Persist as a rule if requested. A rule matches by executable
                     // basename, so only save when every selected PID is the same
@@ -1014,6 +1105,16 @@ fn apply_limits(state: &Rc<RefCell<LimitState>>) {
                     return;
                 }
             };
+
+            let (_, gone) = live_pids(
+                &[pid],
+                &state.start_times.borrow(),
+                rlm_core::process::start_time,
+            );
+            if gone > 0 {
+                show_status(&state.status_label, exited_error(gone), true);
+                return;
+            }
 
             match manager.apply_limit(pid, &limit) {
                 Ok(warnings) => {
@@ -1098,6 +1199,50 @@ fn find_widget_by_name(widget: &gtk::Widget, name: &str) -> Option<gtk::Widget> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exited_processes_are_skipped_when_applying() {
+        let listed: HashMap<u32, u64> = [(10, 100), (11, 110), (12, 120)].into();
+        // 11 exited, 12's PID now names a newer process, 99 was typed by hand.
+        let now = |pid: u32| match pid {
+            10 => Some(100),
+            12 => Some(500),
+            99 => Some(7),
+            _ => None,
+        };
+        let (kept, gone) = live_pids(&[10, 11, 12, 99], &listed, now);
+        assert_eq!(kept, vec![10, 99]);
+        assert_eq!(gone, 2);
+        assert_eq!(
+            skipped_note(gone),
+            "; 2 processes had exited and were skipped"
+        );
+        assert_eq!(skipped_note(1), "; 1 process had exited and was skipped");
+        assert_eq!(skipped_note(0), "");
+        // A hand-typed PID is kept even if it is not running; applying says so.
+        assert_eq!(live_pids(&[99], &HashMap::new(), |_| None), (vec![99], 0));
+        let (kept, gone) = live_pids(&[11], &listed, now);
+        assert!(kept.is_empty());
+        assert_eq!(
+            exited_error(gone),
+            "The selected process has exited; nothing was limited"
+        );
+    }
+
+    #[test]
+    fn a_reload_keeps_the_start_times_of_selected_pids() {
+        let old: HashMap<u32, u64> = [(10, 100), (11, 110)].into();
+        // PID 10 was reused by a new process; 11 exited; 20 is new.
+        let fresh: HashMap<u32, u64> = [(10, 900), (20, 200)].into();
+        let merged = merge_start_times(&old, fresh.clone(), &[10, 11]);
+        assert_eq!(merged.get(&10), Some(&100));
+        assert_eq!(merged.get(&11), Some(&110));
+        assert_eq!(merged.get(&20), Some(&200));
+        // Unselected PIDs take the fresh times.
+        let merged = merge_start_times(&old, fresh, &[]);
+        assert_eq!(merged.get(&10), Some(&900));
+        assert_eq!(merged.get(&11), None);
+    }
 
     #[test]
     fn memory_is_shown_in_a_readable_unit() {
