@@ -1,6 +1,7 @@
 use crate::widgets::{
-    create_unit_dropdown, get_unit_suffix, parse_cpu_value, set_value_with_unit,
-    setup_number_validation, setup_size_validation,
+    cpu_suffix_label, create_io_unit_dropdown, create_unit_dropdown, get_unit_suffix,
+    limits_description, parse_cpu_value, set_value_with_unit, setup_number_validation,
+    setup_size_validation,
 };
 use adw::prelude::*;
 use gtk::glib;
@@ -123,7 +124,7 @@ pub fn create(manager: Option<Arc<CgroupManager>>) -> gtk::Widget {
     // Limits group
     let limits_group = adw::PreferencesGroup::new();
     limits_group.set_title("Limits");
-    limits_group.set_description(Some("Set at least one. Empty fields stay unlimited."));
+    limits_group.set_description(Some(&limits_description()));
 
     // Memory with unit dropdown
     let memory_entry = adw::EntryRow::new();
@@ -131,7 +132,6 @@ pub fn create(manager: Option<Arc<CgroupManager>>) -> gtk::Widget {
     memory_entry.set_input_purpose(gtk::InputPurpose::Number);
     setup_size_validation(&memory_entry);
     let memory_unit = create_unit_dropdown();
-    memory_unit.set_selected(1); // Default to MB
     memory_entry.add_suffix(&memory_unit);
     limits_group.add(&memory_entry);
 
@@ -140,10 +140,7 @@ pub fn create(manager: Option<Arc<CgroupManager>>) -> gtk::Widget {
     cpu_entry.set_title("CPU");
     cpu_entry.set_input_purpose(gtk::InputPurpose::Digits);
     setup_number_validation(&cpu_entry);
-    let cpu_suffix = gtk::Label::new(Some("%"));
-    cpu_suffix.add_css_class("dim-label");
-    cpu_suffix.set_margin_start(4);
-    cpu_entry.add_suffix(&cpu_suffix);
+    cpu_entry.add_suffix(&cpu_suffix_label());
     limits_group.add(&cpu_entry);
 
     // I/O Read with unit dropdown
@@ -151,8 +148,7 @@ pub fn create(manager: Option<Arc<CgroupManager>>) -> gtk::Widget {
     io_read_entry.set_title("I/O Read");
     io_read_entry.set_input_purpose(gtk::InputPurpose::Number);
     setup_size_validation(&io_read_entry);
-    let io_read_unit = create_unit_dropdown();
-    io_read_unit.set_selected(1); // Default to MB
+    let io_read_unit = create_io_unit_dropdown();
     io_read_entry.add_suffix(&io_read_unit);
     limits_group.add(&io_read_entry);
 
@@ -161,8 +157,7 @@ pub fn create(manager: Option<Arc<CgroupManager>>) -> gtk::Widget {
     io_write_entry.set_title("I/O Write");
     io_write_entry.set_input_purpose(gtk::InputPurpose::Number);
     setup_size_validation(&io_write_entry);
-    let io_write_unit = create_unit_dropdown();
-    io_write_unit.set_selected(1); // Default to MB
+    let io_write_unit = create_io_unit_dropdown();
     io_write_entry.add_suffix(&io_write_unit);
     limits_group.add(&io_write_entry);
 

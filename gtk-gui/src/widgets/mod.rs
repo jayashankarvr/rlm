@@ -2,9 +2,11 @@
 
 use adw::prelude::*;
 
-// Unit options for memory/IO. The first letter of each label is the suffix
-// the value is sent with (K, M, G, T).
-pub const UNITS: &[&str] = &["KB", "MB", "GB", "TB"];
+// Unit options. The first letter of each label is the suffix the value is
+// sent with (K, M, G). Memory starts at MB because the minimum is 8 MB; I/O
+// keeps KB/s because its minimum is 64 KB/s.
+pub const MEMORY_UNITS: &[&str] = &["MB", "GB"];
+pub const IO_UNITS: &[&str] = &["KB/s", "MB/s", "GB/s"];
 
 // Field length limits
 pub const MAX_LIMIT_LEN: usize = 20;
@@ -49,13 +51,49 @@ fn filter_number(text: &str, decimal: bool) -> String {
         .collect()
 }
 
-/// Create a unit dropdown (KB/MB/GB/TB), MB selected
-pub fn create_unit_dropdown() -> gtk::DropDown {
-    let units = gtk::StringList::new(UNITS);
-    let dropdown = gtk::DropDown::new(Some(units), gtk::Expression::NONE);
+fn unit_dropdown(units: &[&str]) -> gtk::DropDown {
+    let list = gtk::StringList::new(units);
+    let dropdown = gtk::DropDown::new(Some(list), gtk::Expression::NONE);
     dropdown.set_valign(gtk::Align::Center);
-    dropdown.set_selected(1);
+    // MB or MB/s to start with.
+    dropdown.set_selected(units.iter().position(|u| u.starts_with('M')).unwrap_or(0) as u32);
     dropdown
+}
+
+/// Create a memory unit dropdown (MB/GB), MB selected
+pub fn create_unit_dropdown() -> gtk::DropDown {
+    unit_dropdown(MEMORY_UNITS)
+}
+
+/// Create an I/O unit dropdown (KB/s, MB/s, GB/s), MB/s selected
+pub fn create_io_unit_dropdown() -> gtk::DropDown {
+    unit_dropdown(IO_UNITS)
+}
+
+/// The dim "% of one core" text after a CPU field.
+pub fn cpu_suffix_label() -> gtk::Label {
+    let label = gtk::Label::new(Some("% of one core"));
+    label.add_css_class("dim-label");
+    label.set_margin_start(4);
+    label
+}
+
+/// The description of a Limits group, with this computer's core count.
+pub fn limits_description() -> String {
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+    limits_description_for(cores)
+}
+
+fn limits_description_for(cores: usize) -> String {
+    let cores = if cores == 1 {
+        "1 core".to_string()
+    } else {
+        format!("{cores} cores")
+    };
+    format!(
+        "Set at least one. Empty fields stay unlimited. For CPU, 100% is one core; \
+         this computer has {cores}. Memory must be at least 8 MB and I/O at least 64 KB/s."
+    )
 }
 
 /// The unit letters a dropdown offers, in order.
@@ -200,6 +238,26 @@ mod tests {
         assert_eq!(split_size("", ALL), None);
         assert_eq!(split_size("abc", ALL), None);
         assert_eq!(split_size("4X", ALL), None);
+    }
+
+    #[test]
+    fn unit_labels_start_with_the_suffix_they_send() {
+        let mem: Vec<char> = MEMORY_UNITS
+            .iter()
+            .filter_map(|u| u.chars().next())
+            .collect();
+        let io: Vec<char> = IO_UNITS.iter().filter_map(|u| u.chars().next()).collect();
+        assert_eq!(mem, ['M', 'G']);
+        assert_eq!(io, ['K', 'M', 'G']);
+        // Saved values in units no longer offered still show exactly.
+        assert_eq!(split_size("2T", &mem), Some(("2048".into(), 1)));
+        assert_eq!(split_size("100K", &io), Some(("100".into(), 0)));
+    }
+
+    #[test]
+    fn limits_description_names_the_core_count() {
+        assert!(limits_description_for(1).contains("has 1 core."));
+        assert!(limits_description_for(8).contains("100% is one core; this computer has 8 cores."));
     }
 
     #[test]

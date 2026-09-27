@@ -1,6 +1,6 @@
 use crate::widgets::{
-    create_unit_dropdown, get_unit_suffix, parse_cpu_value, set_value_with_unit,
-    setup_number_validation, setup_size_validation,
+    cpu_suffix_label, create_io_unit_dropdown, create_unit_dropdown, get_unit_suffix,
+    parse_cpu_value, set_value_with_unit, setup_number_validation, setup_size_validation,
 };
 use adw::prelude::*;
 use common::{Config, Profile};
@@ -247,7 +247,6 @@ fn show_profile_dialog(parent: &adw::PreferencesPage, state: &Rc<RefCell<Profile
     memory_entry.set_input_purpose(gtk::InputPurpose::Number);
     setup_size_validation(&memory_entry);
     let memory_unit = create_unit_dropdown();
-    memory_unit.set_selected(1); // Default to MB
     memory_entry.add_suffix(&memory_unit);
     limits_group.add(&memory_entry);
 
@@ -256,10 +255,7 @@ fn show_profile_dialog(parent: &adw::PreferencesPage, state: &Rc<RefCell<Profile
     cpu_entry.set_title("CPU");
     cpu_entry.set_input_purpose(gtk::InputPurpose::Digits);
     setup_number_validation(&cpu_entry);
-    let cpu_suffix = gtk::Label::new(Some("%"));
-    cpu_suffix.add_css_class("dim-label");
-    cpu_suffix.set_margin_start(4);
-    cpu_entry.add_suffix(&cpu_suffix);
+    cpu_entry.add_suffix(&cpu_suffix_label());
     limits_group.add(&cpu_entry);
 
     // I/O Read with unit dropdown
@@ -267,8 +263,7 @@ fn show_profile_dialog(parent: &adw::PreferencesPage, state: &Rc<RefCell<Profile
     io_read_entry.set_title("I/O Read");
     io_read_entry.set_input_purpose(gtk::InputPurpose::Number);
     setup_size_validation(&io_read_entry);
-    let io_read_unit = create_unit_dropdown();
-    io_read_unit.set_selected(1); // Default to MB
+    let io_read_unit = create_io_unit_dropdown();
     io_read_entry.add_suffix(&io_read_unit);
     limits_group.add(&io_read_entry);
 
@@ -277,8 +272,7 @@ fn show_profile_dialog(parent: &adw::PreferencesPage, state: &Rc<RefCell<Profile
     io_write_entry.set_title("I/O Write");
     io_write_entry.set_input_purpose(gtk::InputPurpose::Number);
     setup_size_validation(&io_write_entry);
-    let io_write_unit = create_unit_dropdown();
-    io_write_unit.set_selected(1); // Default to MB
+    let io_write_unit = create_io_unit_dropdown();
     io_write_entry.add_suffix(&io_write_unit);
     limits_group.add(&io_write_entry);
 
@@ -527,10 +521,7 @@ fn show_edit_profile_dialog(parent: &adw::PreferencesPage, name: &str, profile: 
     cpu_entry.set_title("CPU");
     cpu_entry.set_input_purpose(gtk::InputPurpose::Digits);
     setup_number_validation(&cpu_entry);
-    let cpu_suffix = gtk::Label::new(Some("%"));
-    cpu_suffix.add_css_class("dim-label");
-    cpu_suffix.set_margin_start(4);
-    cpu_entry.add_suffix(&cpu_suffix);
+    cpu_entry.add_suffix(&cpu_suffix_label());
     if let Some(ref v) = profile.cpu {
         cpu_entry.set_text(&parse_cpu_value(v));
     }
@@ -541,7 +532,7 @@ fn show_edit_profile_dialog(parent: &adw::PreferencesPage, name: &str, profile: 
     io_read_entry.set_title("I/O Read");
     io_read_entry.set_input_purpose(gtk::InputPurpose::Number);
     setup_size_validation(&io_read_entry);
-    let io_read_unit = create_unit_dropdown();
+    let io_read_unit = create_io_unit_dropdown();
     if let Some(ref v) = profile.io_read {
         set_value_with_unit(&io_read_entry, &io_read_unit, v);
     }
@@ -553,7 +544,7 @@ fn show_edit_profile_dialog(parent: &adw::PreferencesPage, name: &str, profile: 
     io_write_entry.set_title("I/O Write");
     io_write_entry.set_input_purpose(gtk::InputPurpose::Number);
     setup_size_validation(&io_write_entry);
-    let io_write_unit = create_unit_dropdown();
+    let io_write_unit = create_io_unit_dropdown();
     if let Some(ref v) = profile.io_write {
         set_value_with_unit(&io_write_entry, &io_write_unit, v);
     }
