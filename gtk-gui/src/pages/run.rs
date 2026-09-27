@@ -259,8 +259,9 @@ pub fn create(manager: Option<Arc<CgroupManager>>) -> gtk::Widget {
         move || run_command(&state_clone),
     );
 
-    toast_overlay.set_child(Some(&with_action_bar(&page, &status_label, &run_btn)));
-    toast_overlay.upcast()
+    // Toasts show over the page, above the action bar, never covering it.
+    toast_overlay.set_child(Some(&page));
+    with_action_bar(&toast_overlay, &status_label, &run_btn).upcast()
 }
 
 fn load_profile_names() -> Vec<String> {

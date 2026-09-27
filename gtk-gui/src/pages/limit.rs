@@ -394,8 +394,9 @@ pub fn create(manager: Option<Arc<CgroupManager>>) -> gtk::Widget {
         move || apply_limits(&state_clone),
     );
 
-    toast_overlay.set_child(Some(&with_action_bar(&page, &status_label, &apply_btn)));
-    toast_overlay.upcast()
+    // Toasts show over the page, above the action bar, never covering it.
+    toast_overlay.set_child(Some(&page));
+    with_action_bar(&toast_overlay, &status_label, &apply_btn).upcast()
 }
 
 fn setup_pid_validation(entry: &adw::EntryRow) {
