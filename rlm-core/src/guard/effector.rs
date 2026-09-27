@@ -23,12 +23,13 @@
 //! unavailable, call failed, or timed out) we fall back to the raw cgroupfs
 //! primitives in `cgfs`. Raw-mechanism targets (rlm's own rule cgroups) skip
 //! the D-Bus attempt entirely. Thawing is mechanism-independent: we always
-//! attempt `ThawUnit` best-effort *and* always perform the raw
-//! `cgroup.freeze` write afterward, unconditionally — this guarantees a
-//! cgroup is never left frozen just because the D-Bus call "succeeded" on a
-//! stale unit, and tolerates a missing cgroup (the raw write simply errors
-//! and we move on). Caps are the exception: they never go through systemd
-//! (see below).
+//! perform the raw `cgroup.freeze` write first, unconditionally, and only
+//! then attempt `ThawUnit` best-effort so systemd's view matches. This
+//! guarantees a cgroup is never left frozen because of a stale unit or a
+//! slow bus, and tolerates a missing cgroup (the raw write simply errors and
+//! we move on). On shutdown and startup replay every raw thaw and restore
+//! finishes before the first D-Bus call. Caps are the exception: they never
+//! go through systemd (see below).
 //!
 //! # Restoring `memory.high`
 //! The kernel truncates `memory.high` writes to page multiples, so the byte
@@ -348,12 +349,28 @@ impl<'a> Effector<'a> {
         for e in self.journal.entries() {
             by_cgroup.entry(e.cgroup.clone()).or_default().push(e);
         }
+        // Pass 1: every raw thaw and memory.high restore, then clear the
+        // journal. No D-Bus call happens before this is done, so a slow
+        // session bus cannot push the undo past systemd's stop timeout.
         for (cgroup, entries) in &by_cgroup {
-            let unit = entries.last().and_then(|e| e.unit.clone());
-            let _ = self.thaw_raw(cgroup, unit.as_deref());
+            if let Err(e) = cgfs::write_freeze(cgroup, false) {
+                tracing::debug!(cgroup, error = %e, "raw thaw failed (cgroup may already be gone)");
+            }
             self.restore_high_if_any(cgroup, entries);
         }
-        self.journal.clear()
+        let cleared = self.journal.clear();
+        // Pass 2, best effort: tell systemd so its view of the units
+        // matches the kernel's. The processes already run again.
+        if let Some(systemd) = self.systemd {
+            for (cgroup, entries) in &by_cgroup {
+                if let Some(unit) = entries.last().and_then(|e| e.unit.as_deref()) {
+                    if let Err(e) = systemd.thaw_unit(unit, DBUS_TIMEOUT) {
+                        tracing::debug!(cgroup, unit, error = %e, "ThawUnit failed after raw thaw");
+                    }
+                }
+            }
+        }
+        cleared
     }
 
     /// Restore `memory.high` for one cgroup's journal `entries` (oldest-first),
@@ -395,19 +412,20 @@ impl<'a> Effector<'a> {
         }
     }
 
-    /// Mechanism-independent thaw: best-effort `ThawUnit` first (if we have a
-    /// unit and a bus), then an *unconditional* raw `cgroup.freeze` write —
-    /// this always runs, regardless of mechanism or whether `ThawUnit`
-    /// succeeded, so a cgroup is never left frozen. Tolerates a missing
-    /// cgroup: the raw write then simply returns `Err`, which every caller
-    /// here treats as non-fatal.
+    /// Mechanism-independent thaw: an *unconditional* raw `cgroup.freeze`
+    /// write first, so a cgroup is never left frozen and a slow bus cannot
+    /// delay it, then a best-effort `ThawUnit` (if we have a unit and a bus)
+    /// so systemd's view of the unit matches. Tolerates a missing cgroup:
+    /// the raw write then simply returns `Err`, which every caller here
+    /// treats as non-fatal.
     fn thaw_raw(&self, cgroup: &str, unit: Option<&str>) -> Result<()> {
+        let result = cgfs::write_freeze(cgroup, false);
         if let (Some(unit), Some(systemd)) = (unit, self.systemd) {
             if let Err(e) = systemd.thaw_unit(unit, DBUS_TIMEOUT) {
-                tracing::debug!(cgroup, unit, error = %e, "ThawUnit failed; raw thaw still runs");
+                tracing::debug!(cgroup, unit, error = %e, "ThawUnit failed after raw thaw");
             }
         }
-        cgfs::write_freeze(cgroup, false)
+        result
     }
 }
 
