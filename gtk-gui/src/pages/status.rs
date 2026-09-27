@@ -131,6 +131,19 @@ pub fn still_running(
         .collect()
 }
 
+/// Whether every process in a cgroup now (`current`, each PID with its
+/// start time) is one of those `removed` from it, so putting them back can
+/// only have been the guard's rule. A process that was not there at
+/// removal, or whose start time cannot be read, means someone limited the
+/// cgroup again since, and that limit must be left alone. An empty cgroup
+/// counts as unchanged.
+pub fn only_removed_processes(
+    removed: &[(u32, Option<u64>)],
+    current: &[(u32, Option<u64>)],
+) -> bool {
+    current.iter().all(|p| p.1.is_some() && removed.contains(p))
+}
+
 /// The saved rules that own `cgroup`, sorted: rlm-guard keeps each rule's
 /// processes in `app-<rule name>`, so removing that cgroup's limit only
 /// lasts until the guard's next pass. Names that differ only in `/` or a
@@ -436,9 +449,18 @@ impl StatusPage {
                 let text = match forget_rules(&rules) {
                     Ok(()) => {
                         // The guard may have put the limit back since it was
-                        // removed; take it off again now the rule is gone.
+                        // removed; take it off again now the rule is gone,
+                        // unless the cgroup now holds other processes: then
+                        // it was limited again on purpose.
                         if let Some(manager) = page.manager.as_ref() {
-                            let _ = manager.cleanup_cgroup(&cgroup);
+                            let current: Vec<(u32, Option<u64>)> = manager
+                                .pids_in_cgroup(&cgroup)
+                                .into_iter()
+                                .map(|pid| (pid, start_time(pid)))
+                                .collect();
+                            if only_removed_processes(&pids, &current) {
+                                let _ = manager.cleanup_cgroup(&cgroup);
+                            }
                         }
                         page.refresh();
                         forgot_text(&rules, guard_running())
@@ -575,6 +597,26 @@ mod tests {
             _ => None, // exited
         };
         assert_eq!(still_running(&recorded, now), [10]);
+    }
+
+    #[test]
+    fn forget_rule_cleans_up_only_the_removed_processes() {
+        let removed = [(10, Some(100)), (11, Some(110)), (12, None)];
+        // The guard put back the same processes, or some of them.
+        assert!(only_removed_processes(
+            &removed,
+            &[(10, Some(100)), (11, Some(110))]
+        ));
+        assert!(only_removed_processes(&removed, &[(11, Some(110))]));
+        assert!(only_removed_processes(&removed, &[]));
+        // A new process, or a reused PID: limited again since.
+        assert!(!only_removed_processes(
+            &removed,
+            &[(10, Some(100)), (13, Some(130))]
+        ));
+        assert!(!only_removed_processes(&removed, &[(10, Some(999))]));
+        // Unknown start times never match.
+        assert!(!only_removed_processes(&removed, &[(12, None)]));
     }
 
     #[test]
