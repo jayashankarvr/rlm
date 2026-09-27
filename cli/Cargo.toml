@@ -10,6 +10,8 @@ description = "rlm: unprivileged cgroup v2 limits for your own processes, plus r
 readme = "../README.md"
 keywords = ["cgroups", "resource-limit", "memory", "systemd", "linux"]
 categories = ["command-line-utilities", "os::linux-apis"]
+# Reads README.md and CLAUDE.md from the repo root, which are not in the published crate.
+exclude = ["tests/doc_config_examples.rs"]
 
 [package.metadata.deb]
 name = "rlm"
