@@ -44,7 +44,9 @@ pub fn create(manager: Option<Arc<CgroupManager>>) -> gtk::Widget {
     // Main heading group
     let header_group = adw::PreferencesGroup::new();
     header_group.set_title("Launch New Process");
-    header_group.set_description(Some("Start an application with resource limits"));
+    header_group.set_description(Some(
+        "Start a program with limits applied from its first instruction",
+    ));
     page.add(&header_group);
 
     // Status label
@@ -58,6 +60,9 @@ pub fn create(manager: Option<Arc<CgroupManager>>) -> gtk::Widget {
     // Command group
     let command_group = adw::PreferencesGroup::new();
     command_group.set_title("Command");
+    command_group.set_description(Some(
+        "The program and its arguments, or pick an application below",
+    ));
 
     let command_entry = adw::EntryRow::new();
     command_entry.set_title("Command");
@@ -69,6 +74,7 @@ pub fn create(manager: Option<Arc<CgroupManager>>) -> gtk::Widget {
     // App search group
     let apps_group = adw::PreferencesGroup::new();
     apps_group.set_title("Applications");
+    apps_group.set_description(Some("Installed apps. Selecting one fills in its command."));
 
     // Refresh button in header
     let refresh_btn = gtk::Button::from_icon_name("view-refresh-symbolic");
@@ -98,7 +104,7 @@ pub fn create(manager: Option<Arc<CgroupManager>>) -> gtk::Widget {
     // Profile selection group
     let profile_group = adw::PreferencesGroup::new();
     profile_group.set_title("Quick Apply");
-    profile_group.set_description(Some("Use a saved profile"));
+    profile_group.set_description(Some("Choosing a profile fills in the limits below"));
 
     let profiles = load_profile_names();
     let profile_list =
@@ -117,12 +123,12 @@ pub fn create(manager: Option<Arc<CgroupManager>>) -> gtk::Widget {
 
     // Limits group
     let limits_group = adw::PreferencesGroup::new();
-    limits_group.set_title("Manual Limits");
-    limits_group.set_description(Some("Override or set limits manually"));
+    limits_group.set_title("Limits");
+    limits_group.set_description(Some("Set at least one. Empty fields stay unlimited."));
 
     // Memory with unit dropdown
     let memory_entry = adw::EntryRow::new();
-    memory_entry.set_title("Memory Limit");
+    memory_entry.set_title("Memory");
     memory_entry.set_input_purpose(gtk::InputPurpose::Digits);
     setup_number_validation(&memory_entry);
     let memory_unit = create_unit_dropdown();
@@ -132,7 +138,7 @@ pub fn create(manager: Option<Arc<CgroupManager>>) -> gtk::Widget {
 
     // CPU with fixed % suffix
     let cpu_entry = adw::EntryRow::new();
-    cpu_entry.set_title("CPU Limit");
+    cpu_entry.set_title("CPU");
     cpu_entry.set_input_purpose(gtk::InputPurpose::Digits);
     setup_number_validation(&cpu_entry);
     let cpu_suffix = gtk::Label::new(Some("%"));
@@ -143,7 +149,7 @@ pub fn create(manager: Option<Arc<CgroupManager>>) -> gtk::Widget {
 
     // I/O Read with unit dropdown
     let io_read_entry = adw::EntryRow::new();
-    io_read_entry.set_title("I/O Read Limit");
+    io_read_entry.set_title("I/O Read");
     io_read_entry.set_input_purpose(gtk::InputPurpose::Digits);
     setup_number_validation(&io_read_entry);
     let io_read_unit = create_unit_dropdown();
@@ -153,7 +159,7 @@ pub fn create(manager: Option<Arc<CgroupManager>>) -> gtk::Widget {
 
     // I/O Write with unit dropdown
     let io_write_entry = adw::EntryRow::new();
-    io_write_entry.set_title("I/O Write Limit");
+    io_write_entry.set_title("I/O Write");
     io_write_entry.set_input_purpose(gtk::InputPurpose::Digits);
     setup_number_validation(&io_write_entry);
     let io_write_unit = create_unit_dropdown();
@@ -345,7 +351,7 @@ fn run_command(state: &Rc<RefCell<RunState>>) {
 
     let command_text = state.command_entry.text();
     if command_text.is_empty() {
-        show_status(&state.status_label, "Error: Enter a command", true);
+        show_status(&state.status_label, "Enter a command", true);
         return;
     }
 
@@ -359,18 +365,14 @@ fn run_command(state: &Rc<RefCell<RunState>>) {
         && io_read_val.is_empty()
         && io_write_val.is_empty()
     {
-        show_status(
-            &state.status_label,
-            "Error: Specify at least one limit",
-            true,
-        );
+        show_status(&state.status_label, "Set at least one limit", true);
         return;
     }
 
     let Some(ref manager) = state.manager else {
         show_status(
             &state.status_label,
-            "Error: Cgroup manager not available",
+            "Cannot set up cgroups for your user. Run rlm doctor in a terminal to see why.",
             true,
         );
         return;
@@ -418,14 +420,14 @@ fn run_command(state: &Rc<RefCell<RunState>>) {
     ) {
         Ok(l) => l,
         Err(e) => {
-            show_status(&state.status_label, &format!("Error: {e}"), true);
+            show_status(&state.status_label, &e.to_string(), true);
             return;
         }
     };
 
     let parts: Vec<&str> = command_text.split_whitespace().collect();
     if parts.is_empty() {
-        show_status(&state.status_label, "Error: Invalid command", true);
+        show_status(&state.status_label, "Enter a command", true);
         return;
     }
 
@@ -440,7 +442,7 @@ fn run_command(state: &Rc<RefCell<RunState>>) {
         Err(e) => {
             show_status(
                 &state.status_label,
-                &format!("Error creating cgroup: {e}"),
+                &format!("Could not create the cgroup: {e}"),
                 true,
             );
             return;
@@ -456,7 +458,11 @@ fn run_command(state: &Rc<RefCell<RunState>>) {
         Ok(c) => c,
         Err(e) => {
             let _ = manager.remove_if_empty(&cgroup_name);
-            show_status(&state.status_label, &format!("Error spawning: {e}"), true);
+            show_status(
+                &state.status_label,
+                &format!("Could not start the program: {e}"),
+                true,
+            );
             return;
         }
     };

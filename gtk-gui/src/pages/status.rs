@@ -12,7 +12,9 @@ pub fn create(manager: Option<Arc<CgroupManager>>) -> gtk::Widget {
     // Process list group
     let group = adw::PreferencesGroup::new();
     group.set_title("Managed Processes");
-    group.set_description(Some("Processes with active resource limits"));
+    group.set_description(Some(
+        "Processes rlm has limited and their limits. The trash button removes a limit.",
+    ));
 
     // Refresh button in header
     let refresh_btn = gtk::Button::from_icon_name("view-refresh-symbolic");
@@ -28,7 +30,8 @@ pub fn create(manager: Option<Arc<CgroupManager>>) -> gtk::Widget {
     // Empty state
     let empty_row = adw::ActionRow::new();
     empty_row.set_title("No managed processes");
-    empty_row.set_subtitle("Use the Limit or Run tabs to manage processes");
+    empty_row
+        .set_subtitle("Limit a running process from Limit Running, or start one from Launch New");
     list_box.append(&empty_row);
 
     group.add(&list_box);
@@ -84,7 +87,9 @@ fn do_refresh(list_box: &gtk::ListBox, manager: Arc<CgroupManager>) {
             if processes.is_empty() {
                 let empty_row = adw::ActionRow::new();
                 empty_row.set_title("No managed processes");
-                empty_row.set_subtitle("Use the Limit or Run tabs to manage processes");
+                empty_row.set_subtitle(
+                    "Limit a running process from Limit Running, or start one from Launch New",
+                );
                 list_box.append(&empty_row);
             } else {
                 for proc in processes {
@@ -95,7 +100,7 @@ fn do_refresh(list_box: &gtk::ListBox, manager: Arc<CgroupManager>) {
         }
         Err(e) => {
             let error_row = adw::ActionRow::new();
-            error_row.set_title("Error loading processes");
+            error_row.set_title("Could not load processes");
             error_row.set_subtitle(&e.to_string());
             error_row.add_css_class("error");
             list_box.append(&error_row);

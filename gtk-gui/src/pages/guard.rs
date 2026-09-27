@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 const HISTORY_SHOWN: usize = 20;
 
 /// `service::query` spawns two `systemctl --user` calls, each with its own
-/// 1s timeout (see `rlm_core::guard::service::SYSTEMCTL_TIMEOUT`) — cheap
+/// 1s timeout (see `rlm_core::guard::service::SYSTEMCTL_TIMEOUT`); cheap
 /// once, but the auto-refresh timer (`window.rs`) calls `refresh` every 2s,
 /// which would otherwise spawn `systemctl` every 2s on the GTK main thread.
 /// Cache the service state and only re-query every `SERVICE_QUERY_INTERVAL`;
@@ -388,6 +388,9 @@ pub fn create() -> gtk::Widget {
 
     let status_group = adw::PreferencesGroup::new();
     status_group.set_title("Status");
+    status_group.set_description(Some(
+        "Service state, memory pressure and when the guard acts",
+    ));
     let refresh_btn = gtk::Button::from_icon_name("view-refresh-symbolic");
     refresh_btn.add_css_class("flat");
     refresh_btn.set_tooltip_text(Some("Refresh"));
@@ -398,6 +401,9 @@ pub fn create() -> gtk::Widget {
 
     let interventions_group = adw::PreferencesGroup::new();
     interventions_group.set_title("Active interventions");
+    interventions_group.set_description(Some(
+        "Apps the guard has frozen or capped right now. They are restored when pressure eases or the guard stops.",
+    ));
     let interventions_list = new_list_box("guard-interventions-list");
     interventions_group.add(&interventions_list);
     page.add(&interventions_group);

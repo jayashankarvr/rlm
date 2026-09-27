@@ -50,7 +50,7 @@ pub fn create(manager: Option<Arc<CgroupManager>>) -> gtk::Widget {
     // Main heading group
     let header_group = adw::PreferencesGroup::new();
     header_group.set_title("Limit Running Process");
-    header_group.set_description(Some("Apply resource limits to a running process"));
+    header_group.set_description(Some("Limit processes that are already running. Limits last until you remove them or the processes exit."));
     page.add(&header_group);
 
     // Status label for feedback
@@ -64,6 +64,9 @@ pub fn create(manager: Option<Arc<CgroupManager>>) -> gtk::Widget {
     // Limit mode selection
     let mode_group = adw::PreferencesGroup::new();
     mode_group.set_title("Limit Mode");
+    mode_group.set_description(Some(
+        "Individual limits one process. Application puts several processes under one shared limit.",
+    ));
 
     let mode_row = adw::ComboRow::new();
     mode_row.set_title("Mode");
@@ -80,6 +83,7 @@ pub fn create(manager: Option<Arc<CgroupManager>>) -> gtk::Widget {
     // Target process group
     let target_group = adw::PreferencesGroup::new();
     target_group.set_title("Target Process");
+    target_group.set_description(Some("Type a PID, or pick from the list below"));
 
     let pid_entry = adw::EntryRow::new();
     pid_entry.set_title("Process ID");
@@ -126,7 +130,7 @@ pub fn create(manager: Option<Arc<CgroupManager>>) -> gtk::Widget {
     // Profile selection group
     let profile_group = adw::PreferencesGroup::new();
     profile_group.set_title("Quick Apply");
-    profile_group.set_description(Some("Use a saved profile"));
+    profile_group.set_description(Some("Choosing a profile fills in the limits below"));
 
     let profiles = load_profile_names();
     let profile_list =
@@ -145,8 +149,8 @@ pub fn create(manager: Option<Arc<CgroupManager>>) -> gtk::Widget {
 
     // Limits group
     let limits_group = adw::PreferencesGroup::new();
-    limits_group.set_title("Custom Limits");
-    limits_group.set_description(Some("Or set manually"));
+    limits_group.set_title("Limits");
+    limits_group.set_description(Some("Set at least one. Empty fields stay unlimited."));
 
     // Memory with unit dropdown
     let memory_entry = adw::EntryRow::new();
@@ -193,7 +197,7 @@ pub fn create(manager: Option<Arc<CgroupManager>>) -> gtk::Widget {
 
     // Persist-as-rule toggle (only meaningful in application mode; hidden otherwise)
     let save_rule_check =
-        gtk::CheckButton::with_label("Save as persistent rule (re-apply across reboots)");
+        gtk::CheckButton::with_label("Save as a rule: rlm-guard applies it to this app now and after reboots (needs the guard running)");
     save_rule_check.set_halign(gtk::Align::Center);
     save_rule_check.set_visible(false);
 
@@ -449,10 +453,10 @@ fn load_all_processes(state: &Rc<RefCell<LimitState>>) {
 fn update_mode_info(label: &gtk::Label, mode: LimitMode) {
     match mode {
         LimitMode::Individual => {
-            label.set_text("Select a single process. Each process gets its own limits.");
+            label.set_text("Select one process. It gets its own limits.");
         }
         LimitMode::Application => {
-            label.set_text("Select multiple processes. All selected processes will share the same limits (combined pool).");
+            label.set_text("Select an application or several processes. They share one set of limits: 4G for 10 processes is 4G in total.");
         }
     }
 }
@@ -661,7 +665,11 @@ fn apply_limits(state: &Rc<RefCell<LimitState>>) {
     }
 
     let Some(ref manager) = state.manager else {
-        show_status(&state.status_label, "Cgroup manager unavailable", true);
+        show_status(
+            &state.status_label,
+            "Cannot set up cgroups for your user. Run rlm doctor in a terminal to see why.",
+            true,
+        );
         return;
     };
 
