@@ -9,6 +9,7 @@ use crate::pages::{gui_error, plain_toast, show_toast};
 use adw::prelude::*;
 use common::{build_limit, format_bytes, AppRule, Config, Limit};
 use gtk::glib;
+use rlm_core::process::start_time;
 use rlm_core::rules::cgroup_name_for;
 use rlm_core::status::ProcessStatus;
 use rlm_core::CgroupManager;
@@ -112,6 +113,21 @@ pub fn restore_limit(row: &RowView) -> common::Result<Limit> {
         io_read.as_deref(),
         io_write.as_deref(),
     )
+}
+
+/// The PIDs of `recorded` (PID, start time at removal) that still name the
+/// same process: `now` gives a PID's current start time. A PID that has
+/// exited, or was reused by a process that started later, is left out, as is
+/// one whose start time could not be read at removal.
+pub fn still_running(
+    recorded: &[(u32, Option<u64>)],
+    now: impl Fn(u32) -> Option<u64>,
+) -> Vec<u32> {
+    recorded
+        .iter()
+        .filter(|(pid, then)| then.is_some() && now(*pid) == *then)
+        .map(|(pid, _)| *pid)
+        .collect()
 }
 
 /// The saved rules that own `cgroup`, sorted: rlm-guard keeps each rule's
@@ -386,11 +402,18 @@ impl StatusPage {
         let Some(manager) = self.manager.clone() else {
             return;
         };
-        let pids = manager.pids_in_cgroup(&row.cgroup);
+        // Each PID with its start time, so Undo can tell a process that is
+        // still running from a new one that reused the PID.
+        let pids: Vec<(u32, Option<u64>)> = manager
+            .pids_in_cgroup(&row.cgroup)
+            .into_iter()
+            .map(|pid| (pid, start_time(pid)))
+            .collect();
         if let Err(e) = manager.cleanup_cgroup(&row.cgroup) {
             self.toast(plain_toast(&format!(
-                "Could not remove the limit from {}: {e}",
-                row.name
+                "Could not remove the limit from {}: {}",
+                row.name,
+                gui_error(&e)
             )));
             self.refresh();
             return;
@@ -449,15 +472,11 @@ impl StatusPage {
 
     /// Put the limits `row` showed back on those of `pids` still running,
     /// in a cgroup of the same name.
-    fn undo_remove(self: &Rc<Self>, row: &RowView, pids: &[u32]) {
+    fn undo_remove(self: &Rc<Self>, row: &RowView, pids: &[(u32, Option<u64>)]) {
         let Some(manager) = self.manager.clone() else {
             return;
         };
-        let alive: Vec<u32> = pids
-            .iter()
-            .copied()
-            .filter(|p| std::path::Path::new(&format!("/proc/{p}")).exists())
-            .collect();
+        let alive = still_running(pids, start_time);
         if alive.is_empty() {
             self.toast(plain_toast(&format!(
                 "{} is no longer running; nothing to restore",
@@ -470,10 +489,15 @@ impl StatusPage {
         self.refresh();
         match result {
             Ok(warnings) if warnings.is_empty() => {}
-            Ok(warnings) => self.toast(plain_toast(&warnings.join("; "))),
+            Ok(warnings) => self.toast(plain_toast(&format!(
+                "Restored the limit on {}, with warnings: {}",
+                row.name,
+                warnings.join("; ")
+            ))),
             Err(e) => self.toast(plain_toast(&format!(
-                "Could not restore the limit on {}: {e}",
-                row.name
+                "Could not restore the limit on {}: {}",
+                row.name,
+                gui_error(&e)
             ))),
         }
     }
@@ -535,6 +559,23 @@ mod tests {
         assert!(same_cgroups(&old, &[a.clone(), b.clone()]));
         assert!(!same_cgroups(&old, &[b.clone(), a.clone()]));
         assert!(!same_cgroups(&old, &[a]));
+    }
+
+    #[test]
+    fn undo_skips_exited_and_reused_pids() {
+        let recorded = [
+            (10, Some(100)),
+            (11, Some(200)),
+            (12, Some(300)),
+            (13, None),
+        ];
+        let now = |pid: u32| match pid {
+            10 => Some(100), // still the same process
+            11 => Some(999), // PID reused by a newer process
+            13 => Some(5),
+            _ => None, // exited
+        };
+        assert_eq!(still_running(&recorded, now), [10]);
     }
 
     #[test]

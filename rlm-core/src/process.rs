@@ -127,6 +127,22 @@ fn read_process_stat(proc_path: &Path) -> Option<(u32, u32)> {
     None
 }
 
+/// The start time (field 22, clock ticks after boot) from the text of
+/// `/proc/<pid>/stat`. The comm field is in parentheses and may itself hold
+/// spaces or ')', so fields are counted from the last ')'.
+pub fn parse_start_time(stat: &str) -> Option<u64> {
+    let rest = &stat[stat.rfind(')')? + 1..];
+    // After the comm comes field 3 (state); field 22 is 19 further on.
+    rest.split_whitespace().nth(19)?.parse().ok()
+}
+
+/// When `pid` started, or `None` if it is gone. With the PID it names one
+/// process: a PID reused later by another process has a different start
+/// time.
+pub fn start_time(pid: u32) -> Option<u64> {
+    parse_start_time(&fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
+}
+
 /// Get executable path for a process
 fn get_executable(proc_path: &Path) -> Option<PathBuf> {
     fs::read_link(proc_path.join("exe")).ok()
@@ -439,6 +455,23 @@ pub fn find_all_by_executable(executable_name: &str) -> Result<Vec<ProcessInfo>>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn start_time_is_field_22_counted_after_the_comm() {
+        let tail = "R 2238197 2238197 2238197 0 -1 4194304 519 0 0 0 0 0 0 0 20 0 1 0 5852809 18214912 1841";
+        assert_eq!(
+            parse_start_time(&format!("2238200 (cat) {tail}")),
+            Some(5852809)
+        );
+        // A comm with spaces and a ')' of its own.
+        assert_eq!(
+            parse_start_time(&format!("42 (Web Co) (x)) {tail}")),
+            Some(5852809)
+        );
+        assert_eq!(parse_start_time("42 (cat) R 1 2"), None);
+        assert_eq!(parse_start_time(""), None);
+        assert!(start_time(std::process::id()).is_some());
+    }
 
     #[test]
     fn parse_status_reads_uid_name_and_rss_plus_swap() {
