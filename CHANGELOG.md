@@ -25,6 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Logs go to stderr, without color when not on a terminal. The default level is WARN for rlm and INFO for rlm-guard; `RUST_LOG` overrides it.
 - `rlm status` is read-only.
 - Packages: crates.io `rlmctl` (binaries rlm and rlm-guard), `rlmctl-core`, `rlmctl-common`; the delegation drop-in is `rlm-delegate.conf`.
+- Building from source or from crates.io needs Rust 1.87 or newer (the zbus release in use requires it).
 
 ### Added
 

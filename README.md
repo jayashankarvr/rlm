@@ -84,7 +84,7 @@ From 0.2.0 on:
 cargo install rlmctl
 ```
 
-This installs `rlm` and `rlm-guard`. The GUI is not on crates.io because it needs the GTK4 and libadwaita development headers to build; install it from source.
+This installs `rlm` and `rlm-guard` and needs Rust 1.87 or newer. The GUI is not on crates.io because it needs the GTK4 and libadwaita development headers to build; install it from source.
 
 ### From source
 

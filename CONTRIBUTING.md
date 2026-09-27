@@ -3,7 +3,7 @@
 ## Setup
 
 1. Clone the repository
-2. Install Rust 1.85 or newer
+2. Install Rust 1.87 or newer
 3. For the GUI, install the GTK4 and libadwaita development headers (Debian/Ubuntu: `libgtk-4-dev libadwaita-1-dev pkg-config`)
 4. Build: `cargo build --workspace`
 

@@ -45,6 +45,21 @@ jobs:
       - name: Check docs against the code
         run: scripts/check-docs.sh
 
+  msrv:
+    name: MSRV (Rust 1.87)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust 1.87
+        uses: dtolnay/rust-toolchain@1.87
+
+      - name: Build CLI and core
+        run: cargo build --locked -p rlmctl -p rlmctl-core -p rlmctl-common
+
+      - name: Run tests
+        run: cargo test --locked -p rlmctl -p rlmctl-core -p rlmctl-common
+
   build-gui:
     name: Build GUI
     runs-on: ubuntu-latest
