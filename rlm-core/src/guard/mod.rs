@@ -9,6 +9,7 @@ pub mod cgfs;
 pub mod effector;
 pub mod history;
 pub mod journal;
+pub mod lock;
 pub mod policy;
 pub mod report;
 pub mod resolve;
@@ -37,4 +38,10 @@ pub fn journal_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/tmp"))
         .join("rlm")
         .join("guard-journal.jsonl")
+}
+
+/// Path of the lock file that keeps a second `rlm-guard` from running.
+/// It sits next to the journal the lock protects.
+pub fn lock_path() -> PathBuf {
+    journal_path().with_file_name("rlm-guard.lock")
 }

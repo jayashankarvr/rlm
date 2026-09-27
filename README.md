@@ -262,7 +262,7 @@ guard:
 No. It only freezes the app's cgroup (through systemd, with a direct `cgroup.freeze` write as fallback) or sets `memory.high`. It never sends a signal. The kernel's own OOM killer is not affected, so a hard memory limit you set can still end in an OOM kill.
 
 **What if the guard crashes while an app is frozen?**
-Every freeze and cap is written to a journal, `~/.local/state/rlm/guard-journal.jsonl`, before it is applied. On the next start, including a start that fails on a bad config, the guard replays the journal and restores the app. Entries are keyed by boot and cgroup identity, so it never touches a cgroup that was since recreated for something else. On a normal stop (SIGTERM) it undoes everything before exiting.
+Every freeze and cap is written to a journal, `~/.local/state/rlm/guard-journal.jsonl`, before it is applied. On the next start, including a start that fails on a bad config, the guard replays the journal and restores the app. Entries are keyed by boot and cgroup identity, so it never touches a cgroup that was since recreated for something else. On a normal stop (SIGTERM) it undoes everything before exiting. Only one guard runs per user: a second `rlm-guard` finds `~/.local/state/rlm/rlm-guard.lock` held and exits without touching the journal.
 
 **Could it freeze my desktop or terminal?**
 Processes on the protect list are never frozen: desktop shells and compositors, Xorg and Xwayland, sshd, systemd, dbus-daemon, the audio stack, bash, zsh, fish and rlm-guard. A scope that contains a protected process, such as a terminal whose shell shares the scope with a runaway script, is capped and never frozen. Add your own names under `guard.selection.protect`.

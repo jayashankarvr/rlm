@@ -55,6 +55,30 @@ fn main() {
     // -u rlm-guard); it is not noise like a one-shot CLI's INFO would be.
     rlm_core::logging::init(tracing::Level::INFO);
 
+    // One guard per user. A second one would sweep and rewrite the first
+    // one's journal, so stop before touching it. Held until exit.
+    let lock_path = rlm_core::guard::lock_path();
+    let _instance_lock = match rlm_core::guard::lock::try_lock(&lock_path) {
+        Ok(Some(file)) => Some(file),
+        Ok(None) => {
+            tracing::error!(
+                "another rlm-guard is already running (lock {} is held); exiting",
+                lock_path.display()
+            );
+            std::process::exit(1);
+        }
+        // The state dir is unusable, so the journal cannot open either and
+        // no second guard can share it. Keep running so persistent rules
+        // still work, as they do when only the journal fails.
+        Err(e) => {
+            tracing::warn!(
+                "cannot take the lock {}: {e}; continuing without it",
+                lock_path.display()
+            );
+            None
+        }
+    };
+
     let config = match Config::load_validated() {
         Ok(c) => c,
         Err(e) => {
