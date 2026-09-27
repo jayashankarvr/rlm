@@ -287,6 +287,84 @@ pub fn split_size(value: &str, suffixes: &[char]) -> Option<(String, usize)> {
     Some((scaled_decimal(bytes, unit_bytes(suffixes[0]), 9), 0))
 }
 
+/// A size field's text with its unit suffix ("1.5G"), or `None` when the
+/// field is empty.
+pub fn size_value(entry: &adw::EntryRow, unit: &gtk::DropDown) -> Option<String> {
+    let text = entry.text();
+    let text = text.trim();
+    (!text.is_empty()).then(|| format!("{text}{}", get_unit_suffix(unit)))
+}
+
+/// A CPU field's text as a percentage ("50%"), or `None` when it is empty.
+pub fn cpu_value(entry: &adw::EntryRow) -> Option<String> {
+    let text = entry.text();
+    let text = text.trim();
+    (!text.is_empty()).then(|| format!("{text}%"))
+}
+
+/// Whether the number in a size such as "1.5G" is written out in full:
+/// "5." and ".5" are not, though the field lets them be typed.
+fn complete_number(value: &str) -> bool {
+    let value = value.trim();
+    let end = value
+        .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .unwrap_or(value.len());
+    let number = &value[..end];
+    !number.is_empty() && !number.starts_with('.') && !number.ends_with('.')
+}
+
+/// A limit parse error for the field `label`, in words for the GUI: no
+/// "invalid memory value" prefix (it would be wrong for an I/O field) and
+/// no command-line hint.
+fn field_error(label: &str, value: &str, e: &common::Error) -> String {
+    let text = e.to_string();
+    let line = text.lines().next().unwrap_or("");
+    let detail = line
+        .strip_prefix("invalid memory value: ")
+        .or_else(|| line.strip_prefix("invalid cpu value: "))
+        .unwrap_or(line);
+    // A parse error that only repeats the input says nothing new.
+    if value.trim().trim_end_matches('%') == detail.trim() {
+        format!("{label}: {} is not a valid value", value.trim())
+    } else {
+        format!("{label}: {detail}")
+    }
+}
+
+/// The limits a form's fields ask for, or a message naming the field that
+/// is wrong. `memory`, `io_read` and `io_write` are sizes with their unit
+/// ("1.5G"), `cpu` a percentage ("50%"); `None` is an empty field.
+pub fn form_limit(
+    memory: Option<&str>,
+    cpu: Option<&str>,
+    io_read: Option<&str>,
+    io_write: Option<&str>,
+) -> Result<common::Limit, String> {
+    let sizes = [
+        ("Memory", memory),
+        ("I/O Read", io_read),
+        ("I/O Write", io_write),
+    ];
+    for (label, value) in sizes {
+        if value.is_some_and(|v| !complete_number(v)) {
+            return Err(format!("{label}: enter a number like 1.5"));
+        }
+    }
+    if let Some(v) = memory {
+        common::MemoryLimit::parse(v).map_err(|e| field_error("Memory", v, &e))?;
+    }
+    if let Some(v) = cpu {
+        common::CpuLimit::parse(v).map_err(|e| field_error("CPU", v, &e))?;
+    }
+    for (label, value) in &sizes[1..] {
+        if let Some(v) = value {
+            common::IoLimit::parse_bps(v).map_err(|e| field_error(label, v, &e))?;
+        }
+    }
+    common::build_limit(memory, cpu, io_read, io_write)
+        .map_err(|e| e.to_string().lines().next().unwrap_or("").to_string())
+}
+
 /// Parse a CPU value like "75%" and return just the number
 pub fn parse_cpu_value(value: &str) -> String {
     value.trim().trim_end_matches('%').to_string()
@@ -355,6 +433,44 @@ mod tests {
     fn limits_description_names_the_core_count() {
         assert!(limits_description_for(1).contains("has 1 core."));
         assert!(limits_description_for(8).contains("100% is one core; this computer has 8 cores."));
+    }
+
+    #[test]
+    fn half_typed_decimals_ask_for_a_number() {
+        for v in ["5.M", ".5G"] {
+            assert_eq!(
+                form_limit(Some(v), None, None, None).unwrap_err(),
+                "Memory: enter a number like 1.5"
+            );
+        }
+        assert_eq!(
+            form_limit(None, None, Some("5.M"), None).unwrap_err(),
+            "I/O Read: enter a number like 1.5"
+        );
+        assert!(form_limit(Some("1.5G"), None, None, None).is_ok());
+    }
+
+    #[test]
+    fn form_errors_name_the_field_in_gui_words() {
+        let io = form_limit(None, None, None, Some("1K")).unwrap_err();
+        assert_eq!(io, "I/O Write: 1K per second is below the 64K minimum");
+        assert!(!io.to_lowercase().contains("memory"), "{io}");
+        let mem = form_limit(Some("1M"), None, None, None).unwrap_err();
+        assert!(
+            mem.starts_with("Memory: 1M is below the 8M minimum"),
+            "{mem}"
+        );
+        assert!(!mem.contains('\n'), "{mem}");
+        assert_eq!(
+            form_limit(None, Some("0%"), None, None).unwrap_err(),
+            "CPU: value cannot be zero"
+        );
+        assert_eq!(
+            form_limit(None, Some("50.5%"), None, None).unwrap_err(),
+            "CPU: 50.5% is not a valid value"
+        );
+        let l = form_limit(Some("512M"), Some("50%"), Some("1M"), None).unwrap();
+        assert_eq!(l.cpu.unwrap().percent(), 50);
     }
 
     #[test]

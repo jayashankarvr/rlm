@@ -4,11 +4,12 @@
 
 use crate::pages::{plain_toast, show_toast};
 use crate::widgets::{
-    cpu_suffix_label, create_io_unit_dropdown, create_unit_dropdown, get_unit_suffix, icon_button,
-    parse_cpu_value, set_value_with_unit, setup_number_validation, setup_size_validation,
+    cpu_suffix_label, create_io_unit_dropdown, create_unit_dropdown, form_limit, get_unit_suffix,
+    icon_button, parse_cpu_value, set_value_with_unit, setup_number_validation,
+    setup_size_validation,
 };
 use adw::prelude::*;
-use common::{build_limit, builtin_presets, Config, Profile};
+use common::{builtin_presets, Config, Profile};
 use gtk::glib;
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -65,14 +66,13 @@ pub fn profile_from_fields(
 
 /// Whether a profile named `name` with these limits can be saved.
 pub fn check_form(name: &str, profile: &Profile) -> Result<(), FormProblem> {
-    let limit = build_limit(
+    let limit = form_limit(
         profile.memory.as_deref(),
         profile.cpu.as_deref(),
         profile.io_read.as_deref(),
         profile.io_write.as_deref(),
     )
-    // Only the first line: later lines are CLI hints about argument syntax.
-    .map_err(|e| FormProblem::Invalid(e.to_string().lines().next().unwrap_or("").to_string()))?;
+    .map_err(FormProblem::Invalid)?;
     if name.trim().is_empty() {
         return Err(FormProblem::NoName);
     }

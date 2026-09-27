@@ -1,8 +1,8 @@
 use crate::widgets::{
-    cpu_suffix_label, create_io_unit_dropdown, create_unit_dropdown, fit_list_height,
-    get_unit_suffix, icon_button, limits_description, list_scroller, on_enter, parse_cpu_value,
+    cpu_suffix_label, cpu_value, create_io_unit_dropdown, create_unit_dropdown, fit_list_height,
+    form_limit, icon_button, limits_description, list_scroller, on_enter, parse_cpu_value,
     require_manager, set_value_with_unit, setup_number_validation, setup_size_validation,
-    status_toast, with_action_bar, NO_MANAGER_HINT,
+    size_value, status_toast, with_action_bar, NO_MANAGER_HINT,
 };
 use adw::prelude::*;
 use gtk::glib;
@@ -843,17 +843,12 @@ fn apply_limits(state: &Rc<RefCell<LimitState>>) {
     let mode = *state.limit_mode.borrow();
 
     let pid_text = state.pid_entry.text();
-    let memory_val = state.memory_entry.text();
-    let cpu_val = state.cpu_entry.text();
-    let io_read_val = state.io_read_entry.text();
-    let io_write_val = state.io_write_entry.text();
+    let memory = size_value(&state.memory_entry, &state.memory_unit);
+    let cpu = cpu_value(&state.cpu_entry);
+    let io_read = size_value(&state.io_read_entry, &state.io_read_unit);
+    let io_write = size_value(&state.io_write_entry, &state.io_write_unit);
 
-    // Check at least one limit is set
-    if memory_val.is_empty()
-        && cpu_val.is_empty()
-        && io_read_val.is_empty()
-        && io_write_val.is_empty()
-    {
+    if memory.is_none() && cpu.is_none() && io_read.is_none() && io_write.is_none() {
         show_status(&state.status_label, "Set at least one limit", true);
         return;
     }
@@ -863,49 +858,15 @@ fn apply_limits(state: &Rc<RefCell<LimitState>>) {
         return;
     };
 
-    // Build limit values with units
-    let memory = if memory_val.is_empty() {
-        None
-    } else {
-        Some(format!(
-            "{}{}",
-            memory_val,
-            get_unit_suffix(&state.memory_unit)
-        ))
-    };
-    let cpu = if cpu_val.is_empty() {
-        None
-    } else {
-        Some(format!("{}%", cpu_val))
-    };
-    let io_read = if io_read_val.is_empty() {
-        None
-    } else {
-        Some(format!(
-            "{}{}",
-            io_read_val,
-            get_unit_suffix(&state.io_read_unit)
-        ))
-    };
-    let io_write = if io_write_val.is_empty() {
-        None
-    } else {
-        Some(format!(
-            "{}{}",
-            io_write_val,
-            get_unit_suffix(&state.io_write_unit)
-        ))
-    };
-
-    let limit = match common::build_limit(
+    let limit = match form_limit(
         memory.as_deref(),
         cpu.as_deref(),
         io_read.as_deref(),
         io_write.as_deref(),
     ) {
         Ok(l) => l,
-        Err(e) => {
-            show_status(&state.status_label, &format!("{e}"), true);
+        Err(message) => {
+            show_status(&state.status_label, &message, true);
             return;
         }
     };
