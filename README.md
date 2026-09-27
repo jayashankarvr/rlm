@@ -254,7 +254,7 @@ guard:
 
 - `enabled: false` turns off freezing and capping; rlm-guard still applies persistent rules.
 - `notify` sends a plain `notify-send` warning when pressure rises.
-- Unknown keys and out-of-range values are errors. With an invalid config, rlm-guard exits with status 78 and stays stopped until you fix the file, then run `systemctl --user restart rlm-guard`. `rlm guard status` shows the error.
+- Unknown keys and out-of-range values are errors. `calm_hold_secs` and `freeze_cooldown_secs` go up to 86400 (one day), `freeze_hold_secs` up to 60, `sample_interval_ms` from 100 to 60000, and `mem_available_floor_mb` and `min_rss_mb` up to 16777216 (16 TiB). With an invalid config, rlm-guard exits with status 78 and stays stopped until you fix the file, then run `systemctl --user restart rlm-guard`. `rlm guard status` shows the error.
 
 ### How the guard stays safe
 

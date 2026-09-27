@@ -172,8 +172,8 @@ impl PolicyEngine {
         }
 
         // 5. Recover: auto-thaw held freezes, and lift caps once calm has held.
-        let freeze_hold_ms = self.cfg.timing.freeze_hold_secs * 1000;
-        let calm_hold_ms = self.cfg.timing.calm_hold_secs * 1000;
+        let freeze_hold_ms = self.cfg.timing.freeze_hold_secs.saturating_mul(1000);
+        let calm_hold_ms = self.cfg.timing.calm_hold_secs.saturating_mul(1000);
         let mut recovered = Vec::new();
         // Apps thawed on this tick must not be re-targeted by escalation in
         // the same tick; they need a re-measure first.
@@ -235,7 +235,7 @@ impl PolicyEngine {
                     let partial = members
                         .iter()
                         .any(|m| m.resolution.coverage == Coverage::Partial);
-                    let cooldown_ms = self.cfg.timing.freeze_cooldown_secs * 1000;
+                    let cooldown_ms = self.cfg.timing.freeze_cooldown_secs.saturating_mul(1000);
                     let in_cooldown = self
                         .last_freeze_ms
                         .get(&app)
@@ -435,7 +435,7 @@ impl PolicyEngine {
         targets: &'a [Target],
         blocked: &HashSet<String>,
     ) -> Option<(String, Vec<&'a Target>)> {
-        let min_rss_kb = self.cfg.selection.min_rss_mb * 1024;
+        let min_rss_kb = self.cfg.selection.min_rss_mb.saturating_mul(1024);
         let held = self.held_apps();
         let mut groups: BTreeMap<&str, Vec<&Target>> = BTreeMap::new();
         for t in targets {
@@ -482,7 +482,7 @@ impl PolicyEngine {
         };
         let size = |ms: &[&Target]| -> u64 {
             ms.iter()
-                .map(|m| m.current_bytes.unwrap_or(m.rss_kb * 1024))
+                .map(|m| m.current_bytes.unwrap_or(m.rss_kb.saturating_mul(1024)))
                 .sum()
         };
         let pick = eligible
