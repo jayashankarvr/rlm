@@ -83,6 +83,16 @@ pub fn user_unit_path(config_dir: &Path) -> PathBuf {
     config_dir.join("systemd/user/rlm-guard.service")
 }
 
+/// Description line of the unit 0.1 shipped in `dist/`. Its README told users
+/// to copy that file into `~/.config/systemd/user/` and point ExecStart at
+/// `~/.cargo/bin`, so it has no generated marker but is still ours to replace.
+const LEGACY_DESCRIPTION: &str =
+    "Description=rlm freeze guard - proactively prevents system freezes";
+
+fn is_ours(unit: &str) -> bool {
+    unit.starts_with(GENERATED_MARKER) || unit.lines().any(|l| l.trim() == LEGACY_DESCRIPTION)
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum EnablePlan {
     /// A packaged unit exists and no user unit shadows it.
@@ -109,7 +119,7 @@ pub fn plan_enable(
     unit_path: &Path,
 ) -> EnablePlan {
     match (existing, bin) {
-        (Some(text), _) if !text.starts_with(GENERATED_MARKER) => EnablePlan::UserUnitCustom,
+        (Some(text), _) if !is_ours(text) => EnablePlan::UserUnitCustom,
         (Some(text), Some(bin)) => {
             let want = render_user_unit(UNIT_TEMPLATE, bin);
             if text == want {
@@ -261,6 +271,20 @@ mod tests {
         assert_eq!(
             plan_enable(false, Some("[Service]\nExecStart=/mine\n"), Some(bin), unit),
             EnablePlan::UserUnitCustom
+        );
+    }
+
+    #[test]
+    fn plan_enable_replaces_the_0_1_unit() {
+        let legacy = "[Unit]\nDescription=rlm freeze guard - proactively prevents system freezes\n\n[Service]\nExecStart=%h/.cargo/bin/rlm-guard\n";
+        let bin = Path::new("/home/u/.cargo/bin/rlm-guard");
+        let unit = Path::new("/home/u/.config/systemd/user/rlm-guard.service");
+        assert_eq!(
+            plan_enable(false, Some(legacy), Some(bin), unit),
+            EnablePlan::WriteUserUnit {
+                path: unit.to_path_buf(),
+                contents: render_user_unit(UNIT_TEMPLATE, bin),
+            }
         );
     }
 }
