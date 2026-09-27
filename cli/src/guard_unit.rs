@@ -74,7 +74,9 @@ fn is_executable(p: &Path) -> bool {
 }
 
 /// The `rlm-guard` next to the running `rlm` first, then the first one on
-/// `path_env`.
+/// `path_env`. Relative `PATH` entries (including empty ones and `.`) are
+/// skipped: they depend on the working directory, and the result ends up in
+/// a unit's `ExecStart`.
 pub fn find_guard_binary(current_exe: Option<&Path>, path_env: Option<&OsStr>) -> Option<PathBuf> {
     let sibling = current_exe
         .and_then(Path::parent)
@@ -82,6 +84,7 @@ pub fn find_guard_binary(current_exe: Option<&Path>, path_env: Option<&OsStr>) -
     let on_path = path_env
         .into_iter()
         .flat_map(std::env::split_paths)
+        .filter(|dir| dir.is_absolute())
         .map(|dir| dir.join("rlm-guard"));
     sibling
         .into_iter()
@@ -259,6 +262,27 @@ mod tests {
         let on_path = find_guard_binary(Some(&none.path().join("rlm")), Some(b.path().as_os_str()));
         assert_eq!(on_path, Some(b.path().join("rlm-guard")));
         assert_eq!(find_guard_binary(None, None), None);
+    }
+
+    #[test]
+    fn relative_path_entries_are_skipped() {
+        let d = tempfile::tempdir().unwrap();
+        exe(d.path());
+        // The same directory spelled relative to the working directory.
+        let cwd = std::env::current_dir().unwrap();
+        let mut rel = PathBuf::new();
+        for _ in cwd.components().skip(1) {
+            rel.push("..");
+        }
+        rel.push(d.path().strip_prefix("/").unwrap());
+        assert!(rel.join("rlm-guard").is_file());
+        let path = std::env::join_paths([Path::new(""), Path::new("."), &rel]).unwrap();
+        assert_eq!(find_guard_binary(None, Some(&path)), None);
+        let path = std::env::join_paths([rel.as_path(), d.path()]).unwrap();
+        assert_eq!(
+            find_guard_binary(None, Some(&path)),
+            Some(d.path().join("rlm-guard"))
+        );
     }
 
     #[test]
