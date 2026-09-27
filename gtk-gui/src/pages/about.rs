@@ -65,7 +65,7 @@ pub fn create() -> gtk::Widget {
 
     let license_row = adw::ActionRow::new();
     license_row.set_title("Apache License 2.0");
-    license_row.set_subtitle("Open source license allowing commercial use");
+    license_row.set_subtitle("SPDX: Apache-2.0. The full text is in the LICENSE file.");
     license_group.add(&license_row);
 
     let license_text = gtk::TextView::new();
@@ -101,7 +101,7 @@ pub fn create() -> gtk::Widget {
     page.upcast()
 }
 
-const LICENSE_TEXT: &str = r#"Copyright 2025 Jayashankar
+const LICENSE_TEXT: &str = r#"Copyright 2025-2026 Jayashankar
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.

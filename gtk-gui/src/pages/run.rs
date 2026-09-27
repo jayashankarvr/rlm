@@ -49,9 +49,11 @@ pub fn create(manager: Option<Arc<CgroupManager>>) -> gtk::Widget {
 
     // Status label
     let status_label = gtk::Label::new(None);
-    status_label.set_margin_top(12);
-    status_label.set_margin_bottom(12);
     status_label.set_wrap(true);
+    // Only take up room when there is a message; an empty label would push
+    // the button further down the page.
+    status_label.set_visible(false);
+    status_label.connect_label_notify(|l| l.set_visible(!l.label().is_empty()));
 
     // Command group
     let command_group = adw::PreferencesGroup::new();
@@ -166,7 +168,6 @@ pub fn create(manager: Option<Arc<CgroupManager>>) -> gtk::Widget {
     run_btn.add_css_class("suggested-action");
     run_btn.add_css_class("pill");
     run_btn.set_halign(gtk::Align::Center);
-    run_btn.set_margin_top(24);
     run_btn.set_margin_bottom(24);
 
     let button_box = gtk::Box::new(gtk::Orientation::Vertical, 12);
