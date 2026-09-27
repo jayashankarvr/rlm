@@ -2,7 +2,7 @@
 
 ## Overview
 
-rlm now supports limiting applications that spawn multiple processes. When you limit multiple processes together, they **share** the resource limits (combined pool), not per-process limits.
+rlm can limit applications that spawn multiple processes. When you limit multiple processes together, they **share** the resource limits (combined pool), not per-process limits.
 
 ## How Shared Limits Work
 
@@ -43,15 +43,20 @@ rlm limit --name firefox --memory 1G --cpu 50%  # Each firefox process gets 1G
 
 ## Checking Status
 
-The `rlm status` command now shows whether limits are shared or individual:
+`rlm status` shows whether limits are shared or individual. The TYPE column is `shared (N procs)` for a shared cgroup and `individual` for a single process:
 
 ```bash
 $ rlm status
-PID      NAME                     MEMORY         CPU            I/O          TYPE
-1234     firefox                  4.0G          75%         limited    shared (12 procs)
-5678     chrome                  6.0G         100%         limited    shared (8 procs)
-9012     myapp                   1.0G          50%         limited    individual
+PID      NAME                            MEMORY             CPU        I/O            TYPE
+-------------------------------------------------------------------------------------
+1234     firefox                           4.0G             75%          -  shared (12 procs)
+5678     chrome                            6.0G            100%    limited   shared (8 procs)
+9012     myapp                             1.0G             50%          -      individual
+
+Note: 'shared' means multiple processes share the same limit pool
 ```
+
+The values above are illustrative.
 
 ## Removing Limits
 
@@ -93,6 +98,7 @@ rlm unlimit --pid 1234
 - Individual limits: `pid-{PID}` (one cgroup per process)
 - Application limits: `app-{application_name}` (one cgroup for all processes)
 - Multiple PIDs: `multi-{first_pid}` (one cgroup for specified PIDs)
+- `rlm run`: `run-*` (one cgroup per command)
 
 ### Process Detection
 
@@ -135,15 +141,17 @@ rlm limit --all-pids 1234,5678,9012 --memory 8G --cpu 200%
 
 ### Example 3: Mixed Approach
 
-You can mix individual and shared limits:
+You can mix shared and individual limits as long as each process is in only one cgroup. Here `myapp` runs a separate worker binary, `myapp-worker`:
 
 ```bash
-# Limit main application processes together
+# All myapp processes share 4G
 rlm limit --application myapp --memory 4G
 
-# But limit a specific worker process separately
-rlm limit --pid 9999 --memory 2G --cpu 50%
+# The worker is a different executable, so it is not in app-myapp and can get its own limit
+rlm limit --pid <pid of myapp-worker> --memory 2G --cpu 50%
 ```
+
+A process that is already in `app-myapp` cannot also get an individual limit. Remove the shared limit first with `rlm unlimit --application myapp`, then limit the processes the way you want.
 
 ## Troubleshooting
 
@@ -161,15 +169,32 @@ rlm limit --application firefox-bin --memory 4G
 
 ### Processes Already Limited
 
-If processes are already in individual cgroups, you'll get an error. Remove individual limits first:
+A process can be in only one rlm cgroup. Limiting it again fails with an error such as:
+
+```
+process 1234 is already limited in cgroup 'pid-1234'; run rlm unlimit --pid 1234 first
+```
+
+(for a shared limit the hint names the cgroup: `run rlm unlimit --cgroup <name> first`). Remove the existing limit, then apply the new one:
 
 ```bash
 # Remove individual limits
 rlm unlimit --name firefox
 
+# Or remove a shared or run-* cgroup by name
+rlm unlimit --cgroup app-firefox
+
 # Then apply shared limits
 rlm limit --application firefox --memory 4G
 ```
+
+`rlm unlimit --pid` removes only an individual `pid-N` limit. For a process in a shared cgroup it tells you to remove the whole group with `rlm unlimit --cgroup <name>`.
+
+Processes released by `rlm unlimit` can be limited again.
+
+### Scripts and Batches
+
+Limiting by `--name`, `--application` or `--all-pids` asks for confirmation when more than one process is affected. Pass `--yes` to skip the prompt. Without a terminal on stdin (scripts, cron), `--yes` is required and the command fails without it.
 
 ## GUI Support
 

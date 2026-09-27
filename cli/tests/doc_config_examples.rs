@@ -19,11 +19,14 @@ fn yaml_blocks(doc: &str) -> Vec<String> {
 
 #[test]
 fn every_documented_yaml_example_parses() {
-    for (name, doc) in [
-        ("README.md", include_str!("../../README.md")),
-        ("CLAUDE.md", include_str!("../../CLAUDE.md")),
-    ] {
-        let blocks = yaml_blocks(doc);
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let mut docs = vec![("README.md", include_str!("../../README.md").to_string())];
+    // CLAUDE.md is not tracked in every checkout (it can be git-ignored), so check it only when present.
+    if let Ok(s) = std::fs::read_to_string(root.join("CLAUDE.md")) {
+        docs.push(("CLAUDE.md", s));
+    }
+    for (name, doc) in docs {
+        let blocks = yaml_blocks(&doc);
         assert!(!blocks.is_empty(), "{name} has no yaml examples");
         for b in blocks {
             // Examples that start with a comment line like "# ~/.config/rlm/config.yaml" are still full files.

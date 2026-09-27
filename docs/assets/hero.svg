@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="410" viewBox="0 0 880 410" role="img" aria-label="Terminal showing rlm run, rlm status and rlm guard status">
+  <title>rlm run, rlm status and rlm guard status (illustrative values)</title>
+  <rect width="880" height="410" rx="10" fill="#1e1e2e"/>
+  <circle cx="22" cy="20" r="6" fill="#f38ba8"/><circle cx="42" cy="20" r="6" fill="#f9e2af"/><circle cx="62" cy="20" r="6" fill="#a6e3a1"/>
+  <g font-family="DejaVu Sans Mono, Menlo, monospace" font-size="13" fill="#cdd6f4" xml:space="preserve" style="white-space:pre">
+    <text x="20" y="56"><tspan fill="#a6e3a1">$</tspan> rlm run --memory 2G --cpu 200% -- cargo build --release</text>
+    <text x="20" y="78" fill="#9399b2">    Finished `release` profile [optimized] target(s) in 41.20s</text>
+    <text x="20" y="112"><tspan fill="#a6e3a1">$</tspan> rlm status</text>
+    <text x="20" y="134" fill="#9399b2">PID      NAME                            MEMORY             CPU        I/O            TYPE</text>
+    <text x="20" y="156">48211    firefox                           4.0G             75%          - shared (14 procs)</text>
+    <text x="20" y="178">51007    code                              3.0G            150%    limited shared (9 procs)</text>
+    <text x="20" y="212"><tspan fill="#a6e3a1">$</tspan> rlm guard status</text>
+    <text x="20" y="234">Service:  running (starts at login)</text>
+    <text x="20" y="256">Config:   ok</text>
+    <text x="20" y="278">Pressure: app.slice: some 0.4% full 0.0%, 9120 MB of 15890 MB available (57%)</text>
+    <text x="20" y="300">Policy:   acts when pressure is high and available memory is below 20% or 400 MB</text>
+    <text x="20" y="322">Interventions: none</text>
+    <text x="20" y="344">History:</text>
+    <text x="20" y="366" fill="#9399b2">    12m ago  cap     python3  set a soft limit (memory.high)</text>
+    <text x="20" y="388" fill="#9399b2">    11m ago  lift    python3  removed the soft limit</text>
+  </g>
+</svg>
