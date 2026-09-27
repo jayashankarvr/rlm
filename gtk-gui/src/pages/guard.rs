@@ -81,10 +81,20 @@ thread_local! {
 /// The `rlm` binary to run: the one next to `rlm-gtk` if present (they are
 /// installed together), otherwise whatever `rlm` is on PATH.
 fn rlm_binary() -> PathBuf {
-    std::env::current_exe()
-        .ok()
+    rlm_binary_for(std::env::current_exe().ok().as_deref())
+}
+
+/// [`rlm_binary`] for a given `rlm-gtk` path. The sibling must be an
+/// executable file, not just any file named `rlm`.
+fn rlm_binary_for(current_exe: Option<&std::path::Path>) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    current_exe
         .and_then(|exe| exe.parent().map(|dir| dir.join("rlm")))
-        .filter(|p| p.is_file())
+        .filter(|p| {
+            std::fs::metadata(p)
+                .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+                .unwrap_or(false)
+        })
         .unwrap_or_else(|| PathBuf::from("rlm"))
 }
 
@@ -480,6 +490,21 @@ mod tests {
         let mut cmd = std::process::Command::new("sh");
         cmd.args(["-c", script]);
         cmd
+    }
+
+    #[test]
+    fn rlm_binary_needs_an_executable_sibling() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        let gtk = d.path().join("rlm-gtk");
+        assert_eq!(rlm_binary_for(Some(&gtk)), PathBuf::from("rlm"));
+        let rlm = d.path().join("rlm");
+        std::fs::write(&rlm, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&rlm, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(rlm_binary_for(Some(&gtk)), PathBuf::from("rlm"));
+        std::fs::set_permissions(&rlm, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(rlm_binary_for(Some(&gtk)), rlm);
+        assert_eq!(rlm_binary_for(None), PathBuf::from("rlm"));
     }
 
     #[test]
