@@ -49,8 +49,8 @@ rlm limit --name firefox --memory 1G --cpu 50%  # Each firefox process gets 1G
 $ rlm status
 PID      NAME                            MEMORY             CPU        I/O            TYPE
 -------------------------------------------------------------------------------------
-1234     firefox                           4.0G             75%          -  shared (12 procs)
-5678     chrome                            6.0G            100%    limited   shared (8 procs)
+1234     firefox                           4.0G             75%          - shared (12 procs)
+5678     chrome                            6.0G            100%    limited shared (8 procs)
 9012     myapp                             1.0G             50%          -      individual
 
 Note: 'shared' means multiple processes share the same limit pool
@@ -169,13 +169,19 @@ rlm limit --application firefox-bin --memory 4G
 
 ### Processes Already Limited
 
-A process can be in only one rlm cgroup. Limiting it again fails with an error such as:
+A process can be in only one rlm cgroup.
+
+- Limiting a process again with `--pid` or `--name` while it has its own `pid-N` limit replaces that limit with the new values.
+- Limiting processes with `--application` or `--all-pids` into the shared cgroup they are already in updates that cgroup.
+- Any other combination fails. With `--application` or `--all-pids` the error names the cgroup the process is in, for example:
 
 ```
-process 1234 is already limited in cgroup 'pid-1234'; run rlm unlimit --pid 1234 first
+process 1234 is already limited in cgroup 'pid-1234'; run rlm unlimit --cgroup pid-1234 first
 ```
 
-(for a shared limit the hint names the cgroup: `run rlm unlimit --cgroup <name> first`). Remove the existing limit, then apply the new one:
+- With `--pid` or `--name` for a process in a shared or `run-*` cgroup, the error currently reads `process 1234 is already limited in cgroup 'app-firefox'; run rlm unlimit --pid 1234 first`. That hint does not work there; use `rlm unlimit --cgroup app-firefox` instead.
+
+Remove the existing limit, then apply the new one:
 
 ```bash
 # Remove individual limits

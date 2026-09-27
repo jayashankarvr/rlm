@@ -17,9 +17,9 @@ rlm sets memory, CPU and I/O limits on your own Linux processes without root, fr
 **The guard (rlm-guard).** This is an optional per-user service.
 
 - It acts only on your own apps under systemd's `app.slice` and on the cgroups rlm itself created.
-- It acts only while apps are stalling on memory (PSI) and available memory is below 20% of RAM or below 400 MB.
+- It acts when apps are stalling on memory (PSI) and available memory is below 20% of RAM, or at once when available memory drops below 400 MB, stall or not.
 - It freezes the app for 5 seconds, then applies a soft `memory.high` cap if pressure stays high.
-- It lifts every freeze and cap after 30 seconds of calm.
+- A freeze always ends after those 5 seconds; a cap is lifted after 30 seconds of calm.
 - It never sends a signal to any process.
 - It holds at most 3 apps at a time.
 
@@ -33,22 +33,22 @@ rlm sets memory, CPU and I/O limits on your own Linux processes without root, fr
 ### What it is not
 
 - Not a replacement for systemd-oomd or earlyoom. Those kill processes; rlm pauses and slows them. You can run both.
-- It has no effect on processes of other users or of root.
+- Run as your user, it has no effect on processes of other users or of root.
 
 ## Supported distros
 
-Any Linux with cgroup v2, PSI and systemd:
+The CLI and the guard run on any Linux with cgroup v2, PSI and systemd. The GUI (rlm-gtk) also needs GTK 4 and libadwaita 1.4 or newer.
 
-| Distro              | Version |
-|---------------------|---------|
-| Ubuntu              | 22.04+  |
-| Debian              | 12+     |
-| Fedora              | 31+     |
-| RHEL / Rocky / Alma | 9+      |
-| Arch                | current |
-| openSUSE Tumbleweed | current |
+| Distro              | CLI and guard | GUI     |
+|---------------------|---------------|---------|
+| Ubuntu              | 22.04+        | 24.04+  |
+| Debian              | 12+           | 13+     |
+| Fedora              | 31+           | 39+     |
+| RHEL / Rocky / Alma | 9+            | 10+     |
+| Arch                | current       | current |
+| openSUSE Tumbleweed | current       | current |
 
-Older versions may work with the `systemd.unified_cgroup_hierarchy=1` kernel boot parameter.
+On Ubuntu 22.04, Debian 12 and RHEL 9 the libadwaita version is too old for the GUI; use the CLI there. Older versions may work with the `systemd.unified_cgroup_hierarchy=1` kernel boot parameter.
 
 ## Install
 
@@ -58,23 +58,25 @@ Download from [Releases](https://github.com/jayashankarvr/rlm/releases) (package
 
 ```bash
 # Debian/Ubuntu
-sudo apt install ./rlm_*.deb ./rlm-gtk_*.deb
+sudo apt install ./rlm_*.deb ./rlm-gtk_*.deb   # rlm-gtk: Ubuntu 24.04+, Debian 13+
 
 # Fedora/RHEL
-sudo dnf install ./rlm-*.rpm ./rlm-gtk-*.rpm
+sudo dnf install ./rlm-0*.rpm ./rlm-gtk-0*.rpm   # rlm-gtk: Fedora 39+, RHEL 10+
 ```
 
 The `rlm` package ships `rlm`, `rlm-guard`, a systemd user unit for the guard and the delegation drop-in `rlm-delegate.conf`. `rlm-gtk` is the GUI.
 
 ### Arch Linux (AUR)
 
-The AUR packages are `rlm` and `rlm-gtk`:
+The AUR packages are `rlm` and `rlm-gtk` (from 0.2.0 on):
 
 ```bash
 yay -S rlm rlm-gtk
 ```
 
 ### crates.io
+
+From 0.2.0 on:
 
 ```bash
 cargo install rlmctl
@@ -138,7 +140,7 @@ With `--application` or `--all-pids`, the processes share the limits: 10 process
 
 - Sizes use binary units and accept decimals and `B`/`iB` suffixes: `512M`, `1.5G`, `2GiB`, `512MB` are all valid. Memory limits below 8M and I/O limits below 64K/s are rejected.
 - CPU is a percentage of one core: `50%` is half a core, `200%` is two cores.
-- Batch operations (`--name`, `--application`, `--all-pids`) ask for confirmation. Pass `--yes` to skip it; `--yes` is required when stdin is not a terminal, for example in scripts.
+- Batch operations (`--name`, `--application`, `--all-pids`) ask for confirmation. Pass `--yes` to skip it. When 2 or more processes match and stdin is not a terminal, for example in scripts, `--yes` is required.
 - Processes on the guard protect list (desktop session, shells, audio) are refused unless you pass `--force`.
 - Processes owned by other users are always refused (unless you run rlm as root). `--force` does not change that.
 
@@ -249,10 +251,10 @@ No. It only freezes the app's cgroup (through systemd, with a direct `cgroup.fre
 Every freeze and cap is written to a journal, `~/.local/state/rlm/guard-journal.jsonl`, before it is applied. On the next start, including a start that fails on a bad config, the guard replays the journal and restores the app. Entries are keyed by boot and cgroup identity, so it never touches a cgroup that was since recreated for something else. On a normal stop (SIGTERM) it undoes everything before exiting.
 
 **Could it freeze my desktop or terminal?**
-Processes on the protect list are never acted on: desktop shells and compositors, Xorg and Xwayland, sshd, systemd, dbus-daemon, the audio stack, bash, zsh, fish and rlm-guard. A scope that contains a protected process, such as a terminal whose shell shares the scope with a runaway script, is capped and never frozen. Add your own names under `guard.selection.protect`.
+Processes on the protect list are never frozen: desktop shells and compositors, Xorg and Xwayland, sshd, systemd, dbus-daemon, the audio stack, bash, zsh, fish and rlm-guard. A scope that contains a protected process, such as a terminal whose shell shares the scope with a runaway script, is capped and never frozen. Add your own names under `guard.selection.protect`.
 
 **Why did it not act when my machine was slow?**
-It needs both conditions: apps under `app.slice` stalling on memory, and available memory below 20% of RAM or below 400 MB. Slowness from CPU or disk load does not count. A stall inside one cgroup that rlm limited is ignored by design: that app is hitting the limit you set, and the rest of the system is fine.
+It needs apps under `app.slice` stalling on memory while available memory is below 20% of RAM. The one exception is available memory below 400 MB: then it acts even without a stall. Slowness from CPU or disk load does not count. A stall inside one cgroup that rlm limited is ignored by design: that app is hitting the limit you set, and the rest of the system is fine.
 
 **How hard is a cap?**
 Soft. A cap never goes below 90% of the app's current memory or below 256 MiB. On hosts without swap it never asks for more than the app's file cache can give back. The app slows down while the kernel reclaims; it is not killed. A cap never loosens a lower `memory.high` that was already in place.

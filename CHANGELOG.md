@@ -16,13 +16,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- rlm-guard acts only when apps under app.slice are stalling on memory and available memory is below 20% of RAM (new `guard.trigger.act_below_available_pct`) or the 400 MB floor; stalls inside a cgroup rlm limited are ignored.
+- rlm-guard acts when apps under app.slice are stalling on memory and available memory is below 20% of RAM (new `guard.trigger.act_below_available_pct`), or at once when available memory is below the 400 MB floor, with or without a stall. Stalls inside a cgroup rlm limited are ignored.
 - rlm-guard picks the app whose memory grows fastest, treats all cgroups of one app as one, holds at most 3 apps, and waits at least 3 seconds after a partial action.
 - Soft caps never ask for more than 10% of an app's current memory, have a 256 MiB floor, and account for hosts without swap. Caps and restores no longer change systemd unit properties.
 - Invalid config files are errors: unknown keys and out-of-range guard values are rejected, and rlm-guard exits with status 78 instead of running on defaults.
-- rlm-guard scans only your own processes, only under pressure, and rewrites rule limits only when needed.
+- rlm-guard scans only your own processes, and only under pressure or every 5 seconds while persistent rules exist. It rewrites rule limits only when needed.
 - Sizes accept decimals and B/iB suffixes (1.5G, 512MB, 2GiB); memory limits below 8M and I/O limits below 64K/s are rejected; profile names are case-insensitive; `--profile` values can be overridden by explicit flags.
-- Logs go to stderr at WARN by default, without color when not on a terminal.
+- Logs go to stderr, without color when not on a terminal. The default level is WARN for rlm and INFO for rlm-guard; `RUST_LOG` overrides it.
 - `rlm status` is read-only.
 - Packages: crates.io `rlmctl` (binaries rlm and rlm-guard), `rlmctl-core`, `rlmctl-common`; the delegation drop-in is `rlm-delegate.conf`.
 

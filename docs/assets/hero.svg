@@ -1,22 +1,24 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="880" height="410" viewBox="0 0 880 410" role="img" aria-label="Terminal showing rlm run, rlm status and rlm guard status">
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="454" viewBox="0 0 880 454" role="img" aria-label="Terminal showing rlm run, rlm status and rlm guard status">
   <title>rlm run, rlm status and rlm guard status (illustrative values)</title>
-  <rect width="880" height="410" rx="10" fill="#1e1e2e"/>
+  <rect width="880" height="454" rx="10" fill="#1e1e2e"/>
   <circle cx="22" cy="20" r="6" fill="#f38ba8"/><circle cx="42" cy="20" r="6" fill="#f9e2af"/><circle cx="62" cy="20" r="6" fill="#a6e3a1"/>
-  <g font-family="DejaVu Sans Mono, Menlo, monospace" font-size="13" fill="#cdd6f4" xml:space="preserve" style="white-space:pre">
-    <text x="20" y="56"><tspan fill="#a6e3a1">$</tspan> rlm run --memory 2G --cpu 200% -- cargo build --release</text>
-    <text x="20" y="78" fill="#9399b2">    Finished `release` profile [optimized] target(s) in 41.20s</text>
-    <text x="20" y="112"><tspan fill="#a6e3a1">$</tspan> rlm status</text>
-    <text x="20" y="134" fill="#9399b2">PID      NAME                            MEMORY             CPU        I/O            TYPE</text>
-    <text x="20" y="156">48211    firefox                           4.0G             75%          - shared (14 procs)</text>
-    <text x="20" y="178">51007    code                              3.0G            150%    limited shared (9 procs)</text>
-    <text x="20" y="212"><tspan fill="#a6e3a1">$</tspan> rlm guard status</text>
-    <text x="20" y="234">Service:  running (starts at login)</text>
-    <text x="20" y="256">Config:   ok</text>
-    <text x="20" y="278">Pressure: app.slice: some 0.4% full 0.0%, 9120 MB of 15890 MB available (57%)</text>
-    <text x="20" y="300">Policy:   acts when pressure is high and available memory is below 20% or 400 MB</text>
-    <text x="20" y="322">Interventions: none</text>
-    <text x="20" y="344">History:</text>
-    <text x="20" y="366" fill="#9399b2">    12m ago  cap     python3  set a soft limit (memory.high)</text>
-    <text x="20" y="388" fill="#9399b2">    11m ago  lift    python3  removed the soft limit</text>
+  <g font-family="DejaVu Sans Mono, Menlo, monospace" font-size="13" fill="#cdd6f4">
+    <text x="20" y="56"><tspan fill="#a6e3a1">$</tspan>&#160;rlm&#160;run&#160;--memory&#160;2G&#160;--cpu&#160;200%&#160;--&#160;cargo&#160;build&#160;--release</text>
+    <text x="20" y="78" fill="#9399b2">&#160;&#160;&#160;&#160;Finished&#160;`release`&#160;profile&#160;[optimized]&#160;target(s)&#160;in&#160;41.20s</text>
+    <text x="20" y="112"><tspan fill="#a6e3a1">$</tspan>&#160;rlm&#160;status</text>
+    <text x="20" y="134" fill="#9399b2">PID&#160;&#160;&#160;&#160;&#160;&#160;NAME&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;MEMORY&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;CPU&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;I/O&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;TYPE</text>
+    <text x="20" y="156" fill="#9399b2">-------------------------------------------------------------------------------------</text>
+    <text x="20" y="178">48211&#160;&#160;&#160;&#160;firefox&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;4.0G&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;75%&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;-&#160;shared&#160;(14&#160;procs)</text>
+    <text x="20" y="200">51007&#160;&#160;&#160;&#160;code&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;3.0G&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;150%&#160;&#160;&#160;&#160;limited&#160;shared&#160;(9&#160;procs)</text>
+    <text x="20" y="234"><tspan fill="#a6e3a1">$</tspan>&#160;rlm&#160;guard&#160;status</text>
+    <text x="20" y="256">Service:&#160;&#160;running&#160;(starts&#160;at&#160;login)</text>
+    <text x="20" y="278">Config:&#160;&#160;&#160;ok</text>
+    <text x="20" y="300">Pressure:&#160;app.slice:&#160;some&#160;0.4%&#160;full&#160;0.0%,&#160;9120&#160;MB&#160;of&#160;15890&#160;MB&#160;available&#160;(57%)</text>
+    <text x="20" y="322">Policy:&#160;&#160;&#160;acts&#160;when&#160;pressure&#160;is&#160;high&#160;and&#160;available&#160;memory&#160;is&#160;below&#160;20%&#160;or&#160;400&#160;MB</text>
+    <text x="20" y="344">Interventions:&#160;none</text>
+    <text x="20" y="366">History:</text>
+    <text x="20" y="388" fill="#9399b2">&#160;&#160;&#160;&#160;12m&#160;ago&#160;&#160;cap&#160;&#160;&#160;&#160;&#160;python3&#160;&#160;set&#160;a&#160;soft&#160;limit&#160;(memory.high)</text>
+    <text x="20" y="410" fill="#9399b2">&#160;&#160;&#160;&#160;11m&#160;ago&#160;&#160;lift&#160;&#160;&#160;&#160;app-org.kde.konsole-4821.scope&#160;&#160;removed&#160;the&#160;soft&#160;limit</text>
+    <text x="20" y="432">Full&#160;history:&#160;rlm&#160;guard&#160;history&#160;(also:&#160;journalctl&#160;--user&#160;-u&#160;rlm-guard)</text>
   </g>
 </svg>

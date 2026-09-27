@@ -15,7 +15,7 @@ categories = ["gui", "os::linux-apis"]
 maintainer = "Jayashankar <me.jayashankar@gmail.com>"
 section = "admin"
 priority = "optional"
-depends = "$auto, rlm (>= 0.2.0), libgtk-4-1 (>= 4.6), libadwaita-1-0 (>= 1.2)"
+depends = "$auto, rlm (>= 0.2.0), libgtk-4-1 (>= 4.6), libadwaita-1-0 (>= 1.4)"
 assets = [
     ["target/release/rlm-gtk", "usr/bin/", "755"],
     ["assets/io.github.rlm.gtk.desktop", "usr/share/applications/", "644"],
@@ -35,7 +35,7 @@ assets = [
 [package.metadata.generate-rpm.requires]
 rlm = ">= 0.2.0"
 gtk4 = ">= 4.6"
-libadwaita = ">= 1.2"
+libadwaita = ">= 1.4"
 
 [[bin]]
 name = "rlm-gtk"

@@ -31,7 +31,7 @@ scripts/check-docs.sh
 
 `scripts/check-docs.sh` checks the README and APPLICATION_LIMITING.md against the code (profile names, drop-in name, required sections). The test `cli/tests/doc_config_examples.rs` parses every YAML example in README.md and CLAUDE.md under the strict config rules, so keep those examples valid.
 
-Tests that touch real cgroups are `#[ignore]` and opt-in. They create only `test-*` cgroups and remove them before returning. No test may freeze, cap, limit, signal or move a process it did not start itself.
+Tests that touch real cgroups are `#[ignore]` and opt-in. They create `test-*` and `run-*` cgroups under rlm's base and transient systemd scopes (`systemd-run --scope`), and remove what they create before returning. No test may freeze, cap, limit, signal or move a process it did not start itself.
 
 ## Code Style
 
