@@ -29,7 +29,16 @@ struct LimitState {
     manager: Option<Arc<CgroupManager>>,
     all_processes: RefCell<Vec<rlm_core::process::ProcessInfo>>,
     profiles: RefCell<Vec<String>>,
-    limit_mode: RefCell<LimitMode>,    // Individual or Application
+    limit_mode: RefCell<LimitMode>, // Individual or Application
+    /// PIDs of each application row in Application mode, keyed by the row's
+    /// widget name, so selecting a row can fill in all of its processes.
+    group_pids: RefCell<std::collections::HashMap<String, Vec<u32>>>,
+    /// Set while filter_processes rebuilds the list, so the selection
+    /// changes that causes do not rewrite the PID field.
+    rebuilding: std::cell::Cell<bool>,
+    /// Each application row's Select button, keyed like `group_pids`. An
+    /// expander row draws no selection highlight, so the button shows it.
+    group_buttons: RefCell<std::collections::HashMap<String, gtk::Button>>,
     save_rule_check: gtk::CheckButton, // Persist as a rule (application mode only)
 }
 
@@ -115,7 +124,8 @@ pub fn create(manager: Option<Arc<CgroupManager>>) -> gtk::Widget {
     search_group.add(&search_entry);
 
     let process_list = gtk::ListBox::new();
-    process_list.set_selection_mode(gtk::SelectionMode::Multiple); // Allow multi-select
+    // Individual mode selects one row; filter_processes switches this per mode.
+    process_list.set_selection_mode(gtk::SelectionMode::Single);
     process_list.add_css_class("boxed-list");
 
     let scroll = gtk::ScrolledWindow::new();
@@ -232,6 +242,9 @@ pub fn create(manager: Option<Arc<CgroupManager>>) -> gtk::Widget {
         all_processes: RefCell::new(Vec::new()),
         profiles: RefCell::new(profiles),
         limit_mode: RefCell::new(LimitMode::Individual),
+        group_pids: RefCell::new(std::collections::HashMap::new()),
+        rebuilding: std::cell::Cell::new(false),
+        group_buttons: RefCell::new(std::collections::HashMap::new()),
         save_rule_check: save_rule_check.clone(),
     }));
 
@@ -286,49 +299,45 @@ pub fn create(manager: Option<Arc<CgroupManager>>) -> gtk::Widget {
         filter_processes(&state_clone, text.as_str());
     });
 
-    // Process list selection handler (for application mode)
+    // The PID field mirrors the list selection. Individual mode: the one
+    // selected process. Application mode: every process of every selected
+    // application.
     let state_clone = state.clone();
     let pid_entry_clone = pid_entry.clone();
     process_list.connect_selected_rows_changed(move |list| {
         let state = state_clone.borrow();
-        if *state.limit_mode.borrow() == LimitMode::Application {
-            // Collect PIDs from selected rows (including nested rows in expanders)
-            let mut selected_pids = Vec::new();
-            for row in list.selected_rows() {
-                // Check if it's a direct process row
-                if let Some(pid_str) = row.widget_name().strip_prefix("proc-") {
-                    if let Ok(pid) = pid_str.parse::<u32>() {
-                        selected_pids.push(pid);
+        if state.rebuilding.get() {
+            return;
+        }
+        let mode = *state.limit_mode.borrow();
+        let groups = state.group_pids.borrow();
+        let mut pids = Vec::new();
+        for row in list.selected_rows() {
+            let name = row.widget_name();
+            match mode {
+                LimitMode::Individual => {
+                    if let Some(pid) = name
+                        .strip_prefix("proc-")
+                        .and_then(|p| p.parse::<u32>().ok())
+                    {
+                        pids.push(pid);
                     }
                 }
-                // Check nested rows in expander rows
-                if let Some(expander) = row.downcast_ref::<adw::ExpanderRow>() {
-                    let mut child = expander.first_child();
-                    while let Some(c) = child {
-                        if let Some(proc_row) = c.downcast_ref::<adw::ActionRow>() {
-                            if let Some(pid_str) = proc_row.widget_name().strip_prefix("proc-") {
-                                if let Ok(pid) = pid_str.parse::<u32>() {
-                                    selected_pids.push(pid);
-                                }
-                            }
-                        }
-                        child = c.next_sibling();
+                LimitMode::Application => {
+                    if let Some(group) = groups.get(name.as_str()) {
+                        pids.extend(group);
                     }
                 }
-            }
-
-            // Update PID entry with comma-separated list
-            if !selected_pids.is_empty() {
-                let pids_str = selected_pids
-                    .iter()
-                    .map(|p| p.to_string())
-                    .collect::<Vec<_>>()
-                    .join(",");
-                pid_entry_clone.set_text(&pids_str);
-            } else {
-                pid_entry_clone.set_text("");
             }
         }
+        let text = pids
+            .iter()
+            .map(|p| p.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        pid_entry_clone.set_text(&text);
+        drop(groups);
+        sync_group_buttons(&state, list);
     });
 
     // Profile selection handler
@@ -469,9 +478,18 @@ fn filter_processes(state: &Rc<RefCell<LimitState>>, query: &str) {
     let list = &state_ref.process_list;
     let mode = *state_ref.limit_mode.borrow();
 
+    state_ref.rebuilding.set(true);
     while let Some(child) = list.first_child() {
         list.remove(&child);
     }
+    list.set_selection_mode(match mode {
+        LimitMode::Individual => gtk::SelectionMode::Single,
+        LimitMode::Application => gtk::SelectionMode::Multiple,
+    });
+    // Rebuilt below; cleared after the rows are gone so the selection
+    // handler never reads it while it is borrowed mutably.
+    state_ref.group_pids.borrow_mut().clear();
+    state_ref.group_buttons.borrow_mut().clear();
 
     let processes = state_ref.all_processes.borrow();
     let query_lower = query.to_lowercase();
@@ -503,40 +521,30 @@ fn filter_processes(state: &Rc<RefCell<LimitState>>, query: &str) {
                 let row = adw::ExpanderRow::new();
                 row.set_title(&glib::markup_escape_text(&group.name));
                 row.set_subtitle(&format!("{} process(es)", group.processes.len()));
-                row.set_widget_name(&format!("group-{}", group.name.replace('/', "_")));
+                let row_name = format!("group-{}", group.name.replace('/', "_"));
+                row.set_widget_name(&row_name);
+                state_ref
+                    .group_pids
+                    .borrow_mut()
+                    .insert(row_name, group.processes.iter().map(|p| p.pid).collect());
 
-                // Add "Select All" button
-                let select_all_btn = gtk::Button::with_label("Select All");
-                select_all_btn.add_css_class("flat");
-                select_all_btn.add_css_class("suggested-action");
-
-                let group_pids: Vec<u32> = group.processes.iter().map(|p| p.pid).collect();
+                // Selects or deselects the whole application; the selection
+                // handler then fills the PID field with all of its processes.
+                let select_all_btn = gtk::Button::with_label("Select");
+                select_all_btn.set_valign(gtk::Align::Center);
                 let list_clone = list.clone();
-                let pid_entry_clone = state_ref.pid_entry.clone();
+                let row_clone = row.clone();
                 select_all_btn.connect_clicked(move |_| {
-                    // Select all processes in this group
-                    let pids_str = group_pids
-                        .iter()
-                        .map(|p| p.to_string())
-                        .collect::<Vec<_>>()
-                        .join(",");
-                    pid_entry_clone.set_text(&pids_str);
-
-                    // Update list selection (visual feedback)
-                    let mut child = list_clone.first_child();
-                    while let Some(c) = child {
-                        if let Some(row) = c.downcast_ref::<adw::ActionRow>() {
-                            if let Some(pid_str) = row.widget_name().strip_prefix("proc-") {
-                                if let Ok(pid) = pid_str.parse::<u32>() {
-                                    if group_pids.contains(&pid) {
-                                        list_clone.select_row(Some(row));
-                                    }
-                                }
-                            }
-                        }
-                        child = c.next_sibling();
+                    if row_clone.is_selected() {
+                        list_clone.unselect_row(&row_clone);
+                    } else {
+                        list_clone.select_row(Some(&row_clone));
                     }
                 });
+                state_ref
+                    .group_buttons
+                    .borrow_mut()
+                    .insert(row.widget_name().to_string(), select_all_btn.clone());
                 row.add_suffix(&select_all_btn);
 
                 // List individual processes in the group
@@ -583,14 +591,52 @@ fn filter_processes(state: &Rc<RefCell<LimitState>>, query: &str) {
                 row.set_activatable(true);
                 row.set_widget_name(&format!("proc-{}", proc.pid));
 
-                let pid = proc.pid;
-                let pid_entry = state_ref.pid_entry.clone();
-                row.connect_activated(move |_| {
-                    pid_entry.set_text(&pid.to_string());
-                });
-
                 list.append(&row);
             }
+        }
+    }
+
+    // Keep the PID field as it was and highlight the rows that match it.
+    let wanted: Vec<u32> = parse_pid_list(&state_ref.pid_entry.text()).unwrap_or_default();
+    if !wanted.is_empty() {
+        let groups = state_ref.group_pids.borrow();
+        let mut child = list.first_child();
+        while let Some(c) = child {
+            if let Some(row) = c.downcast_ref::<gtk::ListBoxRow>() {
+                let name = row.widget_name();
+                let matches = match mode {
+                    LimitMode::Individual => name
+                        .strip_prefix("proc-")
+                        .and_then(|p| p.parse::<u32>().ok())
+                        .is_some_and(|pid| wanted.contains(&pid)),
+                    LimitMode::Application => groups
+                        .get(name.as_str())
+                        .is_some_and(|g| g.iter().all(|pid| wanted.contains(pid))),
+                };
+                if matches {
+                    list.select_row(Some(row));
+                }
+            }
+            child = c.next_sibling();
+        }
+    }
+    sync_group_buttons(&state_ref, list);
+    state_ref.rebuilding.set(false);
+}
+
+/// Show each application row's selection on its button: "Selected" in the
+/// accent colour, or a plain "Select".
+fn sync_group_buttons(state: &LimitState, list: &gtk::ListBox) {
+    for (name, btn) in state.group_buttons.borrow().iter() {
+        let selected = list
+            .selected_rows()
+            .iter()
+            .any(|r| r.widget_name().as_str() == name);
+        btn.set_label(if selected { "Selected" } else { "Select" });
+        if selected {
+            btn.add_css_class("suggested-action");
+        } else {
+            btn.remove_css_class("suggested-action");
         }
     }
 }
