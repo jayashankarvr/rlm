@@ -279,7 +279,7 @@ footer a { margin-right: 1.25rem; }
       <ul class="plain">
         <li>Protecting the desktop session's own memory with a <code>memory.min</code> chain.</li>
         <li>Event-driven pressure triggers. The guard samples once per second.</li>
-        <li>Notifications with Resume or Keep paused actions. Today the guard can send a plain warning when pressure rises.</li>
+        <li>Resume or Keep paused buttons on the guard's notifications. Today they only say what the guard did.</li>
         <li>A system-wide mode for other users or system services.</li>
       </ul>
     </section>
@@ -431,7 +431,7 @@ rlm import profiles.yaml         <span class="c"># import profiles</span></code>
         <li><strong>Limit Running</strong><span>Pick whole apps to share one limit, or a single process. Apps are listed by memory use.</span></li>
         <li><strong>Launch New</strong><span>Start a program or an installed app with limits.</span></li>
         <li><strong>Profiles</strong><span>The built-in presets and your own; edit a preset and restore it later.</span></li>
-        <li><strong>Guard</strong><span>Turn the guard on or off, and see memory pressure, what it is holding and what it did.</span></li>
+        <li><strong>Guard</strong><span>Turn the guard and its notifications on or off, and see memory pressure, what it is holding and what it did.</span></li>
       </ul>
       <p class="note">The desktop app hides processes on the protect list. Use the CLI with <code>--force</code> if you really need to limit one.</p>
     </section>
@@ -445,10 +445,12 @@ rlm import profiles.yaml         <span class="c"># import profiles</span></code>
         <li>A freeze always ends after those 5 seconds; a cap is lifted after 30 seconds of calm.</li>
         <li>It never sends a signal to any process, and it holds at most 3 apps at a time.</li>
         <li>It only acts on your own apps and on the cgroups rlm created.</li>
+        <li>It tells you with a desktop notification, such as "Firefox paused" or "Firefox slowed down", and the notification clears itself once the app is released.</li>
       </ul>
       <div class="cmd"><pre><code>rlm guard enable    <span class="c"># install the service if needed, enable and start it</span>
 rlm guard status    <span class="c"># state, config, pressure, what it holds, recent events</span>
 rlm guard test      <span class="c"># what it would do right now, without acting</span>
+rlm guard test --notify  <span class="c"># preview the notifications</span>
 rlm guard history   <span class="c"># recent freezes, caps and restores</span>
 rlm guard disable   <span class="c"># stop and disable the service</span></code></pre></div>
       <p>The full log is in <code>journalctl --user -u rlm-guard</code>.</p>
@@ -471,7 +473,9 @@ rlm guard disable   <span class="c"># stop and disable the service</span></code>
   selection:
     min_rss_mb: 200
     protect: []   <span class="c"># names added to the built-in protect list</span>
-  notify: true</code></pre></div>
+  notify: true
+  notify_pressure: false</code></pre></div>
+      <p class="note"><code>notify: false</code> turns the notifications off. <code>notify_pressure: true</code> also warns, at most once a minute, when memory runs low before any app is held. The running guard picks up these two without a restart, and the Guard page of the desktop app has switches for them.</p>
       <p class="note">With <code>enabled: false</code> the guard stops freezing and capping but still applies your rules. An invalid config stops the guard with a clear error in <code>rlm guard status</code>; fix the file and run <code>systemctl --user restart rlm-guard</code>.</p>
 
       <h3 id="guard-safe">How it stays safe</h3>
