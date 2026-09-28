@@ -321,12 +321,6 @@ fn run(config: Config) -> common::Result<()> {
             Vec::new()
         };
 
-        let stamp = config_stamp(&cfg_files);
-        if stamp != cfg_stamp {
-            cfg_stamp = stamp;
-            reload_notify_flags(&mut notifier);
-        }
-
         let mut level = None;
         match (&effector, sample) {
             (Some(effector), Some(sample)) if gcfg.enabled => {
@@ -360,6 +354,14 @@ fn run(config: Config) -> common::Result<()> {
             _ => {}
         }
         notifier.end_tick(now_ms, level, &mut |key, cg| names.name(key, cg));
+
+        // After this tick's actions, so reading a just-saved config never
+        // delays a freeze.
+        let stamp = config_stamp(&cfg_files);
+        if stamp != cfg_stamp {
+            cfg_stamp = stamp;
+            reload_notify_flags(&mut notifier);
+        }
 
         // Persistent application rules, every RULES_INTERVAL_MS: absorbs
         // newly launched matching instances. Skips any rule cgroup the

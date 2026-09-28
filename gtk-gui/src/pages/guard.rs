@@ -676,6 +676,14 @@ impl GuardPage {
             self.pressure_switch.set_active(pressure);
         }
         SYNCING_SWITCH.with(|f| f.set(false));
+        for (row, subtitle) in [
+            (&self.notify_switch, NOTIFY_SUBTITLE),
+            (&self.pressure_switch, PRESSURE_SUBTITLE),
+        ] {
+            if row.subtitle().as_deref() != Some(subtitle) {
+                row.set_subtitle(subtitle);
+            }
+        }
         self.notify_switch.set_sensitive(true);
         self.pressure_switch.set_sensitive(notify);
     }

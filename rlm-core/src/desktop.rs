@@ -71,6 +71,9 @@ pub fn names_by_program() -> HashMap<String, String> {
         let Some(program) = exec_program(&e.exec) else {
             continue;
         };
+        if is_launcher(&program) {
+            continue;
+        }
         let better = names
             .get(&program)
             .is_none_or(|old| (e.name.len(), &e.name) < (old.len(), old));
@@ -79,6 +82,37 @@ pub fn names_by_program() -> HashMap<String, String> {
         }
     }
     names
+}
+
+/// Interpreters and launchers: an entry that runs one of these names some
+/// other app, so its `Name` must not label every process of that program.
+fn is_launcher(program: &str) -> bool {
+    const EXACT: &[&str] = &[
+        "sh",
+        "bash",
+        "dash",
+        "zsh",
+        "fish",
+        "env",
+        "java",
+        "node",
+        "nodejs",
+        "electron",
+        "flatpak",
+        "snap",
+        "gjs",
+        "gjs-console",
+        "perl",
+        "ruby",
+        "php",
+        "mono",
+        "dotnet",
+        "wine",
+        "wine64",
+        "xdg-open",
+        "gio",
+    ];
+    EXACT.contains(&program) || program.starts_with("python")
 }
 
 /// The basename of the program a raw desktop file `Exec` value runs, looking
@@ -445,5 +479,12 @@ mod tests {
         assert_eq!(exec_program("env -i -- app").as_deref(), Some("app"));
         assert_eq!(exec_program("env A=1"), None);
         assert_eq!(exec_program("%U"), None);
+    }
+
+    #[test]
+    fn interpreters_do_not_take_an_apps_name() {
+        assert!(is_launcher("python3.14"));
+        assert!(is_launcher("flatpak"));
+        assert!(!is_launcher("firefox"));
     }
 }
