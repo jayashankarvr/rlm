@@ -436,6 +436,21 @@ impl<S: NotifySink> Notifier<S> {
 
 /// Longest wait for one call to the notification server.
 const CALL_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How long an intervention notification may stay up (ms). The guard
+/// replaces or closes it long before this; the limit only matters when the
+/// guard died (crash, SIGKILL) without closing it.
+pub const INTERVENTION_EXPIRE_MS: i32 = 10 * 60 * 1000;
+
+/// The `expire_timeout` for the notification `key`: the server default
+/// (-1) for the early warning, [`INTERVENTION_EXPIRE_MS`] for the rest.
+pub fn expire_timeout(key: &str) -> i32 {
+    if key == PRESSURE_KEY {
+        -1
+    } else {
+        INTERVENTION_EXPIRE_MS
+    }
+}
 /// Requests queued for the sender thread; more are dropped.
 const QUEUE: usize = 64;
 
@@ -536,7 +551,7 @@ fn sender(rx: mpsc::Receiver<Cmd>) {
         match (cmd, conn) {
             (Cmd::Show { key, title, body }, Some(c)) => {
                 let replaces = ids.get(&key).copied().unwrap_or(0);
-                match dbus_notify(c, replaces, &title, &body) {
+                match dbus_notify(c, replaces, &title, &body, expire_timeout(&key)) {
                     Ok(id) => {
                         ids.insert(key, id);
                     }
@@ -580,6 +595,7 @@ fn dbus_notify(
     replaces_id: u32,
     title: &str,
     body: &str,
+    expire_timeout: i32,
 ) -> zbus::Result<u32> {
     use zbus::zvariant::Value;
     let mut hints: HashMap<&str, Value<'_>> = HashMap::new();
@@ -587,7 +603,6 @@ fn dbus_notify(
     // Urgency normal.
     hints.insert("urgency", Value::U8(1));
     let actions: Vec<&str> = Vec::new();
-    let expire_timeout: i32 = -1;
     let reply = conn.call_method(
         Some(NOTIFY_DEST),
         NOTIFY_PATH,
@@ -954,6 +969,12 @@ mod tests {
         );
         let err = common::Error::Config("bad".into());
         assert_eq!(flags_after_reload(current, Err(&err)), current);
+    }
+
+    #[test]
+    fn only_intervention_notifications_expire() {
+        assert_eq!(expire_timeout("firefox"), 600_000);
+        assert_eq!(expire_timeout(PRESSURE_KEY), -1);
     }
 
     #[test]
