@@ -71,10 +71,9 @@ pub fn paused_text(app: &str, hold_secs: u64) -> (String, String) {
     let unit = if hold_secs == 1 { "second" } else { "seconds" };
     (
         format!("{app} paused"),
-        format!(
-            "Memory is running low, so rlm paused {app} for {hold_secs} {unit} to keep your \
-             computer responsive."
-        ),
+        // GNOME shows one line of body text in the popup, so keep it short;
+        // the title already names the app.
+        format!("Paused for {hold_secs} {unit} while memory is low."),
     )
 }
 
@@ -83,8 +82,7 @@ pub fn slowed_text(app: &str, cap_bytes: u64) -> (String, String) {
     (
         format!("{app} slowed down"),
         format!(
-            "Memory is still low, so rlm is holding {app} to about {} until memory frees up. \
-             It keeps running.",
+            "Held to about {} until memory frees up.",
             format_size(cap_bytes)
         ),
     )
@@ -752,21 +750,17 @@ mod tests {
             paused_text("Firefox", 5),
             (
                 "Firefox paused".to_string(),
-                "Memory is running low, so rlm paused Firefox for 5 seconds to keep your \
-                 computer responsive."
-                    .to_string()
+                "Paused for 5 seconds while memory is low.".to_string()
             )
         );
         assert_eq!(
             slowed_text("Firefox", 3_200_000_000),
             (
                 "Firefox slowed down".to_string(),
-                "Memory is still low, so rlm is holding Firefox to about 3.2 GB until memory \
-                 frees up. It keeps running."
-                    .to_string()
+                "Held to about 3.2 GB until memory frees up.".to_string()
             )
         );
-        assert!(paused_text("X", 1).1.contains("for 1 second to"));
+        assert!(paused_text("X", 1).1.contains("for 1 second while"));
         assert_eq!(format_size(512_000_000), "512 MB");
         assert_eq!(format_size(268_435_456), "268 MB");
     }
