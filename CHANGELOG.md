@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.5] - 2026-09-28
+
+### Changed
+
+- Guard notifications say what happened to which app: "Firefox paused" when the guard freezes an app, updated in place to "Firefox slowed down" if it caps it, and cleared on their own once the app is released or the guard stops. They carry rlm's name and icon and use the app's name from its menu entry where one clearly matches.
+- Notifications are sent only when the guard acts on an app. The old "memory pressure Warn" message is gone; an early "Memory is running low" warning is available with the new `guard.notify_pressure: true` (off by default).
+- Notifications go through the desktop's notification service over D-Bus, on a background thread that never delays the guard, and reconnect if that service restarts. Without a session bus the guard falls back to `notify-send`.
+
+### Added
+
+- Desktop app, Guard page: switches for "Notify when an app is paused or slowed" and "Warn when memory runs low".
+- The running guard picks up `guard.notify` and `guard.notify_pressure` changes without a restart, so apps it holds stay held.
+- `rlm guard test --notify` shows sample notifications without touching any app.
+
 ## [0.2.4] - 2026-09-28
 
 ### Changed

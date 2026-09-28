@@ -1,7 +1,7 @@
 # Maintainer: Jayashankar <me.jayashankar@gmail.com>
 pkgbase=rlm
 pkgname=(rlm rlm-gtk)
-pkgver=0.2.4
+pkgver=0.2.5
 pkgrel=1
 pkgdesc='Unprivileged cgroup v2 resource limits with an optional freeze-or-cap guard'
 arch=(x86_64 aarch64)
@@ -9,7 +9,7 @@ url='https://github.com/jayashankarvr/rlm'
 license=(Apache-2.0)
 makedepends=(cargo gtk4 libadwaita)
 source=("$pkgbase-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('b4409a18adb5112e22f4ae15f7bba6be2fd7eb778880ffec9a114667c9a4a5a3')
+sha256sums=('SKIP') # replaced at release time
 
 prepare() {
   cd "$pkgbase-$pkgver"

@@ -815,7 +815,7 @@ dependencies = [
 
 [[package]]
 name = "harness"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "clap",
  "ctrlc",
@@ -1207,7 +1207,7 @@ checksum = "7a2d987857b319362043e95f5353c0535c1f58eec5336fdfcf626430af7def58"
 
 [[package]]
 name = "rlm-gtk"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "gtk4",
  "libadwaita",
@@ -1220,7 +1220,7 @@ dependencies = [
 
 [[package]]
 name = "rlmctl"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "clap",
  "ctrlc",
@@ -1235,7 +1235,7 @@ dependencies = [
 
 [[package]]
 name = "rlmctl-common"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "dirs",
  "serde",
@@ -1246,7 +1246,7 @@ dependencies = [
 
 [[package]]
 name = "rlmctl-core"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "dirs",
  "libc",
