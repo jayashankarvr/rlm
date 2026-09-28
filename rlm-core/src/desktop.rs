@@ -63,25 +63,78 @@ pub fn list_applications() -> Result<Vec<DesktopApp>> {
 }
 
 /// Installed application names keyed by the basename of the program their
-/// `Exec` runs (`firefox` to `Firefox`). When several entries run the same
-/// program, the shortest name wins.
+/// `Exec` runs (`firefox` to `Firefox`). See [`names_from_entries`].
 pub fn names_by_program() -> HashMap<String, String> {
-    let mut names: HashMap<String, String> = HashMap::new();
-    for e in desktop_entries() {
-        let Some(program) = exec_program(&e.exec) else {
+    names_from_entries(&desktop_entries())
+}
+
+/// Program basename to app name, from `entries`. Entries that run an
+/// interpreter or launcher, or that pass arguments launching something else
+/// (a web app, a game shortcut, a terminal command), are skipped: their
+/// `Name` is not the program's. When the remaining entries for one program
+/// disagree on the name, only those whose file stem or `StartupWMClass`
+/// matches the program count; if they still disagree, the program gets no
+/// name here.
+fn names_from_entries(entries: &[Entry]) -> HashMap<String, String> {
+    let mut by_program: HashMap<String, Vec<&Entry>> = HashMap::new();
+    for e in entries {
+        let Some(args) = exec_args(&e.exec) else {
             continue;
         };
-        if is_launcher(&program) {
+        let Some(program) = program_of(&args) else {
+            continue;
+        };
+        if is_launcher(&program) || args.iter().any(|a| launches_something_else(a)) {
             continue;
         }
-        let better = names
-            .get(&program)
-            .is_none_or(|old| (e.name.len(), &e.name) < (old.len(), old));
-        if better {
-            names.insert(program, e.name);
+        by_program.entry(program).or_default().push(e);
+    }
+    let mut names = HashMap::new();
+    for (program, entries) in by_program {
+        let name = single_name(entries.iter().copied()).or_else(|| {
+            single_name(
+                entries
+                    .iter()
+                    .copied()
+                    .filter(|e| entry_matches(e, &program)),
+            )
+        });
+        if let Some(name) = name {
+            names.insert(program, name);
         }
     }
     names
+}
+
+/// The one name all `entries` share, `None` if there are none or several.
+fn single_name<'a>(entries: impl Iterator<Item = &'a Entry>) -> Option<String> {
+    let mut names = entries.map(|e| e.name.as_str());
+    let first = names.next()?;
+    names.all(|n| n == first).then(|| first.to_string())
+}
+
+/// Whether an entry is the program's own: its file stem (or the last part
+/// of a reverse-DNS stem such as `org.mozilla.firefox`) or its
+/// `StartupWMClass` is the program name, ignoring case.
+fn entry_matches(e: &Entry, program: &str) -> bool {
+    let stem = e.stem.to_lowercase();
+    let program = program.to_lowercase();
+    stem == program
+        || stem.rsplit('.').next() == Some(program.as_str())
+        || e.wm_class
+            .as_deref()
+            .is_some_and(|c| c.eq_ignore_ascii_case(&program))
+}
+
+/// An Exec argument that makes the program open some other app or a URL:
+/// a browser web app, a Steam or Lutris game, or a terminal command.
+fn launches_something_else(arg: &str) -> bool {
+    arg == "-e"
+        || arg.starts_with("--app-id")
+        || arg.starts_with("--app=")
+        || arg.starts_with("--application-mode")
+        || arg.starts_with("steam://")
+        || arg.starts_with("lutris:")
 }
 
 /// Interpreters and launchers: an entry that runs one of these names some
@@ -118,8 +171,23 @@ fn is_launcher(program: &str) -> bool {
 /// The basename of the program a raw desktop file `Exec` value runs, looking
 /// past an `env VAR=value` wrapper. `None` if there is none.
 pub fn exec_program(value: &str) -> Option<String> {
-    let args = split_exec(&unescape_value(value))?;
-    let mut args = args.into_iter().filter_map(expand_field_codes);
+    program_of(&exec_args(value)?)
+}
+
+/// A raw desktop file `Exec` value split into arguments, field codes
+/// removed. `None` when a quote is left open.
+fn exec_args(value: &str) -> Option<Vec<String>> {
+    Some(
+        split_exec(&unescape_value(value))?
+            .into_iter()
+            .filter_map(expand_field_codes)
+            .collect(),
+    )
+}
+
+/// The basename of the program `args` run, past an `env` wrapper.
+fn program_of(args: &[String]) -> Option<String> {
+    let mut args = args.iter();
     let mut program = args.next()?;
     if program == "env" {
         program = loop {
@@ -134,14 +202,17 @@ pub fn exec_program(value: &str) -> Option<String> {
             }
         };
     }
-    let base = program.rsplit('/').next().unwrap_or(&program);
+    let base = program.rsplit('/').next().unwrap_or(program);
     (!base.is_empty()).then(|| base.to_string())
 }
 
-/// A shown application entry: its `Name` and raw `Exec` value.
+/// A shown application entry: its `Name`, raw `Exec` value, file name
+/// without `.desktop`, and `StartupWMClass`.
 struct Entry {
     name: String,
     exec: String,
+    stem: String,
+    wm_class: Option<String>,
 }
 
 /// Read the `[Desktop Entry]` group of one file. `None` for a hidden entry,
@@ -150,6 +221,7 @@ fn read_entry(path: &Path) -> Option<Entry> {
     let content = fs::read_to_string(path).ok()?;
     let mut name = None;
     let mut exec = None;
+    let mut wm_class = None;
     let mut no_display = false;
     let mut in_desktop_entry = false;
 
@@ -173,6 +245,8 @@ fn read_entry(path: &Path) -> Option<Entry> {
             if exec.is_none() && exec_command(value).is_some() {
                 exec = Some(value.to_string());
             }
+        } else if let Some(value) = line.strip_prefix("StartupWMClass=") {
+            wm_class = Some(value.trim().to_string());
         } else if line == "NoDisplay=true" || line == "Hidden=true" {
             no_display = true;
         } else if line.starts_with("Type=") && line != "Type=Application" {
@@ -187,6 +261,11 @@ fn read_entry(path: &Path) -> Option<Entry> {
     Some(Entry {
         name: name?,
         exec: exec?,
+        stem: path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        wm_class,
     })
 }
 
@@ -489,6 +568,88 @@ mod tests {
         assert!(read_entry(&path).is_none());
         fs::write(&path, "[Desktop Entry]\nType=Application\nName=X\nExec=x\n").unwrap();
         assert_eq!(read_entry(&path).map(|e| e.name).as_deref(), Some("X"));
+    }
+
+    fn entry(stem: &str, name: &str, exec: &str, wm_class: Option<&str>) -> Entry {
+        Entry {
+            name: name.into(),
+            exec: exec.into(),
+            stem: stem.into(),
+            wm_class: wm_class.map(Into::into),
+        }
+    }
+
+    #[test]
+    fn a_single_entry_names_its_program() {
+        let names = names_from_entries(&[entry("firefox", "Firefox", "firefox %u", None)]);
+        assert_eq!(names.get("firefox").map(String::as_str), Some("Firefox"));
+        let names = names_from_entries(&[entry(
+            "org.mozilla.firefox",
+            "Firefox",
+            "/usr/bin/firefox %u",
+            None,
+        )]);
+        assert_eq!(names.get("firefox").map(String::as_str), Some("Firefox"));
+    }
+
+    #[test]
+    fn a_web_app_does_not_rename_its_browser() {
+        let names = names_from_entries(&[
+            entry(
+                "chrome-abc-Default",
+                "YouTube",
+                "/usr/bin/chromium --profile-directory=Default --app-id=abc",
+                None,
+            ),
+            entry("chromium", "Chromium", "/usr/bin/chromium %U", None),
+        ]);
+        assert_eq!(names.get("chromium").map(String::as_str), Some("Chromium"));
+        let names = names_from_entries(&[entry(
+            "chrome-abc-Default",
+            "YouTube",
+            "chromium --app=https://youtube.com",
+            None,
+        )]);
+        assert_eq!(names.get("chromium"), None);
+    }
+
+    #[test]
+    fn a_game_shortcut_does_not_rename_steam() {
+        let names = names_from_entries(&[
+            entry("Hades", "Hades", "steam steam://rungameid/1145360", None),
+            entry("steam", "Steam", "/usr/bin/steam %U", None),
+        ]);
+        assert_eq!(names.get("steam").map(String::as_str), Some("Steam"));
+    }
+
+    #[test]
+    fn a_terminal_command_does_not_rename_the_terminal() {
+        let names = names_from_entries(&[
+            entry("btop", "btop++", "kitty -e btop", None),
+            entry("kitty", "kitty", "kitty", None),
+        ]);
+        assert_eq!(names.get("kitty").map(String::as_str), Some("kitty"));
+        assert_eq!(names.get("btop"), None, "btop is not what runs");
+    }
+
+    #[test]
+    fn disagreeing_entries_need_a_matching_stem_or_class() {
+        let names = names_from_entries(&[
+            entry("code", "Visual Studio Code", "/usr/bin/code %F", None),
+            entry("my-project", "My Project", "/usr/bin/code /home/me/p", None),
+        ]);
+        assert_eq!(
+            names.get("code").map(String::as_str),
+            Some("Visual Studio Code")
+        );
+        let names = names_from_entries(&[
+            entry("a", "A", "tool", Some("Tool")),
+            entry("b", "B", "tool", None),
+        ]);
+        assert_eq!(names.get("tool").map(String::as_str), Some("A"));
+        let names =
+            names_from_entries(&[entry("a", "A", "tool", None), entry("b", "B", "tool", None)]);
+        assert_eq!(names.get("tool"), None, "still ambiguous");
     }
 
     #[test]
