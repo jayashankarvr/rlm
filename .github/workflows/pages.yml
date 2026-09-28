@@ -1,0 +1,45 @@
+name: Website
+
+# Copies site/ to the gh-pages branch, next to the apt repository, whenever
+# it changes on main.
+on:
+  push:
+    branches: [main]
+    paths: ["site/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# Shares the group with the apt workflow so the two never push gh-pages at
+# the same time.
+concurrency:
+  group: apt-repository
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check out gh-pages
+        run: |
+          git fetch --depth 1 origin gh-pages
+          git worktree add pages FETCH_HEAD
+
+      - name: Copy the site
+        run: cp -r site/. pages/
+
+      - name: Publish
+        run: |
+          cd pages
+          git add -A
+          if git diff --cached --quiet; then
+            echo "website unchanged"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -q -m "website: update from ${GITHUB_SHA::7}"
+          git push origin HEAD:gh-pages
