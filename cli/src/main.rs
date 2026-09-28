@@ -1263,7 +1263,7 @@ fn guard_test_notify() -> ExitCode {
         },
         done,
     );
-    notifier.end_tick(0, None, &mut name);
+    notifier.end_tick(0, rlm_core::guard::notify::Memory::Unknown, &mut name);
     std::thread::sleep(STEP);
 
     notifier.record(&Action::Thaw { res: res.clone() }, done);
@@ -1276,11 +1276,19 @@ fn guard_test_notify() -> ExitCode {
             cap_bytes: Some(3_200_000_000),
         }),
     );
-    notifier.end_tick(STEP.as_millis() as u64, None, &mut name);
+    notifier.end_tick(
+        STEP.as_millis() as u64,
+        rlm_core::guard::notify::Memory::Unknown,
+        &mut name,
+    );
     std::thread::sleep(STEP);
 
     notifier.record(&Action::LiftCap { res }, done);
-    notifier.end_tick(2 * STEP.as_millis() as u64, None, &mut name);
+    notifier.end_tick(
+        2 * STEP.as_millis() as u64,
+        rlm_core::guard::notify::Memory::Unknown,
+        &mut name,
+    );
     if !notifier.sink().0.flush(std::time::Duration::from_secs(3)) {
         eprintln!("warning: the notification server did not answer in time");
     }

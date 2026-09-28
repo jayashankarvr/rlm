@@ -14,7 +14,8 @@
 //! notification server can never hold up the guard loop.
 
 use super::effector::Applied;
-use super::types::{Action, Level};
+use super::policy::is_scarce;
+use super::types::{Action, Level, Sample};
 use common::GuardConfig;
 use std::collections::{HashMap, HashSet};
 use std::process::Command;
@@ -36,6 +37,27 @@ pub const PRESSURE_INTERVAL_MS: u64 = 60_000;
 /// Sink key of the early warning. App keys are exe basenames, which never
 /// contain a `/`, so this cannot collide with one.
 pub const PRESSURE_KEY: &str = "/pressure";
+
+/// How the memory looked on one tick, for the early warning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Memory {
+    /// The policy did not run this tick.
+    Unknown,
+    /// Not both under High or Critical pressure and short of memory.
+    Fine,
+    /// Pressure is High or Critical and memory is short, as the policy
+    /// judges it before acting ([`is_scarce`]).
+    Low,
+}
+
+/// [`Memory`] for a tick whose policy computed `level` from `sample`.
+pub fn memory_state(level: Level, sample: &Sample, trigger: &common::GuardTrigger) -> Memory {
+    if matches!(level, Level::High | Level::Critical) && is_scarce(sample, trigger) {
+        Memory::Low
+    } else {
+        Memory::Fine
+    }
+}
 
 /// Where notifications go. `key` names one notification: a second `show`
 /// with the same key replaces it in place, `close` removes it.
@@ -309,14 +331,14 @@ impl<S: NotifySink> Notifier<S> {
         }
     }
 
-    /// Send what changed this tick. `level` is the pressure level the policy
-    /// computed this tick, `None` when it did not run. `name` maps an app key
+    /// Send what changed this tick. `memory` is how the memory looked on this
+    /// tick (see [`memory_state`]). `name` maps an app key
     /// and one of its cgroups to a display name; it is called once per newly
     /// held app, after every action of the tick was applied.
     pub fn end_tick(
         &mut self,
         now_ms: u64,
-        level: Option<Level>,
+        memory: Memory,
         name: &mut dyn FnMut(&str, &str) -> String,
     ) {
         let thawed = std::mem::take(&mut self.thawed);
@@ -379,7 +401,7 @@ impl<S: NotifySink> Notifier<S> {
             self.shown.insert(app, (title, body));
         }
 
-        let pressing = matches!(level, Some(Level::High | Level::Critical));
+        let pressing = memory == Memory::Low;
         if self.held.is_empty() && self.shown.is_empty() && pressing {
             let due = self
                 .last_pressure_ms
@@ -389,7 +411,7 @@ impl<S: NotifySink> Notifier<S> {
                 self.pressure_shown = true;
                 self.last_pressure_ms = Some(now_ms);
             }
-        } else if level.is_some() || !self.held.is_empty() {
+        } else if memory != Memory::Unknown || !self.held.is_empty() {
             self.close_pressure();
         }
     }
@@ -720,9 +742,9 @@ mod tests {
         let mut n = notifier(true, false);
         n.record(&freeze("/a"), ok());
         n.record(&freeze("/b"), ok());
-        n.end_tick(0, Some(Level::High), &mut names);
+        n.end_tick(0, Memory::Low, &mut names);
         assert_eq!(n.take(), vec![paused()]);
-        n.end_tick(1_000, Some(Level::High), &mut names);
+        n.end_tick(1_000, Memory::Low, &mut names);
         assert!(n.take().is_empty(), "nothing changed, nothing sent");
     }
 
@@ -730,11 +752,11 @@ mod tests {
     fn thaw_then_cap_in_one_tick_replaces_without_close() {
         let mut n = notifier(true, false);
         n.record(&freeze("/a"), ok());
-        n.end_tick(0, Some(Level::High), &mut names);
+        n.end_tick(0, Memory::Low, &mut names);
         n.take();
         n.record(&Action::Thaw { res: res("/a") }, ok());
         n.record(&cap("/a"), capped(3 * GB));
-        n.end_tick(5_000, Some(Level::High), &mut names);
+        n.end_tick(5_000, Memory::Low, &mut names);
         assert_eq!(n.take(), vec![slowed(3 * GB)]);
     }
 
@@ -742,13 +764,13 @@ mod tests {
     fn cap_on_the_tick_after_a_thaw_still_replaces() {
         let mut n = notifier(true, false);
         n.record(&freeze("/a"), ok());
-        n.end_tick(0, Some(Level::High), &mut names);
+        n.end_tick(0, Memory::Low, &mut names);
         n.take();
         n.record(&Action::Thaw { res: res("/a") }, ok());
-        n.end_tick(5_000, Some(Level::High), &mut names);
+        n.end_tick(5_000, Memory::Low, &mut names);
         assert!(n.take().is_empty(), "the close waits a tick");
         n.record(&cap("/a"), capped(2 * GB));
-        n.end_tick(6_000, Some(Level::High), &mut names);
+        n.end_tick(6_000, Memory::Low, &mut names);
         assert_eq!(n.take(), vec![slowed(2 * GB)]);
     }
 
@@ -756,11 +778,11 @@ mod tests {
     fn thaw_alone_closes() {
         let mut n = notifier(true, false);
         n.record(&freeze("/a"), ok());
-        n.end_tick(0, Some(Level::High), &mut names);
+        n.end_tick(0, Memory::Low, &mut names);
         n.take();
         n.record(&Action::Thaw { res: res("/a") }, ok());
-        n.end_tick(5_000, Some(Level::Warn), &mut names);
-        n.end_tick(6_000, Some(Level::Calm), &mut names);
+        n.end_tick(5_000, Memory::Fine, &mut names);
+        n.end_tick(6_000, Memory::Fine, &mut names);
         assert_eq!(n.take(), vec![Call::Close("firefox".into())]);
     }
 
@@ -768,10 +790,10 @@ mod tests {
     fn lift_closes_in_the_same_tick() {
         let mut n = notifier(true, false);
         n.record(&cap("/a"), capped(GB));
-        n.end_tick(0, Some(Level::High), &mut names);
+        n.end_tick(0, Memory::Low, &mut names);
         assert_eq!(n.take(), vec![slowed(GB)]);
         n.record(&Action::LiftCap { res: res("/a") }, ok());
-        n.end_tick(40_000, Some(Level::Calm), &mut names);
+        n.end_tick(40_000, Memory::Fine, &mut names);
         assert_eq!(n.take(), vec![Call::Close("firefox".into())]);
     }
 
@@ -779,10 +801,10 @@ mod tests {
     fn a_release_that_reported_an_error_still_closes() {
         let mut n = notifier(true, false);
         n.record(&cap("/a"), capped(GB));
-        n.end_tick(0, Some(Level::High), &mut names);
+        n.end_tick(0, Memory::Low, &mut names);
         n.take();
         n.record(&Action::LiftCap { res: res("/a") }, None);
-        n.end_tick(1_000, Some(Level::Calm), &mut names);
+        n.end_tick(1_000, Memory::Fine, &mut names);
         assert_eq!(n.take(), vec![Call::Close("firefox".into())]);
     }
 
@@ -791,7 +813,7 @@ mod tests {
         let mut n = notifier(true, false);
         n.record(&freeze("/a"), None);
         n.record(&cap("/b"), None);
-        n.end_tick(0, Some(Level::Critical), &mut names);
+        n.end_tick(0, Memory::Low, &mut names);
         assert!(n.take().is_empty());
     }
 
@@ -800,10 +822,10 @@ mod tests {
         let mut n = notifier(true, false);
         n.record(&cap("/a"), capped(GB));
         n.record(&cap("/b"), capped(2 * GB));
-        n.end_tick(0, Some(Level::High), &mut names);
+        n.end_tick(0, Memory::Low, &mut names);
         assert_eq!(n.take(), vec![slowed(3 * GB)]);
         n.record(&Action::LiftCap { res: res("/a") }, ok());
-        n.end_tick(1_000, Some(Level::High), &mut names);
+        n.end_tick(1_000, Memory::Low, &mut names);
         assert_eq!(n.take(), vec![slowed(2 * GB)], "updated, not closed");
     }
 
@@ -811,10 +833,10 @@ mod tests {
     fn disabled_notify_sends_nothing() {
         let mut n = notifier(false, true);
         n.record(&freeze("/a"), ok());
-        n.end_tick(0, Some(Level::Critical), &mut names);
+        n.end_tick(0, Memory::Low, &mut names);
         n.record(&Action::Thaw { res: res("/a") }, ok());
-        n.end_tick(5_000, Some(Level::Critical), &mut names);
-        n.end_tick(6_000, Some(Level::Critical), &mut names);
+        n.end_tick(5_000, Memory::Low, &mut names);
+        n.end_tick(6_000, Memory::Low, &mut names);
         n.close_all();
         assert!(n.take().is_empty());
     }
@@ -823,14 +845,14 @@ mod tests {
     fn turning_notify_off_clears_what_is_shown() {
         let mut n = notifier(true, false);
         n.record(&freeze("/a"), ok());
-        n.end_tick(0, Some(Level::High), &mut names);
+        n.end_tick(0, Memory::Low, &mut names);
         n.take();
         n.set_flags(NotifyFlags {
             notify: false,
             pressure: false,
         });
         assert_eq!(n.take(), vec![Call::Close("firefox".into())]);
-        n.end_tick(1_000, Some(Level::High), &mut names);
+        n.end_tick(1_000, Memory::Low, &mut names);
         assert!(n.take().is_empty());
     }
 
@@ -838,7 +860,7 @@ mod tests {
     fn close_all_closes_every_app() {
         let mut n = notifier(true, false);
         n.record(&freeze("/a"), ok());
-        n.end_tick(0, Some(Level::High), &mut names);
+        n.end_tick(0, Memory::Low, &mut names);
         n.take();
         n.close_all();
         assert_eq!(n.take(), vec![Call::Close("firefox".into())]);
@@ -855,39 +877,59 @@ mod tests {
     #[test]
     fn pressure_warning_is_off_by_default() {
         let mut n = Notifier::new(Fake::default(), &GuardConfig::default());
-        n.end_tick(0, Some(Level::Critical), &mut names);
+        n.end_tick(0, Memory::Low, &mut names);
         assert!(n.take().is_empty());
     }
 
     #[test]
     fn pressure_warning_is_rate_limited_and_only_at_high() {
         let mut n = notifier(true, true);
-        n.end_tick(0, Some(Level::Warn), &mut names);
+        n.end_tick(0, Memory::Fine, &mut names);
         assert!(n.take().is_empty(), "Warn is not enough");
-        n.end_tick(1_000, Some(Level::High), &mut names);
+        n.end_tick(1_000, Memory::Low, &mut names);
         assert_eq!(n.take(), vec![warning()]);
-        n.end_tick(30_000, Some(Level::Critical), &mut names);
+        n.end_tick(30_000, Memory::Low, &mut names);
         assert!(n.take().is_empty(), "at most once a minute");
-        n.end_tick(61_000, Some(Level::Critical), &mut names);
+        n.end_tick(61_000, Memory::Low, &mut names);
         assert_eq!(n.take(), vec![warning()]);
+    }
+
+    #[test]
+    fn memory_is_low_only_when_pressure_is_high_and_memory_short() {
+        let t = common::GuardTrigger::default();
+        let sample = |avail| Sample {
+            some_avg10: 40.0,
+            full_avg10: 0.0,
+            mem_available_mb: avail,
+            mem_total_mb: 16_000,
+            source: super::super::types::PsiSource::AppSlice,
+        };
+        assert_eq!(memory_state(Level::High, &sample(1_000), &t), Memory::Low);
+        assert_eq!(
+            memory_state(Level::High, &sample(8_000), &t),
+            Memory::Fine,
+            "a stall with half the RAM free is not low memory"
+        );
+        assert_eq!(memory_state(Level::Warn, &sample(1_000), &t), Memory::Fine);
+        assert_eq!(memory_state(Level::Critical, &sample(300), &t), Memory::Low);
     }
 
     #[test]
     fn pressure_warning_gives_way_to_an_intervention() {
         let mut n = notifier(true, true);
-        n.end_tick(0, Some(Level::High), &mut names);
+        n.end_tick(0, Memory::Low, &mut names);
         n.take();
         n.record(&freeze("/a"), ok());
-        n.end_tick(1_000, Some(Level::High), &mut names);
+        n.end_tick(1_000, Memory::Low, &mut names);
         assert_eq!(n.take(), vec![paused(), Call::Close(PRESSURE_KEY.into())]);
-        n.end_tick(70_000, Some(Level::High), &mut names);
+        n.end_tick(70_000, Memory::Low, &mut names);
         assert!(n.take().is_empty(), "no warning while an app is held");
     }
 
     #[test]
     fn pressure_warning_needs_notify() {
         let mut n = notifier(false, true);
-        n.end_tick(0, Some(Level::Critical), &mut names);
+        n.end_tick(0, Memory::Low, &mut names);
         assert!(n.take().is_empty());
     }
 

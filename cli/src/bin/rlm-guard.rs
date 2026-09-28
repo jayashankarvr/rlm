@@ -7,7 +7,9 @@
 
 use common::Config;
 use rlm_core::guard::history;
-use rlm_core::guard::notify::{flags_after_reload, AppNames, DesktopSink, Notifier};
+use rlm_core::guard::notify::{
+    flags_after_reload, memory_state, AppNames, DesktopSink, Memory, Notifier,
+};
 use rlm_core::guard::sampler::{live_cgroups, strip_cgroup_root, targets_from_procs};
 use rlm_core::guard::{
     cgfs, try_journal_path, Effector, Journal, PolicyEngine, Sampler, SystemdUser,
@@ -321,7 +323,7 @@ fn run(config: Config) -> common::Result<()> {
             Vec::new()
         };
 
-        let mut level = None;
+        let mut memory = Memory::Unknown;
         match (&effector, sample) {
             (Some(effector), Some(sample)) if gcfg.enabled => {
                 let procs = if wants {
@@ -345,7 +347,7 @@ fn run(config: Config) -> common::Result<()> {
                         }
                     }
                 }
-                level = Some(engine.level());
+                memory = memory_state(engine.level(), &sample, &gcfg.trigger);
             }
             _ if guard_on && !warned_no_psi => {
                 tracing::warn!("memory PSI unavailable; guard cannot act");
@@ -353,7 +355,7 @@ fn run(config: Config) -> common::Result<()> {
             }
             _ => {}
         }
-        notifier.end_tick(now_ms, level, &mut |key, cg| names.name(key, cg));
+        notifier.end_tick(now_ms, memory, &mut |key, cg| names.name(key, cg));
 
         // After this tick's actions, so reading a just-saved config never
         // delays a freeze.
