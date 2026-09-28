@@ -435,20 +435,11 @@ impl<S: NotifySink> Notifier<S> {
 /// Longest wait for one call to the notification server.
 const CALL_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// How long an intervention notification may stay up (ms). The guard
-/// replaces or closes it long before this; the limit only matters when the
-/// guard died (crash, SIGKILL) without closing it.
-pub const INTERVENTION_EXPIRE_MS: i32 = 10 * 60 * 1000;
-
-/// The `expire_timeout` for the notification `key`: the server default
-/// (-1) for the early warning, [`INTERVENTION_EXPIRE_MS`] for the rest.
-pub fn expire_timeout(key: &str) -> i32 {
-    if key == PRESSURE_KEY {
-        -1
-    } else {
-        INTERVENTION_EXPIRE_MS
-    }
-}
+/// The `expire_timeout` sent with every notification: -1, the server's
+/// default. A finite value is the popup's on-screen lifetime on KDE, dunst,
+/// mako and xfce4-notifyd, and a cap can outlast any fixed limit; the guard
+/// closes its notifications itself when it releases an app.
+const EXPIRE_TIMEOUT: i32 = -1;
 /// Requests queued for the sender thread; more are dropped.
 const QUEUE: usize = 64;
 
@@ -549,7 +540,7 @@ fn sender(rx: mpsc::Receiver<Cmd>) {
         match (cmd, conn) {
             (Cmd::Show { key, title, body }, Some(c)) => {
                 let replaces = ids.get(&key).copied().unwrap_or(0);
-                match dbus_notify(c, replaces, &title, &body, expire_timeout(&key)) {
+                match dbus_notify(c, replaces, &title, &body, EXPIRE_TIMEOUT) {
                     Ok(id) => {
                         ids.insert(key, id);
                     }
@@ -997,9 +988,8 @@ mod tests {
     }
 
     #[test]
-    fn only_intervention_notifications_expire() {
-        assert_eq!(expire_timeout("firefox"), 600_000);
-        assert_eq!(expire_timeout(PRESSURE_KEY), -1);
+    fn notifications_use_the_server_default_lifetime() {
+        assert_eq!(EXPIRE_TIMEOUT, -1);
     }
 
     #[test]
