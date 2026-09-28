@@ -166,7 +166,7 @@ fn read_entry(path: &Path) -> Option<Entry> {
         }
 
         if let Some(value) = line.strip_prefix("Name=") {
-            if name.is_none() {
+            if name.is_none() && !value.trim().is_empty() {
                 name = Some(value.to_string());
             }
         } else if let Some(value) = line.strip_prefix("Exec=") {
@@ -479,6 +479,16 @@ mod tests {
         assert_eq!(exec_program("env -i -- app").as_deref(), Some("app"));
         assert_eq!(exec_program("env A=1"), None);
         assert_eq!(exec_program("%U"), None);
+    }
+
+    #[test]
+    fn an_empty_name_is_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x.desktop");
+        fs::write(&path, "[Desktop Entry]\nType=Application\nName=\nExec=x\n").unwrap();
+        assert!(read_entry(&path).is_none());
+        fs::write(&path, "[Desktop Entry]\nType=Application\nName=X\nExec=x\n").unwrap();
+        assert_eq!(read_entry(&path).map(|e| e.name).as_deref(), Some("X"));
     }
 
     #[test]
