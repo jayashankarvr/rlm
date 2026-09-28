@@ -4,10 +4,12 @@
 //! and Policy rows are put in plain words here; the CLI's pressure line, with
 //! the raw PSI numbers, is the Pressure row's tooltip.
 //!
-//! The only thing the page changes is whether the service runs: its switch
-//! runs `rlm guard enable` or `rlm guard disable`, the same code path as the
-//! CLI. Everything else is read from systemd state, the config, a pressure
-//! sample, the write-ahead journal and the intervention history log.
+//! The page changes two things. Its main switch runs `rlm guard enable` or
+//! `rlm guard disable`, the same code path as the CLI. The Notifications
+//! switches write `guard.notify` and `guard.notify_pressure` to the config
+//! file, which the running guard picks up without a restart. Everything else
+//! is read from systemd state, the config, a pressure sample, the write-ahead
+//! journal and the intervention history log.
 
 use crate::widgets::icon_button;
 use adw::prelude::*;
@@ -86,6 +88,21 @@ pub fn switch_on(s: &ServiceState) -> Option<bool> {
 
 const SWITCH_SUBTITLE: &str =
     "Starts now and at every login; freezes or caps a runaway app under memory pressure";
+
+const NOTIFY_SUBTITLE: &str =
+    "One notification per app, updated in place and cleared when the app is released";
+const PRESSURE_SUBTITLE: &str =
+    "At most once a minute while memory is low and no app is paused or slowed";
+
+/// Load the config, set one notification flag and save it, keeping every
+/// other setting. An invalid config is not written; its error is returned.
+fn save_notify_flag(set: impl FnOnce(&mut GuardConfig)) -> std::result::Result<(), String> {
+    let mut cfg =
+        Config::load_validated().map_err(|e| config_error_line(&config_error_path(), &e))?;
+    set(&mut cfg.guard);
+    cfg.save()
+        .map_err(|e| format!("Could not save the config: {e}"))
+}
 
 thread_local! {
     /// Set while `populate` moves the switch, so that change does not run
@@ -260,6 +277,9 @@ pub struct GuardView {
     pub switch_on: Option<bool>,
     pub failed: bool,
     pub config: std::result::Result<(), String>,
+    /// `(guard.notify, guard.notify_pressure)`, `None` when the config is
+    /// invalid.
+    pub notify: Option<(bool, bool)>,
     /// Plain-language pressure, see [`pressure_summary`].
     pub pressure: String,
     /// The CLI's pressure line with the raw PSI numbers.
@@ -285,6 +305,7 @@ pub fn build_view(
 ) -> GuardView {
     let service_desc = capitalize(&describe(service));
     let config = cfg.as_ref().map(|_| ()).map_err(Clone::clone);
+    let notify = cfg.as_ref().ok().map(|c| (c.notify, c.notify_pressure));
     let trigger = cfg.as_ref().map(|c| c.trigger.clone()).unwrap_or_default();
     let pressure = pressure_summary(sample.as_ref(), &trigger, !entries.is_empty());
     let pressure_detail =
@@ -315,6 +336,7 @@ pub fn build_view(
         switch_on: switch_on(service),
         failed: service.active == "failed",
         config,
+        notify,
         pressure,
         pressure_detail,
         policy,
@@ -406,6 +428,8 @@ fn status_row(list_box: &gtk::ListBox, title: &str) -> adw::ActionRow {
 pub struct GuardPage {
     widget: gtk::Widget,
     switch: adw::SwitchRow,
+    notify_switch: adw::SwitchRow,
+    pressure_switch: adw::SwitchRow,
     service_row: adw::ActionRow,
     config_row: adw::ActionRow,
     config_icon: gtk::Image,
@@ -431,6 +455,21 @@ impl GuardPage {
         switch.set_subtitle(SWITCH_SUBTITLE);
         control_group.add(&switch);
         page.add(&control_group);
+
+        let notify_group = adw::PreferencesGroup::new();
+        notify_group.set_title("Notifications");
+        notify_group.set_description(Some(
+            "Saved to your config; the running guard applies them without a restart",
+        ));
+        let notify_switch = adw::SwitchRow::new();
+        notify_switch.set_title("Notify when an app is paused or slowed");
+        notify_switch.set_subtitle(NOTIFY_SUBTITLE);
+        notify_group.add(&notify_switch);
+        let pressure_switch = adw::SwitchRow::new();
+        pressure_switch.set_title("Warn when memory runs low");
+        pressure_switch.set_subtitle(PRESSURE_SUBTITLE);
+        notify_group.add(&pressure_switch);
+        page.add(&notify_group);
 
         let status_group = adw::PreferencesGroup::new();
         status_group.set_title("Status");
@@ -485,6 +524,8 @@ impl GuardPage {
         let this = Rc::new(Self {
             widget: page.upcast(),
             switch,
+            notify_switch,
+            pressure_switch,
             service_row,
             config_row,
             config_icon,
@@ -502,6 +543,24 @@ impl GuardPage {
             if let Some(page) = weak.upgrade() {
                 page.refresh();
             }
+        });
+
+        let pressure = this.pressure_switch.clone();
+        this.notify_switch.connect_active_notify(move |row| {
+            if SYNCING_SWITCH.with(Cell::get) {
+                return;
+            }
+            let on = row.is_active();
+            if toggle_notify_flag(row, NOTIFY_SUBTITLE, |g| g.notify = on) {
+                pressure.set_sensitive(on);
+            }
+        });
+        this.pressure_switch.connect_active_notify(move |row| {
+            if SYNCING_SWITCH.with(Cell::get) {
+                return;
+            }
+            let on = row.is_active();
+            toggle_notify_flag(row, PRESSURE_SUBTITLE, |g| g.notify_pressure = on);
         });
 
         let weak = Rc::downgrade(&this);
@@ -551,6 +610,7 @@ impl GuardPage {
 
     fn apply(&self, view: &GuardView) {
         self.sync_switch(view);
+        self.sync_notify(view);
 
         self.service_row.set_subtitle(&view.service);
         match &view.config {
@@ -599,6 +659,27 @@ impl GuardPage {
         self.last.replace(Some(view.clone()));
     }
 
+    /// Show the config's notification flags. Moving a switch here never
+    /// writes the config. With an invalid config both switches are
+    /// insensitive, since a toggle could not be saved.
+    fn sync_notify(&self, view: &GuardView) {
+        let Some((notify, pressure)) = view.notify else {
+            self.notify_switch.set_sensitive(false);
+            self.pressure_switch.set_sensitive(false);
+            return;
+        };
+        SYNCING_SWITCH.with(|f| f.set(true));
+        if self.notify_switch.is_active() != notify {
+            self.notify_switch.set_active(notify);
+        }
+        if self.pressure_switch.is_active() != pressure {
+            self.pressure_switch.set_active(pressure);
+        }
+        SYNCING_SWITCH.with(|f| f.set(false));
+        self.notify_switch.set_sensitive(true);
+        self.pressure_switch.set_sensitive(notify);
+    }
+
     fn sync_switch(&self, view: &GuardView) {
         let switch = &self.switch;
         if !switch.is_sensitive() {
@@ -627,6 +708,29 @@ impl GuardPage {
         };
         if switch.subtitle().as_deref() != Some(subtitle.as_str()) {
             switch.set_subtitle(&subtitle);
+        }
+    }
+}
+
+/// Save the flag `set` changes, after the user moved `row`. On failure the
+/// switch goes back and its subtitle shows the error; on success the
+/// subtitle goes back to `subtitle`. Returns whether it was saved.
+fn toggle_notify_flag(
+    row: &adw::SwitchRow,
+    subtitle: &str,
+    set: impl FnOnce(&mut GuardConfig),
+) -> bool {
+    match save_notify_flag(set) {
+        Ok(()) => {
+            row.set_subtitle(subtitle);
+            true
+        }
+        Err(e) => {
+            SYNCING_SWITCH.with(|f| f.set(true));
+            row.set_active(!row.is_active());
+            SYNCING_SWITCH.with(|f| f.set(false));
+            row.set_subtitle(&e);
+            false
         }
     }
 }
@@ -723,6 +827,7 @@ mod tests {
             0,
         );
         assert_eq!(v.config, Err("guard: bad".into()));
+        assert_eq!(v.notify, None, "no notification switches to show");
         assert!(v.protect.iter().all(|(_, src)| *src == "built-in"));
     }
 
@@ -873,6 +978,7 @@ mod tests {
             0,
         );
         assert_eq!(v.config, Ok(()));
+        assert_eq!(v.notify, Some((true, false)));
         assert_eq!(v.pressure_detail, pressure_line(&s));
         let bad = build_view(
             &svc("failed", "enabled"),
