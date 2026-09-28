@@ -22,12 +22,13 @@ rlm sets memory, CPU and I/O limits on your own Linux processes without root, fr
 - A freeze always ends after those 5 seconds; a cap is lifted after 30 seconds of calm.
 - It never sends a signal to any process.
 - It holds at most 3 apps at a time.
+- It shows a desktop notification when it pauses or slows an app, and clears it once the app is released.
 
 ### Not yet
 
 - Protecting the desktop session's own memory (a `memory.min` chain for the session).
 - Event-driven PSI triggers. The guard samples once per second.
-- Notifications with Resume or Keep paused actions. Today the guard can send a plain `notify-send` warning when pressure rises.
+- Resume or Keep paused buttons on the guard's notifications. Today they only say what the guard did.
 - A system-wide mode for other users or system services.
 
 ### What it is not
@@ -225,7 +226,7 @@ Launch with `rlm-gtk`. Pages:
 - **Limit Running**: limit running processes, either whole apps under one shared limit ("Whole app") or one process on its own ("Single process")
 - **Launch New**: start a command with limits
 - **Profiles**: the built-in presets and your own profiles; create, edit and delete profiles, and Restore an edited preset to its built-in limits
-- **Guard**: service state, pressure, active interventions and history
+- **Guard**: service state, pressure, active interventions and history, plus switches for the guard and its notifications
 
 The menu button in the sidebar opens Keyboard Shortcuts and About (version and license). Ctrl+1 to Ctrl+5 switch pages. Ctrl+Q quits. The GUI hides processes on the protect list; use the CLI with `--force` if you really need to limit one.
 
@@ -235,6 +236,7 @@ The menu button in the sidebar opens Keyboard Shortcuts and About (version and l
 rlm guard enable    # install the user unit if needed, enable and start the service
 rlm guard status    # service state, config, pressure, active interventions, recent history
 rlm guard test      # dry run: what it would do right now, without acting
+rlm guard test --notify  # preview the notifications (touches no app)
 rlm guard history   # recent freezes, thaws, caps, lifts and failures
 rlm guard disable   # stop and disable the service
 ```
@@ -259,10 +261,13 @@ guard:
     min_rss_mb: 200
     protect: []   # names here are added to the built-in protect list
   notify: true
+  notify_pressure: false
 ```
 
 - `enabled: false` turns off freezing and capping; rlm-guard still applies persistent rules.
-- `notify` sends a plain `notify-send` warning when pressure rises.
+- `notify` shows one desktop notification per app the guard acts on: "Firefox paused" after a freeze, replaced in place by "Firefox slowed down" if it is capped, and cleared on its own once the app is released. Nothing is sent when it is false. Without a session bus the guard falls back to `notify-send`, which cannot update or clear notifications.
+- `notify_pressure: true` also warns "Memory is running low", at most once a minute, while apps stall, memory is short and no app is held yet.
+- The running guard picks up `notify` and `notify_pressure` without a restart, so held apps stay held. The Notifications switches on the GUI Guard page change them for you. Any other change takes effect after `systemctl --user restart rlm-guard`.
 - Unknown keys and out-of-range values are errors. `calm_hold_secs` and `freeze_cooldown_secs` go up to 86400 (one day), `freeze_hold_secs` up to 60, `sample_interval_ms` from 100 to 60000, and `mem_available_floor_mb` and `min_rss_mb` up to 16777216 (16 TiB). With an invalid config, rlm-guard exits with status 78 and stays stopped until you fix the file, then run `systemctl --user restart rlm-guard`. `rlm guard status` shows the error.
 
 ### How the guard stays safe
@@ -286,7 +291,7 @@ Soft. A cap never goes below 90% of the app's current memory or below 256 MiB. O
 
 - `rlm guard status`: current state and the last few events
 - `rlm guard history`: the recorded history (`~/.local/state/rlm/guard-history.jsonl`)
-- The GUI Guard page, which also has a switch that runs `rlm guard enable` or `rlm guard disable`
+- The GUI Guard page, which also has a switch that runs `rlm guard enable` or `rlm guard disable`, and the notification switches
 - `journalctl --user -u rlm-guard` for the full log
 
 ## Configuration

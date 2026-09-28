@@ -3,8 +3,8 @@
 //! rlm rule cgroup) rather than moving it into an ephemeral `guard-<pid>`
 //! cgroup. Every action is best-effort and logged; a failure must never
 //! panic or otherwise crash the daemon loop. `apply` may return `Err` so the
-//! caller can log it, but a missing `notify-send` (or any other notification
-//! failure) is never treated as an error.
+//! caller can log it. Desktop notifications are not sent from here: the
+//! daemon loop hands each applied action to `guard::notify`.
 //!
 //! # Write-ahead journal
 //! Freeze/Cap always `journal.append` (which fsyncs) *before* touching the
@@ -68,12 +68,18 @@ use super::systemd::SystemdUser;
 use super::types::Action;
 use crate::CgroupManager;
 use common::Result;
-use std::process::Command;
 use std::time::Duration;
 
 /// Floor for any soft cap. A cap below this is effectively a freeze for a
 /// desktop app, so small cgroups are never squeezed further than this.
 pub const MIN_CAP_BYTES: u64 = 256 * 1024 * 1024;
+
+/// What a successful [`Effector::apply`] did, beyond "it worked".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Applied {
+    /// The `memory.high` a `Cap` wrote, in bytes. `None` for other actions.
+    pub cap_bytes: Option<u64>,
+}
 
 /// Hard deadline for every D-Bus call on the freeze-guard's storm path. On
 /// `Err` (including a timeout) callers fall back to raw cgroupfs writes.
@@ -104,18 +110,17 @@ impl<'a> Effector<'a> {
     }
 
     /// Apply a single action. Best-effort: returns `Err` only so the caller can
-    /// log it (a [`Action::Notify`] always returns `Ok`).
-    pub fn apply(&self, action: &Action) -> Result<()> {
+    /// log it. On success, [`Applied::cap_bytes`] holds the `memory.high` a
+    /// `Cap` wrote.
+    pub fn apply(&self, action: &Action) -> Result<Applied> {
+        let done = Applied { cap_bytes: None };
         match action {
-            Action::Freeze { res, name } => self.freeze(res, name),
-            Action::Thaw { res } => self.thaw(res),
-            Action::Cap { res, name } => self.cap(res, name),
-            Action::LiftCap { res } => self.lift_cap(res),
-            Action::Notify { message } => {
-                notify(message);
-                // Notification is always best-effort and never fails the caller.
-                Ok(())
-            }
+            Action::Freeze { res, name } => self.freeze(res, name).map(|()| done),
+            Action::Thaw { res } => self.thaw(res).map(|()| done),
+            Action::Cap { res, name } => self.cap(res, name).map(|bytes| Applied {
+                cap_bytes: Some(bytes),
+            }),
+            Action::LiftCap { res } => self.lift_cap(res).map(|()| done),
         }
     }
 
@@ -184,7 +189,8 @@ impl<'a> Effector<'a> {
         result
     }
 
-    fn cap(&self, res: &Resolution, name: &str) -> Result<()> {
+    /// Returns the `memory.high` value written, in bytes.
+    fn cap(&self, res: &Resolution, name: &str) -> Result<u64> {
         // See `freeze`'s matching comment (Promoted Minor A): a `0` inode
         // sentinel here would make this Cap permanently unrestorable while
         // looking like a real guard, so fail closed instead of
@@ -255,12 +261,9 @@ impl<'a> Effector<'a> {
             cgroup = %res.cgroup, name, our_high = %our_high, anon_reclaimable = anon_ok,
             "soft-capping cgroup"
         );
-        let result = cgfs::write_high(&res.cgroup, &our_high);
-
-        if result.is_ok() {
-            self.reconcile_our_high(&entry);
-        }
-        result
+        cgfs::write_high(&res.cgroup, &our_high)?;
+        self.reconcile_our_high(&entry);
+        Ok(our_bytes)
     }
 
     /// After a successful `Cap` write, read `memory.high` back; if what's
@@ -574,27 +577,6 @@ fn page_size() -> u64 {
 /// becomes permanent.
 fn page_align_down(bytes: u64, page: u64) -> u64 {
     bytes.checked_div(page).map_or(bytes, |q| q * page)
-}
-
-/// Best-effort desktop notification via `notify-send`. Silently does nothing if
-/// the binary is missing or the spawn fails; notifications must never break the
-/// guard.
-fn notify(message: &str) {
-    match Command::new("notify-send")
-        .arg("rlm-guard")
-        .arg(message)
-        .spawn()
-    {
-        Ok(mut child) => {
-            // Reap asynchronously so we don't block; ignore any wait error.
-            std::thread::spawn(move || {
-                let _ = child.wait();
-            });
-        }
-        Err(e) => {
-            tracing::debug!(error = %e, "notify-send unavailable; skipping notification");
-        }
-    }
 }
 
 #[cfg(test)]

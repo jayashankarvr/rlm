@@ -102,7 +102,12 @@ pub struct GuardConfig {
     pub trigger: GuardTrigger,
     pub timing: GuardTiming,
     pub selection: GuardSelection,
+    /// Send desktop notifications at all. When on, the guard shows one
+    /// notification per app it pauses or slows down, and clears it when the
+    /// app is released.
     pub notify: bool,
+    /// Also warn once a minute while memory is running low and no app is held.
+    pub notify_pressure: bool,
 }
 
 impl Default for GuardConfig {
@@ -113,6 +118,7 @@ impl Default for GuardConfig {
             timing: GuardTiming::default(),
             selection: GuardSelection::default(),
             notify: true,
+            notify_pressure: false,
         }
     }
 }
@@ -504,7 +510,8 @@ impl Config {
         Ok(())
     }
 
-    fn user_config_path() -> Option<PathBuf> {
+    /// Path of the per-user config file, `~/.config/rlm/config.yaml`.
+    pub fn user_config_path() -> Option<PathBuf> {
         dirs::config_dir().map(|d| d.join("rlm").join("config.yaml"))
     }
 
@@ -707,10 +714,20 @@ mod tests {
 
     #[test]
     fn readme_guard_example_parses_and_validates() {
-        let yaml = "guard:\n  enabled: true\n  trigger:   { psi_some_warn: 10, psi_some_high: 30, psi_full_critical: 10, mem_available_floor_mb: 400 }\n  timing:    { freeze_hold_secs: 5, calm_hold_secs: 30, freeze_cooldown_secs: 60, sample_interval_ms: 1000 }\n  selection: { min_rss_mb: 200, protect: [] }\n  notify: true\n";
+        let yaml = "guard:\n  enabled: true\n  trigger:   { psi_some_warn: 10, psi_some_high: 30, psi_full_critical: 10, mem_available_floor_mb: 400 }\n  timing:    { freeze_hold_secs: 5, calm_hold_secs: 30, freeze_cooldown_secs: 60, sample_interval_ms: 1000 }\n  selection: { min_rss_mb: 200, protect: [] }\n  notify: true\n  notify_pressure: false\n";
         let cfg: Config = serde_yaml_ng::from_str(yaml).unwrap();
         cfg.guard.validate().unwrap();
         assert_eq!(cfg.guard.trigger.act_below_available_pct, 20);
+    }
+
+    #[test]
+    fn notify_pressure_is_off_by_default_and_accepted() {
+        assert!(GuardConfig::default().notify);
+        assert!(!GuardConfig::default().notify_pressure);
+        let cfg: Config = serde_yaml_ng::from_str("guard:\n  notify_pressure: true\n").unwrap();
+        cfg.guard.validate().unwrap();
+        assert!(cfg.guard.notify_pressure);
+        assert!(cfg.guard.notify, "other keys keep their defaults");
     }
 
     #[test]

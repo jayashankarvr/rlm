@@ -7,15 +7,19 @@
 
 use common::Config;
 use rlm_core::guard::history;
+use rlm_core::guard::notify::{
+    flags_after_reload, memory_state, AppNames, DesktopSink, Memory, Notifier,
+};
 use rlm_core::guard::sampler::{live_cgroups, strip_cgroup_root, targets_from_procs};
 use rlm_core::guard::{
     cgfs, try_journal_path, Effector, Journal, PolicyEngine, Sampler, SystemdUser,
 };
 use rlm_core::rules::RulesEnforcer;
 use rlm_core::CgroupManager;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 /// Exit status for an invalid config. Matches `RestartPreventExitStatus` in
 /// the shipped unit, so systemd does not restart-loop against a file that
@@ -30,6 +34,25 @@ const EX_LOCKED: i32 = 75;
 /// How often persistent rules are reconciled. New matching processes are
 /// absorbed within this delay.
 const RULES_INTERVAL_MS: u64 = 5_000;
+
+/// Longest wait at shutdown for the last notifications to go out.
+const NOTIFY_FLUSH: Duration = Duration::from_secs(1);
+
+/// The config files whose change reloads the notification settings.
+fn config_files() -> Vec<PathBuf> {
+    let mut files = vec![PathBuf::from("/etc/rlm/config.yaml")];
+    files.extend(Config::user_config_path());
+    files
+}
+
+/// Modification times of `files` (`None` for a missing one): a cheap stat
+/// the loop compares every tick.
+fn config_stamp(files: &[PathBuf]) -> Vec<Option<SystemTime>> {
+    files
+        .iter()
+        .map(|f| std::fs::metadata(f).and_then(|m| m.modified()).ok())
+        .collect()
+}
 
 /// What one tick reads from `/proc`.
 #[derive(Debug, PartialEq, Eq)]
@@ -253,6 +276,14 @@ fn run(config: Config) -> common::Result<()> {
         let _ = ctrlc::set_handler(move || s.store(true, Ordering::SeqCst));
     }
 
+    // Desktop notifications about what the guard did. Only `guard.notify`
+    // and `guard.notify_pressure` are re-read when the config file changes;
+    // every other setting needs a restart, which would release held apps.
+    let mut notifier = Notifier::new(DesktopSink::spawn(), &gcfg);
+    let mut names = AppNames::in_background();
+    let cfg_files = config_files();
+    let mut cfg_stamp = config_stamp(&cfg_files);
+
     let interval = Duration::from_millis(gcfg.timing.sample_interval_ms.max(100));
     let start = Instant::now();
     let mut warned_no_psi = false;
@@ -292,6 +323,7 @@ fn run(config: Config) -> common::Result<()> {
             Vec::new()
         };
 
+        let mut memory = Memory::Unknown;
         match (&effector, sample) {
             (Some(effector), Some(sample)) if gcfg.enabled => {
                 let procs = if wants {
@@ -302,10 +334,12 @@ fn run(config: Config) -> common::Result<()> {
                 let targets = targets_from_procs(&procs, &cgfs::current_bytes);
                 let live = live_cgroups(&engine.intervened_cgroups());
                 for action in engine.tick(now_ms, sample, &targets, &live) {
-                    let result = effector.apply(&action).map_err(|e| e.to_string());
+                    let outcome = effector.apply(&action);
+                    let result = outcome.as_ref().map(|_| ()).map_err(|e| e.to_string());
                     if let Err(e) = &result {
                         tracing::warn!(?action, "action failed: {e}");
                     }
+                    notifier.record(&action, outcome.ok());
                     let event = history::event_for(&action, &result, history::unix_now());
                     if let (Some(hist), Some(ev)) = (&hist, event) {
                         if let Err(e) = history::append(hist, &ev) {
@@ -313,12 +347,22 @@ fn run(config: Config) -> common::Result<()> {
                         }
                     }
                 }
+                memory = memory_state(engine.level(), &sample, &gcfg.trigger);
             }
             _ if guard_on && !warned_no_psi => {
                 tracing::warn!("memory PSI unavailable; guard cannot act");
                 warned_no_psi = true;
             }
             _ => {}
+        }
+        notifier.end_tick(now_ms, memory, &mut |key, cg| names.name(key, cg));
+
+        // After this tick's actions, so reading a just-saved config never
+        // delays a freeze.
+        let stamp = config_stamp(&cfg_files);
+        if stamp != cfg_stamp {
+            cfg_stamp = stamp;
+            reload_notify_flags(&mut notifier);
         }
 
         // Persistent application rules, every RULES_INTERVAL_MS: absorbs
@@ -339,7 +383,31 @@ fn run(config: Config) -> common::Result<()> {
             tracing::warn!("undo_all failed: {e}");
         }
     }
+    notifier.close_all();
+    notifier.sink().flush(NOTIFY_FLUSH);
     Ok(())
+}
+
+/// The config file changed on disk: apply its notification settings, and
+/// nothing else. An invalid file keeps the current ones.
+fn reload_notify_flags(notifier: &mut Notifier<DesktopSink>) {
+    let current = notifier.flags();
+    let loaded = Config::load_validated();
+    let flags = flags_after_reload(current, loaded.as_ref().map(|c| &c.guard));
+    match &loaded {
+        Err(e) => {
+            tracing::warn!("config changed but is invalid ({e}); keeping notification settings")
+        }
+        Ok(_) if flags != current => {
+            tracing::info!(
+                notify = flags.notify,
+                notify_pressure = flags.pressure,
+                "config changed; applied new notification settings"
+            );
+            notifier.set_flags(flags);
+        }
+        Ok(_) => {}
+    }
 }
 
 /// Sleep up to `total`, waking early if shutdown is requested.

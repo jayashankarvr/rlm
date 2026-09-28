@@ -82,8 +82,6 @@ pub struct Target {
 /// process in that cgroup.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
-    /// Best-effort user notification.
-    Notify { message: String },
     /// Pause the resolved cgroup (cgroup.freeze), the circuit breaker.
     /// `name` is the app the cgroup belongs to.
     Freeze { res: Resolution, name: String },
