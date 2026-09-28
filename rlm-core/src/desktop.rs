@@ -1,7 +1,8 @@
 use common::Result;
+use std::collections::HashMap;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Desktop application entry
 #[derive(Clone)]
@@ -11,37 +12,107 @@ pub struct DesktopApp {
     pub is_cli: bool,
 }
 
-/// List installed applications from .desktop files
-pub fn list_applications() -> Result<Vec<DesktopApp>> {
-    let mut apps = Vec::new();
-    let dirs = [
+/// Directories searched for `.desktop` files: the system ones, then the
+/// user's own.
+fn desktop_dirs() -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = [
         "/usr/share/applications",
         "/usr/local/share/applications",
         "/var/lib/flatpak/exports/share/applications",
-    ];
+    ]
+    .iter()
+    .map(PathBuf::from)
+    .collect();
+    dirs.extend(dirs::data_dir().map(|d| d.join("applications")));
+    dirs
+}
 
-    // Also check user's local applications
-    let home_apps = dirs::data_dir().map(|d| d.join("applications"));
-
-    for dir in dirs.iter().map(Path::new).chain(home_apps.as_deref()) {
-        if let Ok(entries) = fs::read_dir(dir) {
+/// Every shown application entry in [`desktop_dirs`].
+fn desktop_entries() -> Vec<Entry> {
+    let mut out = Vec::new();
+    for dir in desktop_dirs() {
+        if let Ok(entries) = fs::read_dir(&dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
                 if path.extension().is_some_and(|e| e == "desktop") {
-                    if let Some(app) = parse_desktop_file(&path) {
-                        apps.push(app);
+                    if let Some(e) = read_entry(&path) {
+                        out.push(e);
                     }
                 }
             }
         }
     }
+    out
+}
 
+/// List installed applications from .desktop files
+pub fn list_applications() -> Result<Vec<DesktopApp>> {
+    let mut apps: Vec<DesktopApp> = desktop_entries()
+        .into_iter()
+        .filter_map(|e| {
+            Some(DesktopApp {
+                exec: exec_command(&e.exec)?,
+                name: e.name,
+                is_cli: false,
+            })
+        })
+        .collect();
     apps.sort_by_key(|a| a.name.to_lowercase());
     apps.dedup_by(|a, b| a.name == b.name);
     Ok(apps)
 }
 
-fn parse_desktop_file(path: &Path) -> Option<DesktopApp> {
+/// Installed application names keyed by the basename of the program their
+/// `Exec` runs (`firefox` to `Firefox`). When several entries run the same
+/// program, the shortest name wins.
+pub fn names_by_program() -> HashMap<String, String> {
+    let mut names: HashMap<String, String> = HashMap::new();
+    for e in desktop_entries() {
+        let Some(program) = exec_program(&e.exec) else {
+            continue;
+        };
+        let better = names
+            .get(&program)
+            .is_none_or(|old| (e.name.len(), &e.name) < (old.len(), old));
+        if better {
+            names.insert(program, e.name);
+        }
+    }
+    names
+}
+
+/// The basename of the program a raw desktop file `Exec` value runs, looking
+/// past an `env VAR=value` wrapper. `None` if there is none.
+pub fn exec_program(value: &str) -> Option<String> {
+    let args = split_exec(&unescape_value(value))?;
+    let mut args = args.into_iter().filter_map(expand_field_codes);
+    let mut program = args.next()?;
+    if program == "env" {
+        program = loop {
+            let arg = args.next()?;
+            match arg.as_str() {
+                "-u" | "--unset" | "-C" | "--chdir" => {
+                    args.next();
+                }
+                "--" => break args.next()?,
+                a if a.starts_with('-') || a.contains('=') => {}
+                _ => break arg,
+            }
+        };
+    }
+    let base = program.rsplit('/').next().unwrap_or(&program);
+    (!base.is_empty()).then(|| base.to_string())
+}
+
+/// A shown application entry: its `Name` and raw `Exec` value.
+struct Entry {
+    name: String,
+    exec: String,
+}
+
+/// Read the `[Desktop Entry]` group of one file. `None` for a hidden entry,
+/// a non-application, or one without a usable `Name` and `Exec`.
+fn read_entry(path: &Path) -> Option<Entry> {
     let content = fs::read_to_string(path).ok()?;
     let mut name = None;
     let mut exec = None;
@@ -60,10 +131,14 @@ fn parse_desktop_file(path: &Path) -> Option<DesktopApp> {
             continue;
         }
 
-        if line.starts_with("Name=") && name.is_none() {
-            name = Some(line[5..].to_string());
-        } else if line.starts_with("Exec=") && exec.is_none() {
-            exec = exec_command(&line[5..]);
+        if let Some(value) = line.strip_prefix("Name=") {
+            if name.is_none() {
+                name = Some(value.to_string());
+            }
+        } else if let Some(value) = line.strip_prefix("Exec=") {
+            if exec.is_none() && exec_command(value).is_some() {
+                exec = Some(value.to_string());
+            }
         } else if line == "NoDisplay=true" || line == "Hidden=true" {
             no_display = true;
         } else if line.starts_with("Type=") && line != "Type=Application" {
@@ -75,10 +150,9 @@ fn parse_desktop_file(path: &Path) -> Option<DesktopApp> {
         return None;
     }
 
-    Some(DesktopApp {
+    Some(Entry {
         name: name?,
         exec: exec?,
-        is_cli: false,
     })
 }
 
@@ -351,5 +425,25 @@ mod tests {
         assert_eq!(exec_command("   "), None);
         assert_eq!(exec_command("env A=1"), None);
         assert_eq!(exec_command(r#"app "open"#), None);
+    }
+
+    #[test]
+    fn exec_program_is_the_basename_past_env() {
+        assert_eq!(exec_program("firefox %u").as_deref(), Some("firefox"));
+        assert_eq!(
+            exec_program("/usr/bin/google-chrome-stable %U").as_deref(),
+            Some("google-chrome-stable")
+        );
+        assert_eq!(
+            exec_program(r#""/opt/My App/app" --flag"#).as_deref(),
+            Some("app")
+        );
+        assert_eq!(
+            exec_program("env FOO=1 -u X /snap/bin/code --new-window").as_deref(),
+            Some("code")
+        );
+        assert_eq!(exec_program("env -i -- app").as_deref(), Some("app"));
+        assert_eq!(exec_program("env A=1"), None);
+        assert_eq!(exec_program("%U"), None);
     }
 }

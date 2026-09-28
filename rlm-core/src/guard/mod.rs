@@ -10,6 +10,7 @@ pub mod effector;
 pub mod history;
 pub mod journal;
 pub mod lock;
+pub mod notify;
 pub mod policy;
 pub mod report;
 pub mod resolve;
@@ -18,7 +19,7 @@ pub mod service;
 pub mod systemd;
 pub mod types;
 
-pub use effector::Effector;
+pub use effector::{Applied, Effector};
 pub use journal::Journal;
 pub use policy::PolicyEngine;
 pub use sampler::Sampler;

@@ -91,16 +91,14 @@ fn unit_or_leaf(res: &Resolution) -> String {
     })
 }
 
-/// Turn an applied [`Action`] and its result into a [`HistoryEvent`], if the
-/// action is one worth recording. `Notify` is best-effort UI noise, not an
-/// intervention, so it never produces an event.
+/// Turn an applied [`Action`] and its result into a [`HistoryEvent`]. Every
+/// action is an intervention worth recording, so this is always `Some`.
 pub fn event_for(
     action: &Action,
     result: &std::result::Result<(), String>,
     ts: u64,
 ) -> Option<HistoryEvent> {
     let (kind, app, cgroup, detail, verb) = match action {
-        Action::Notify { .. } => return None,
         Action::Freeze { res, name } => (
             HistoryKind::Freeze,
             name.clone(),
@@ -270,14 +268,6 @@ mod tests {
         .unwrap();
         assert_eq!(e.kind, HistoryKind::Failed);
         assert!(e.detail.contains("EBUSY"));
-        assert!(event_for(
-            &Action::Notify {
-                message: "x".into()
-            },
-            &Ok(()),
-            13
-        )
-        .is_none());
     }
 
     #[test]

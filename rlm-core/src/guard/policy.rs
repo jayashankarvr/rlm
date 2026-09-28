@@ -16,8 +16,6 @@ use common::GuardConfig;
 /// PSI `full` avg10 (%) that, on its own, forces at least the High level. Mirrors
 /// the design doc's "or `full.avg10 >= 3`" High trigger.
 const FULL_HIGH_RISE: f64 = 3.0;
-/// Rate-limit window for `Notify` actions (ms): at most one notification a minute.
-const NOTIFY_INTERVAL_MS: u64 = 60_000;
 
 /// Escalation gate (ms) after an action that only partly covered its app.
 /// PSI avg10 is a 10 s average, so re-measuring after 1 s still sees the old
@@ -75,7 +73,7 @@ struct Growth {
 
 /// Self-healing circuit-breaker policy engine.
 ///
-/// On a memory spike it drives the ladder *notify, freeze (short), auto-thaw,
+/// On a memory spike it drives the ladder *freeze (short), auto-thaw,
 /// if still high a soft cap, once calm is sustained a lift*, never issuing a kill. All
 /// of that lives in [`tick`](Self::tick); the struct just holds the state needed
 /// to make decisions stable across ticks (hysteresis, cooldowns, growth).
@@ -104,9 +102,6 @@ pub struct PolicyEngine {
     /// When true the gate is shortened to [`PARTIAL_GATE_MS`] (capped at the
     /// freeze hold) so the guard can re-assess sooner, but never instantly.
     last_action_partial: bool,
-    /// When we last emitted a `Notify`; drives notification rate-limiting.
-    /// `None` means "never notified", so the first eligible notify fires.
-    last_notify_ms: Option<u64>,
     /// Consecutive ticks on which selection deferred for lack of growth
     /// data. Bounded by [`MAX_COLD_DEFER_TICKS`].
     cold_defer_ticks: u32,
@@ -123,7 +118,6 @@ impl PolicyEngine {
             calm_since_ms: None,
             last_action_ms: None,
             last_action_partial: false,
-            last_notify_ms: None,
             cold_defer_ticks: 0,
         }
     }
@@ -228,7 +222,6 @@ impl PolicyEngine {
         // 6. Escalate, but only when apps feel pressure, memory is actually
         //    short (see `is_scarce`), the gate is open, and fewer than
         //    MAX_HELD_APPS apps are already held.
-        let mut victim_name: Option<String> = None;
         if matches!(self.level, Level::High | Level::Critical)
             && is_scarce(&sample, &self.cfg.trigger)
             && self.held_apps().len() < MAX_HELD_APPS
@@ -285,29 +278,8 @@ impl PolicyEngine {
                     }
                     self.last_action_ms = Some(now_ms);
                     self.last_action_partial = partial;
-                    victim_name = Some(app);
                 }
             }
-        }
-
-        // 7. Notify (rate-limited) while there's anything to report.
-        let notify_due = match self.last_notify_ms {
-            None => true,
-            Some(last) => now_ms.saturating_sub(last) >= NOTIFY_INTERVAL_MS,
-        };
-        if self.cfg.notify
-            && matches!(self.level, Level::Warn | Level::High | Level::Critical)
-            && notify_due
-        {
-            let message = match &victim_name {
-                Some(name) => format!(
-                    "rlm-guard: memory pressure {:?}, acting on {}",
-                    self.level, name
-                ),
-                None => format!("rlm-guard: memory pressure {:?}", self.level),
-            };
-            actions.push(Action::Notify { message });
-            self.last_notify_ms = Some(now_ms);
         }
 
         actions
@@ -1044,41 +1016,6 @@ mod tests {
         let a = e.tick(0, sample(0.0, 0.0, 100), &procs, &live_from(&procs));
         assert_eq!(e.level, Level::Critical);
         assert_eq!(freeze_targets(&a), vec!["/app.slice/app-hog-2.scope"]);
-    }
-
-    #[test]
-    fn notify_emitted_and_rate_limited() {
-        let mut e = PolicyEngine::new(cfg());
-        let procs = vec![proc(2, "hog", 4000)];
-
-        // Warn level: some>=10 but below high; just notify, no freeze.
-        let a0 = e.tick(0, sample(12.0, 0.0, 8000), &procs, &live_from(&procs));
-        assert!(
-            a0.iter().any(|x| matches!(x, Action::Notify { .. })),
-            "expected a notify at Warn: {a0:?}"
-        );
-        assert!(freeze_targets(&a0).is_empty());
-
-        // Within 60s: no second notify.
-        let a1 = e.tick(30_000, sample(12.0, 0.0, 8000), &procs, &live_from(&procs));
-        assert!(
-            !a1.iter().any(|x| matches!(x, Action::Notify { .. })),
-            "notify should be rate-limited: {a1:?}"
-        );
-
-        // After 60s: notify again.
-        let a2 = e.tick(60_000, sample(12.0, 0.0, 8000), &procs, &live_from(&procs));
-        assert!(a2.iter().any(|x| matches!(x, Action::Notify { .. })));
-    }
-
-    #[test]
-    fn notify_disabled_suppresses_notifications() {
-        let mut c = cfg();
-        c.notify = false;
-        let mut e = PolicyEngine::new(c);
-        let procs = vec![proc(2, "hog", 4000)];
-        let a = e.tick(0, sample(12.0, 0.0, 8000), &procs, &live_from(&procs));
-        assert!(!a.iter().any(|x| matches!(x, Action::Notify { .. })));
     }
 
     // ---- Task 5 new behaviors --------------------------------------------
