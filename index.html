@@ -1,0 +1,289 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rlm: resource limits for your own Linux apps</title>
+<meta name="description" content="rlm sets memory, CPU and I/O limits on your own Linux processes without root, and can freeze or cap a runaway app under memory pressure instead of letting it lock up the desktop.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=Instrument+Sans:wght@400;600&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg: #eef2f6;
+  --surface: #ffffff;
+  --ink: #172033;
+  --muted: #5a6478;
+  --line: #d3dae4;
+  --app: #3f7f8c;
+  --app-2: #6f9aa6;
+  --app-3: #9db8c1;
+  --limit: #d9a21b;
+  --limit-ink: #7a5600;
+  --code-bg: #172033;
+  --code-ink: #e6ecf4;
+  --focus: #2f6fd6;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #111a28;
+    --surface: #182436;
+    --ink: #e4eaf2;
+    --muted: #9aa6ba;
+    --line: #2a3a52;
+    --app: #5fa3b1;
+    --app-2: #467f8c;
+    --app-3: #33606b;
+    --limit: #e8b534;
+    --limit-ink: #f2cf72;
+    --code-bg: #0c1420;
+    --code-ink: #dbe4ef;
+    --focus: #7fb0ff;
+  }
+}
+* { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font: 400 1.0625rem/1.6 "Instrument Sans", system-ui, sans-serif;
+}
+main { max-width: 44rem; margin: 0 auto; padding: 0 1.25rem 4rem; }
+a { color: inherit; text-decoration-thickness: 1px; text-underline-offset: 3px; }
+a:hover { text-decoration-thickness: 2px; }
+:focus-visible { outline: 3px solid var(--focus); outline-offset: 3px; border-radius: 4px; }
+
+header.site {
+  max-width: 44rem; margin: 0 auto; padding: 1.25rem;
+  display: flex; justify-content: space-between; align-items: baseline;
+}
+.wordmark { font: 700 1.35rem/1 "Bricolage Grotesque", sans-serif; letter-spacing: -0.02em; text-decoration: none; }
+header.site nav a { color: var(--muted); margin-left: 1.25rem; font-size: 0.95rem; text-decoration: none; }
+header.site nav a:hover { color: var(--ink); }
+
+h1, h2 { font-family: "Bricolage Grotesque", sans-serif; letter-spacing: -0.02em; line-height: 1.1; }
+h1 { font-size: clamp(2.2rem, 6vw, 3.4rem); font-weight: 700; margin: 2.5rem 0 1rem; max-width: 16ch; }
+h2 { font-size: 1.75rem; font-weight: 700; margin: 4rem 0 1rem; }
+h3 { font-size: 1.05rem; font-weight: 600; margin: 1.75rem 0 0.4rem; }
+p { margin: 0 0 1rem; }
+.lede { font-size: 1.2rem; color: var(--muted); max-width: 36rem; }
+
+/* The memory bar: the page's one moving part. */
+.meter { margin: 2.5rem 0 0.75rem; }
+.bar {
+  position: relative; display: flex; height: 3.25rem;
+  background: var(--surface); border: 1px solid var(--line); border-radius: 8px; overflow: hidden;
+}
+.seg { height: 100%; border-right: 2px solid var(--surface); }
+.seg.a { width: 18%; background: var(--app-3); }
+.seg.b { width: 14%; background: var(--app-2); }
+.seg.c { width: 10%; background: var(--app-3); }
+.seg.run {
+  width: 22%; background: var(--app);
+  animation: grow 5.5s cubic-bezier(.3,.1,.2,1) 0.6s both;
+}
+.cap {
+  position: absolute; top: -6px; bottom: -6px; left: calc(18% + 14% + 10% + 30%);
+  width: 3px; background: var(--limit);
+}
+.meter-legend { display: flex; justify-content: space-between; gap: 1rem; font-size: 0.9rem; color: var(--muted); }
+.meter-legend .limit-note { color: var(--limit-ink); font-weight: 600; }
+@keyframes grow {
+  0%   { width: 8%;  background: var(--app); }
+  70%  { width: 30%; background: var(--app); }
+  78%  { width: 30%; background: var(--limit); }
+  100% { width: 30%; background: var(--limit); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .seg.run { animation: none; width: 30%; background: var(--limit); }
+}
+
+.facts { list-style: none; padding: 0; margin: 0; }
+.facts li { padding: 0.9rem 0; border-top: 1px solid var(--line); }
+.facts li:last-child { border-bottom: 1px solid var(--line); }
+.facts strong { display: block; font-weight: 600; }
+.facts span { color: var(--muted); }
+
+code { font-family: "JetBrains Mono", ui-monospace, monospace; font-size: 0.9em; }
+p code, li code { background: var(--surface); border: 1px solid var(--line); border-radius: 4px; padding: 0.05em 0.3em; }
+pre code { background: none; border: 0; padding: 0; color: inherit; font-size: inherit; }
+
+/* Install: tabs per distribution, numbered steps only where order matters. */
+.tabs { display: flex; flex-wrap: wrap; gap: 0.25rem; border-bottom: 1px solid var(--line); margin: 1.5rem 0 0; }
+.tabs button {
+  font: 600 0.95rem "Instrument Sans", sans-serif; color: var(--muted);
+  background: none; border: 0; border-bottom: 3px solid transparent;
+  padding: 0.6rem 0.9rem; cursor: pointer; margin-bottom: -1px;
+}
+.tabs button[aria-selected="true"] { color: var(--ink); border-bottom-color: var(--limit); }
+.panel { padding: 1.25rem 0 0; }
+.panel[hidden] { display: none; }
+ol.steps { list-style: none; counter-reset: step; padding: 0; margin: 0; }
+ol.steps > li { counter-increment: step; position: relative; padding-left: 2.25rem; margin-bottom: 1.25rem; }
+ol.steps > li::before {
+  content: counter(step); position: absolute; left: 0; top: 0.05rem;
+  width: 1.5rem; height: 1.5rem; border-radius: 50%;
+  border: 2px solid var(--limit); color: var(--limit-ink);
+  font: 600 0.8rem/1.3rem "Instrument Sans", sans-serif; text-align: center;
+}
+.cmd { position: relative; margin: 0.5rem 0 0; }
+pre {
+  margin: 0; padding: 2.4rem 1rem 0.9rem; overflow-x: auto;
+  background: var(--code-bg); color: var(--code-ink); border-radius: 8px;
+  color-scheme: dark;
+  font: 400 0.85rem/1.55 "JetBrains Mono", ui-monospace, monospace;
+}
+.copy {
+  position: absolute; top: 0.5rem; right: 0.5rem;
+  font: 600 0.75rem "Instrument Sans", sans-serif;
+  color: var(--code-ink); background: rgba(255,255,255,0.08);
+  border: 1px solid rgba(255,255,255,0.2); border-radius: 6px; padding: 0.3rem 0.55rem; cursor: pointer;
+}
+.copy:hover { background: rgba(255,255,255,0.16); }
+.note { font-size: 0.95rem; color: var(--muted); margin-top: 1rem; }
+.fingerprint { font-family: "JetBrains Mono", monospace; font-size: 0.8rem; word-spacing: 0.15em; }
+
+.guard-rules { padding-left: 1.2rem; }
+.guard-rules li { margin-bottom: 0.4rem; }
+
+footer { max-width: 44rem; margin: 0 auto; padding: 2rem 1.25rem 3rem; color: var(--muted); font-size: 0.9rem; border-top: 1px solid var(--line); }
+footer a { margin-right: 1.25rem; }
+
+@media (max-width: 34rem) {
+  header.site nav a:first-child { display: none; }
+  .meter-legend { flex-direction: column; gap: 0.1rem; }
+}
+</style>
+</head>
+<body>
+<header class="site">
+  <a class="wordmark" href="./">rlm</a>
+  <nav>
+    <a href="#install">Install</a>
+    <a href="#guard">Guard</a>
+    <a href="https://github.com/jayashankarvr/rlm">GitHub</a>
+  </nav>
+</header>
+
+<main>
+  <h1>Keep one app from taking the whole machine</h1>
+  <p class="lede">rlm sets memory, CPU and I/O limits on your own Linux processes, without root. Its optional guard freezes or caps a runaway app under memory pressure, instead of letting the desktop lock up.</p>
+
+  <figure class="meter" aria-label="Illustration: several apps share memory; one keeps growing until it reaches its limit and stops there.">
+    <div class="bar" aria-hidden="true">
+      <div class="seg a"></div><div class="seg b"></div><div class="seg c"></div><div class="seg run"></div>
+      <div class="cap"></div>
+    </div>
+    <figcaption class="meter-legend">
+      <span>Your other apps keep their memory</span>
+      <span class="limit-note">The runaway one stops at its limit</span>
+    </figcaption>
+  </figure>
+
+  <h2>What it does</h2>
+  <ul class="facts">
+    <li><strong>Start a program with limits</strong><span><code>rlm run --memory 2G --cpu 200% -- cargo build</code> runs the build with at most 2 GB of memory and two cores.</span></li>
+    <li><strong>Limit something already running</strong><span>By PID, by name, or a whole application with every process in one shared limit.</span></li>
+    <li><strong>Profiles and rules</strong><span>Save named sets of limits, or a rule that applies to an app every time it starts.</span></li>
+    <li><strong>A desktop app too</strong><span>rlm-gtk does the same from a GTK window: pick an app, set limits, apply.</span></li>
+  </ul>
+  <p class="note">rlm uses cgroup v2 through systemd's per-user delegation, so it only ever touches your own processes.</p>
+
+  <h2 id="install">Install</h2>
+  <div class="tabs" role="tablist" aria-label="Choose your system">
+    <button role="tab" id="t-apt" aria-controls="p-apt" aria-selected="true">Ubuntu and Debian</button>
+    <button role="tab" id="t-rpm" aria-controls="p-rpm" aria-selected="false" tabindex="-1">Fedora</button>
+    <button role="tab" id="t-cargo" aria-controls="p-cargo" aria-selected="false" tabindex="-1">Any distro (cargo)</button>
+  </div>
+
+  <section class="panel" id="p-apt" role="tabpanel" aria-labelledby="t-apt">
+    <ol class="steps">
+      <li>Add the signing key
+        <div class="cmd"><pre><code>sudo install -d -m 0755 /etc/apt/keyrings
+curl -fsSL https://jayashankarvr.github.io/rlm/rlm-archive-keyring.gpg | sudo tee /etc/apt/keyrings/rlm.gpg &gt;/dev/null</code></pre></div>
+      </li>
+      <li>Add the repository
+        <div class="cmd"><pre><code>echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/rlm.gpg] https://jayashankarvr.github.io/rlm stable main" | sudo tee /etc/apt/sources.list.d/rlm.list</code></pre></div>
+      </li>
+      <li>Install
+        <div class="cmd"><pre><code>sudo apt update
+sudo apt install rlm rlm-gtk</code></pre></div>
+      </li>
+    </ol>
+    <p class="note">The desktop app, rlm-gtk, needs Ubuntu 24.04 or Debian 13 or newer; rlm alone works from Ubuntu 22.04 and Debian 12. Updates arrive with <code>apt upgrade</code>. Log out and back in once after the first install.</p>
+    <p class="note">Key fingerprint: <span class="fingerprint">C7E1 E11F ED31 3EDB 9A60 9BD7 41F3 0081 BB8A BEC2</span></p>
+  </section>
+
+  <section class="panel" id="p-rpm" role="tabpanel" aria-labelledby="t-rpm" hidden>
+    <p>Download the .rpm files from the <a href="https://github.com/jayashankarvr/rlm/releases/latest">latest release</a>, then:</p>
+    <div class="cmd"><pre><code>sudo dnf install ./rlm-0*.rpm ./rlm-gtk-0*.rpm</code></pre></div>
+    <p class="note">rlm-gtk needs Fedora 40 or newer. Log out and back in once after installing.</p>
+  </section>
+
+  <section class="panel" id="p-cargo" role="tabpanel" aria-labelledby="t-cargo" hidden>
+    <p>With Rust 1.87 or newer:</p>
+    <div class="cmd"><pre><code>cargo install rlmctl</code></pre></div>
+    <p class="note">This installs <code>rlm</code> and <code>rlm-guard</code>. Run <code>rlm doctor</code> to check that your system delegates the cgroup controllers rlm needs. The desktop app comes with the distribution packages.</p>
+  </section>
+
+  <h2 id="guard">The guard</h2>
+  <p>When memory runs short, Linux usually freezes the whole desktop for minutes and then kills something. rlm-guard steps in earlier and more gently.</p>
+  <ul class="guard-rules">
+    <li>It acts when apps stall on memory and free memory is below 20%, or at once below 400 MB.</li>
+    <li>It freezes the app that is growing for 5 seconds, then caps it with a soft limit if pressure stays high.</li>
+    <li>A cap is lifted after 30 seconds of calm. It never sends a signal to any process.</li>
+    <li>Your desktop, shells, terminals and audio are never frozen, and it holds at most 3 apps at a time.</li>
+  </ul>
+  <p>Turn it on with <code>rlm guard enable</code>, or with the switch on the Guard page of the desktop app. See what it did with <code>rlm guard history</code>.</p>
+
+  <h2>Learn more</h2>
+  <p>The <a href="https://github.com/jayashankarvr/rlm#readme">README</a> covers every command, the config file and how the guard stays safe. Questions and bugs go to <a href="https://github.com/jayashankarvr/rlm/issues">GitHub issues</a>.</p>
+</main>
+
+<footer>
+  <a href="https://github.com/jayashankarvr/rlm">Source</a>
+  <a href="https://github.com/jayashankarvr/rlm/releases">Releases</a>
+  <a href="https://crates.io/crates/rlmctl">crates.io</a>
+  <p>Apache-2.0. Made by Jayashankar.</p>
+</footer>
+
+<script>
+  // Tabs: arrow keys move between them, as with any tab list.
+  const tabs = [...document.querySelectorAll('[role="tab"]')];
+  function select(tab) {
+    for (const t of tabs) {
+      const on = t === tab;
+      t.setAttribute('aria-selected', on);
+      t.tabIndex = on ? 0 : -1;
+      document.getElementById(t.getAttribute('aria-controls')).hidden = !on;
+    }
+    tab.focus();
+  }
+  tabs.forEach((t, i) => {
+    t.addEventListener('click', () => select(t));
+    t.addEventListener('keydown', e => {
+      const d = e.key === 'ArrowRight' ? 1 : e.key === 'ArrowLeft' ? -1 : 0;
+      if (d) { e.preventDefault(); select(tabs[(i + d + tabs.length) % tabs.length]); }
+    });
+  });
+  // Copy buttons on every command block.
+  for (const block of document.querySelectorAll('.cmd')) {
+    const btn = document.createElement('button');
+    btn.className = 'copy';
+    btn.type = 'button';
+    btn.textContent = 'Copy';
+    btn.addEventListener('click', async () => {
+      try {
+        await navigator.clipboard.writeText(block.querySelector('code').innerText);
+        btn.textContent = 'Copied';
+      } catch {
+        btn.textContent = 'Select and copy';
+      }
+      setTimeout(() => (btn.textContent = 'Copy'), 1800);
+    });
+    block.appendChild(btn);
+  }
+</script>
+</body>
+</html>
