@@ -577,17 +577,36 @@ fn sender(rx: mpsc::Receiver<Cmd>) {
     }
 }
 
+/// Connect to the session bus, giving up after [`CALL_TIMEOUT`] so a
+/// wedged bus cannot stall the sender; `None` means use `notify-send`.
 fn connect() -> Option<zbus::blocking::Connection> {
-    let conn = zbus::blocking::connection::Builder::session()
-        .map(|b| b.method_timeout(CALL_TIMEOUT))
-        .and_then(|b| b.build());
-    match conn {
-        Ok(c) => Some(c),
-        Err(e) => {
-            tracing::debug!(error = %e, "no session bus; notifications use notify-send");
-            None
-        }
+    let conn = within(CALL_TIMEOUT, || {
+        zbus::blocking::connection::Builder::session()
+            .map(|b| b.method_timeout(CALL_TIMEOUT))
+            .and_then(|b| b.build())
+            .map_err(|e| tracing::debug!(error = %e, "cannot connect to the session bus"))
+            .ok()
+    });
+    if conn.is_none() {
+        tracing::debug!("no session bus; notifications use notify-send");
     }
+    conn
+}
+
+/// Run `f` on a helper thread and wait at most `timeout` for it. On timeout
+/// the thread is left to finish on its own and its result is dropped.
+fn within<T: Send + 'static>(
+    timeout: Duration,
+    f: impl FnOnce() -> Option<T> + Send + 'static,
+) -> Option<T> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::Builder::new()
+        .name("rlm-notify-connect".into())
+        .spawn(move || {
+            let _ = tx.send(f());
+        })
+        .ok()?;
+    rx.recv_timeout(timeout).ok().flatten()
 }
 
 fn dbus_notify(
@@ -969,6 +988,18 @@ mod tests {
         );
         let err = common::Error::Config("bad".into());
         assert_eq!(flags_after_reload(current, Err(&err)), current);
+    }
+
+    #[test]
+    fn a_slow_connect_gives_up() {
+        let start = std::time::Instant::now();
+        let got = within(Duration::from_millis(50), || {
+            std::thread::sleep(Duration::from_secs(5));
+            Some(1)
+        });
+        assert_eq!(got, None);
+        assert!(start.elapsed() < Duration::from_secs(2));
+        assert_eq!(within(Duration::from_secs(2), || Some(7)), Some(7));
     }
 
     #[test]
