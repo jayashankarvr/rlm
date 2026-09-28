@@ -1,20 +1,20 @@
 Architectures: amd64
 Codename: stable
 Components: main
-Date: Sun, 27 Sep 2026 21:13:47 +0000
+Date: Mon, 28 Sep 2026 05:03:53 +0000
 Description: rlm: resource limits for your own processes
 Label: rlm
 Origin: rlm
 Suite: stable
 MD5Sum:
- 01e4408163ea5e517d9a5c77d67898f4            18677 main/binary-amd64/Packages
- bfe1f9e67702b7ce12d43b69556dd643             7562 main/binary-amd64/Packages.gz
+ 15b693078a73f12f60019ed17d74a220            38304 main/binary-amd64/Packages
+ 2a01d3fd00f65d13ba93a595e66a56ee             8668 main/binary-amd64/Packages.gz
 SHA1:
- 570f2056d14b47c5d20165a7f304a48f48f4964a            18677 main/binary-amd64/Packages
- d46eec5eb49fb95efca2a50d936accc1e8a41d88             7562 main/binary-amd64/Packages.gz
+ 10a3aa6b34de2e1ee71b2cc49991580c47483576            38304 main/binary-amd64/Packages
+ ca89bb2bf8ea0aafd525a0d7bd7b853dbfe484d5             8668 main/binary-amd64/Packages.gz
 SHA256:
- 9547e40ab46772a663c719c7bb2092250b367a8a8ad112a6a93936ee19b66ace            18677 main/binary-amd64/Packages
- 859d5441cd0abdedc9e96b230e2c02631ad900949dc5525c396386488e7e011a             7562 main/binary-amd64/Packages.gz
+ 7083573145af050ae08c3295b718c35094d5b34c668d3000ed4019aa1a7de2f9            38304 main/binary-amd64/Packages
+ 3c752f52f18e35719477da2c4d9ca78fce41e54ebd271d7379faf40418992800             8668 main/binary-amd64/Packages.gz
 SHA512:
- b63f950483cd36147005daeb246b5765ac213841eeada26b615f7f2ec9ed1b7cfc444c473a076f5103785ad2c4723ac3161621cc69dc579d832cd5e62936e7da            18677 main/binary-amd64/Packages
- bf087d5c35cfab5b94a26f59ba26870b98307a665a825085df08dbfbb6c210763b446699d427f1ff047066342bd28c783a221cdd22ad88e1981f87895bcadfbc             7562 main/binary-amd64/Packages.gz
+ ccb1046d5d93360cb06694e346c0b2a48ba0e362969577fe5fcc725c9264acaa23897ca298c39b9317a1da3db04a7c8bcfcf7710a56af27f91cdf2eac78f41d8            38304 main/binary-amd64/Packages
+ 3840666d876c9771214a1aec965bbeaa20d1c7be1e908039ec2fbf68818381bdec50981b5ba606d6cdc98ec4d62679892a10124b0fc0fc47be94bbc4eb6288c8             8668 main/binary-amd64/Packages.gz
