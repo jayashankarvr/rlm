@@ -20,7 +20,7 @@ use common::GuardConfig;
 use std::collections::{HashMap, HashSet};
 use std::process::Command;
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Icon and desktop entry the notifications carry (the GTK app's).
 pub const APP_ID: &str = "io.github.rlm.gtk";
@@ -462,8 +462,9 @@ enum Cmd {
 /// freedesktop Notifications D-Bus API on the session bus (`Notify` with
 /// `replaces_id` to update in place, `CloseNotification` to clear). The
 /// thread keeps the server's notification id per key. Without a session
-/// bus it falls back to `notify-send`, which can neither update nor close.
-/// Requests never block the caller: they are queued, and dropped when the
+/// bus it falls back to `notify-send`, which can neither update nor close,
+/// and tries the bus again after 30 s; a connection that breaks is dropped
+/// and rebuilt on the next request. Requests never block the caller: they are queued, and dropped when the
 /// queue is full. Every failure is logged at debug and otherwise ignored.
 pub struct DesktopSink {
     tx: Option<mpsc::SyncSender<Cmd>>,
@@ -526,43 +527,187 @@ impl NotifySink for DesktopSink {
     }
 }
 
-/// The sender thread: owns the bus connection and the id of each shown
-/// notification.
+/// The sender thread: hands every request to a [`Sender`] over the real
+/// session bus.
 fn sender(rx: mpsc::Receiver<Cmd>) {
-    let mut conn: Option<Option<zbus::blocking::Connection>> = None;
-    let mut ids: HashMap<String, u32> = HashMap::new();
+    let mut sender = Sender::new(SessionBus);
     for cmd in rx {
+        sender.handle(cmd, Instant::now());
+    }
+}
+
+/// How long a failed connect is remembered before the next request tries
+/// again. Requests in between use `notify-send`.
+const RECONNECT_AFTER: Duration = Duration::from_secs(30);
+
+/// Why a call to the notification server failed.
+#[derive(Debug)]
+enum BusError {
+    /// The connection or the server is gone: reconnect, and forget the ids.
+    Gone(String),
+    /// Only this call failed (for example it timed out).
+    Call(String),
+}
+
+/// One live connection to the notification server.
+trait Bus {
+    fn notify(&self, replaces_id: u32, title: &str, body: &str) -> Result<u32, BusError>;
+    fn close(&self, id: u32) -> Result<(), BusError>;
+}
+
+/// Makes [`Bus`] connections, and sends without one.
+trait Connector {
+    type Bus: Bus;
+    fn connect(&mut self) -> Option<Self::Bus>;
+    /// Show a notification without a bus (it cannot be updated or closed).
+    fn fallback(&mut self, title: &str, body: &str);
+}
+
+/// The sender's state: the connection (or when to retry one) and the
+/// server's id for each shown notification.
+struct Sender<C: Connector> {
+    connector: C,
+    bus: Option<C::Bus>,
+    /// After a failed connect: no new attempt before this instant.
+    retry_at: Option<Instant>,
+    ids: HashMap<String, u32>,
+}
+
+impl<C: Connector> Sender<C> {
+    fn new(connector: C) -> Self {
+        Self {
+            connector,
+            bus: None,
+            retry_at: None,
+            ids: HashMap::new(),
+        }
+    }
+
+    /// Connect if there is no connection and the retry delay has passed.
+    fn ensure_bus(&mut self, now: Instant) {
+        if self.bus.is_some() || self.retry_at.is_some_and(|t| now < t) {
+            return;
+        }
+        self.bus = self.connector.connect();
+        self.retry_at = if self.bus.is_none() {
+            Some(now + RECONNECT_AFTER)
+        } else {
+            None
+        };
+    }
+
+    /// Drop a connection that is gone. The ids belonged to it (or to a
+    /// server that is gone), so they are forgotten too.
+    fn reset(&mut self, why: &str) {
+        tracing::debug!(error = why, "notification connection lost; reconnecting");
+        self.bus = None;
+        self.retry_at = None;
+        self.ids.clear();
+    }
+
+    fn handle(&mut self, cmd: Cmd, now: Instant) {
         if let Cmd::Flush(done) = cmd {
             let _ = done.send(());
-            continue;
+            return;
         }
-        let conn = conn.get_or_insert_with(connect).as_ref();
-        match (cmd, conn) {
-            (Cmd::Show { key, title, body }, Some(c)) => {
-                let replaces = ids.get(&key).copied().unwrap_or(0);
-                match dbus_notify(c, replaces, &title, &body, EXPIRE_TIMEOUT) {
+        self.ensure_bus(now);
+        match cmd {
+            Cmd::Show { key, title, body } => {
+                let Some(bus) = &self.bus else {
+                    self.connector.fallback(&title, &body);
+                    return;
+                };
+                let replaces = self.ids.get(&key).copied().unwrap_or(0);
+                match bus.notify(replaces, &title, &body) {
                     Ok(id) => {
-                        ids.insert(key, id);
+                        self.ids.insert(key, id);
                     }
-                    Err(e) => tracing::debug!(error = %e, "Notify failed"),
+                    Err(BusError::Gone(e)) => {
+                        self.reset(&e);
+                        // Show it anyway, on a new connection if one comes up.
+                        self.ensure_bus(now);
+                        match &self.bus {
+                            Some(bus) => match bus.notify(0, &title, &body) {
+                                Ok(id) => {
+                                    self.ids.insert(key, id);
+                                }
+                                Err(e) => tracing::debug!(error = ?e, "Notify failed"),
+                            },
+                            None => self.connector.fallback(&title, &body),
+                        }
+                    }
+                    Err(BusError::Call(e)) => tracing::debug!(error = e, "Notify failed"),
                 }
             }
-            (Cmd::Show { title, body, .. }, None) => notify_send(&title, &body),
-            (Cmd::Close { key }, Some(c)) => {
-                if let Some(id) = ids.remove(&key) {
-                    if let Err(e) = c.call_method(
-                        Some(NOTIFY_DEST),
-                        NOTIFY_PATH,
-                        Some(NOTIFY_DEST),
-                        "CloseNotification",
-                        &(id,),
-                    ) {
-                        tracing::debug!(error = %e, "CloseNotification failed");
+            Cmd::Close { key } => {
+                let (Some(bus), Some(id)) = (&self.bus, self.ids.remove(&key)) else {
+                    return;
+                };
+                match bus.close(id) {
+                    Ok(()) => {}
+                    Err(BusError::Gone(e)) => self.reset(&e),
+                    Err(BusError::Call(e)) => {
+                        tracing::debug!(error = e, "CloseNotification failed")
                     }
                 }
             }
-            (Cmd::Close { .. }, None) | (Cmd::Flush(_), _) => {}
+            Cmd::Flush(_) => {}
         }
+    }
+}
+
+/// The real [`Connector`]: the session bus, with `notify-send` as fallback.
+struct SessionBus;
+
+impl Connector for SessionBus {
+    type Bus = zbus::blocking::Connection;
+
+    fn connect(&mut self) -> Option<Self::Bus> {
+        connect()
+    }
+
+    fn fallback(&mut self, title: &str, body: &str) {
+        notify_send(title, body);
+    }
+}
+
+impl Bus for zbus::blocking::Connection {
+    fn notify(&self, replaces_id: u32, title: &str, body: &str) -> Result<u32, BusError> {
+        dbus_notify(self, replaces_id, title, body, EXPIRE_TIMEOUT).map_err(classify)
+    }
+
+    fn close(&self, id: u32) -> Result<(), BusError> {
+        self.call_method(
+            Some(NOTIFY_DEST),
+            NOTIFY_PATH,
+            Some(NOTIFY_DEST),
+            "CloseNotification",
+            &(id,),
+        )
+        .map(|_| ())
+        .map_err(classify)
+    }
+}
+
+/// Sort a zbus error: an I/O failure other than a timeout means the
+/// connection is broken, and a missing or disconnected service means the
+/// notification server went away; both are [`BusError::Gone`]. Anything
+/// else, including a call that timed out, fails only that call.
+fn classify(e: zbus::Error) -> BusError {
+    let gone = match &e {
+        zbus::Error::InputOutput(io) => io.kind() != std::io::ErrorKind::TimedOut,
+        zbus::Error::MethodError(name, _, _) => matches!(
+            name.as_str(),
+            "org.freedesktop.DBus.Error.ServiceUnknown"
+                | "org.freedesktop.DBus.Error.Disconnected"
+                | "org.freedesktop.DBus.Error.NoServer"
+        ),
+        _ => false,
+    };
+    if gone {
+        BusError::Gone(e.to_string())
+    } else {
+        BusError::Call(e.to_string())
     }
 }
 
@@ -973,6 +1118,195 @@ mod tests {
         );
         let err = common::Error::Config("bad".into());
         assert_eq!(flags_after_reload(current, Err(&err)), current);
+    }
+
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
+
+    /// What the fake bus and connector saw, shared with the test.
+    #[derive(Default)]
+    struct Log {
+        calls: RefCell<Vec<String>>,
+        /// Answers for the next connect attempts; `true` connects. Empty
+        /// means connect.
+        connects: RefCell<Vec<bool>>,
+        /// When set, the next bus call fails with this.
+        fail_next: RefCell<Option<BusError>>,
+        next_id: Cell<u32>,
+    }
+
+    struct FakeBus(Rc<Log>, u32);
+
+    impl Bus for FakeBus {
+        fn notify(&self, replaces_id: u32, title: &str, _body: &str) -> Result<u32, BusError> {
+            if let Some(e) = self.0.fail_next.borrow_mut().take() {
+                return Err(e);
+            }
+            let id = if replaces_id == 0 {
+                self.0.next_id.set(self.0.next_id.get() + 1);
+                self.0.next_id.get()
+            } else {
+                replaces_id
+            };
+            self.0
+                .calls
+                .borrow_mut()
+                .push(format!("conn{} notify {replaces_id}->{id} {title}", self.1));
+            Ok(id)
+        }
+
+        fn close(&self, id: u32) -> Result<(), BusError> {
+            if let Some(e) = self.0.fail_next.borrow_mut().take() {
+                return Err(e);
+            }
+            self.0
+                .calls
+                .borrow_mut()
+                .push(format!("conn{} close {id}", self.1));
+            Ok(())
+        }
+    }
+
+    struct FakeConnector(Rc<Log>, u32);
+
+    impl Connector for FakeConnector {
+        type Bus = FakeBus;
+
+        fn connect(&mut self) -> Option<FakeBus> {
+            let ok = {
+                let mut answers = self.0.connects.borrow_mut();
+                if answers.is_empty() {
+                    true
+                } else {
+                    answers.remove(0)
+                }
+            };
+            self.0
+                .calls
+                .borrow_mut()
+                .push(format!("connect {}", if ok { "ok" } else { "failed" }));
+            ok.then(|| {
+                self.1 += 1;
+                FakeBus(Rc::clone(&self.0), self.1)
+            })
+        }
+
+        fn fallback(&mut self, title: &str, _body: &str) {
+            self.0
+                .calls
+                .borrow_mut()
+                .push(format!("notify-send {title}"));
+        }
+    }
+
+    fn show(key: &str, title: &str) -> Cmd {
+        Cmd::Show {
+            key: key.into(),
+            title: title.into(),
+            body: String::new(),
+        }
+    }
+
+    fn sender_with(log: &Rc<Log>) -> Sender<FakeConnector> {
+        Sender::new(FakeConnector(Rc::clone(log), 0))
+    }
+
+    fn take(log: &Log) -> Vec<String> {
+        std::mem::take(&mut *log.calls.borrow_mut())
+    }
+
+    #[test]
+    fn a_failed_connect_is_retried_after_the_backoff() {
+        let log = Rc::new(Log::default());
+        log.connects.borrow_mut().push(false);
+        let mut s = sender_with(&log);
+        let t0 = Instant::now();
+        s.handle(show("a", "A paused"), t0);
+        s.handle(show("a", "A slowed"), t0 + Duration::from_secs(10));
+        assert_eq!(
+            take(&log),
+            [
+                "connect failed",
+                "notify-send A paused",
+                "notify-send A slowed"
+            ],
+            "no new attempt during the backoff"
+        );
+        s.handle(show("a", "A slowed"), t0 + RECONNECT_AFTER);
+        s.handle(show("a", "A slowed again"), t0 + RECONNECT_AFTER);
+        s.handle(
+            Cmd::Close { key: "a".into() },
+            t0 + RECONNECT_AFTER + Duration::from_secs(1),
+        );
+        assert_eq!(
+            take(&log),
+            [
+                "connect ok",
+                "conn1 notify 0->1 A slowed",
+                "conn1 notify 1->1 A slowed again",
+                "conn1 close 1"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_broken_connection_is_dropped_and_rebuilt() {
+        let log = Rc::new(Log::default());
+        let mut s = sender_with(&log);
+        let t0 = Instant::now();
+        s.handle(show("a", "A paused"), t0);
+        take(&log);
+        *log.fail_next.borrow_mut() = Some(BusError::Gone("broken pipe".into()));
+        s.handle(show("a", "A slowed"), t0);
+        assert_eq!(
+            take(&log),
+            ["connect ok", "conn2 notify 0->2 A slowed"],
+            "reconnects and shows it as a new notification"
+        );
+        *log.fail_next.borrow_mut() = Some(BusError::Gone("gone".into()));
+        s.handle(Cmd::Close { key: "a".into() }, t0);
+        s.handle(show("b", "B paused"), t0);
+        assert_eq!(
+            take(&log),
+            ["connect ok", "conn3 notify 0->3 B paused"],
+            "a failed close also resets"
+        );
+    }
+
+    #[test]
+    fn a_timed_out_call_keeps_the_connection() {
+        let log = Rc::new(Log::default());
+        let mut s = sender_with(&log);
+        let t0 = Instant::now();
+        s.handle(show("a", "A paused"), t0);
+        *log.fail_next.borrow_mut() = Some(BusError::Call("timed out".into()));
+        s.handle(show("a", "A slowed"), t0);
+        s.handle(show("a", "A slowed"), t0);
+        assert_eq!(
+            take(&log),
+            [
+                "connect ok",
+                "conn1 notify 0->1 A paused",
+                "conn1 notify 1->1 A slowed"
+            ]
+        );
+    }
+
+    #[test]
+    fn io_errors_other_than_timeouts_mean_the_connection_is_gone() {
+        let io = |kind| zbus::Error::InputOutput(std::sync::Arc::new(std::io::Error::from(kind)));
+        assert!(matches!(
+            classify(io(std::io::ErrorKind::BrokenPipe)),
+            BusError::Gone(_)
+        ));
+        assert!(matches!(
+            classify(io(std::io::ErrorKind::TimedOut)),
+            BusError::Call(_)
+        ));
+        assert!(matches!(
+            classify(zbus::Error::InvalidReply),
+            BusError::Call(_)
+        ));
     }
 
     #[test]
