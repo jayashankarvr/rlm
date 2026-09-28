@@ -14,7 +14,7 @@
     <text x="20" y="256">Service:&#160;&#160;running&#160;(starts&#160;at&#160;login)</text>
     <text x="20" y="278">Config:&#160;&#160;&#160;ok</text>
     <text x="20" y="300">Pressure:&#160;app.slice:&#160;some&#160;0.4%&#160;full&#160;0.0%,&#160;9120&#160;MB&#160;of&#160;15890&#160;MB&#160;available&#160;(57%)</text>
-    <text x="20" y="322">Policy:&#160;&#160;&#160;acts&#160;when&#160;pressure&#160;is&#160;high&#160;and&#160;available&#160;memory&#160;is&#160;below&#160;20%&#160;or&#160;400&#160;MB</text>
+    <text x="20" y="322">Policy:&#160;&#160;&#160;steps&#160;in&#160;when&#160;apps&#160;stall&#160;and&#160;available&#160;memory&#160;is&#160;below&#160;20%,&#160;or&#160;at&#160;once&#160;below&#160;400&#160;MB</text>
     <text x="20" y="344">Interventions:&#160;none</text>
     <text x="20" y="366">History:</text>
     <text x="20" y="388" fill="#9399b2">&#160;&#160;&#160;&#160;12m&#160;ago&#160;&#160;cap&#160;&#160;&#160;&#160;&#160;python3&#160;&#160;set&#160;a&#160;soft&#160;limit&#160;(memory.high)</text>
