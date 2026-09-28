@@ -111,7 +111,7 @@ pub fn create(manager: Option<Arc<CgroupManager>>) -> gtk::Widget {
     // The group description and the hint under Target explain the modes.
 
     // Order matches mode_for_index.
-    let mode_list = gtk::StringList::new(&["Whole app (shared limit)", "Single process"]);
+    let mode_list = gtk::StringList::new(&["Whole app", "Single process"]);
     mode_row.set_model(Some(&mode_list));
     mode_row.set_selected(0);
     mode_group.add(&mode_row);
