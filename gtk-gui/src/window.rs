@@ -154,18 +154,19 @@ impl Window {
         let about = adw::AboutWindow::builder()
             .transient_for(self)
             .modal(true)
+            .default_width(560)
             .application_name("Resource Limit Manager")
             .application_icon("io.github.rlm.gtk")
-            .developer_name("Jayashankar")
-            .version(env!("CARGO_PKG_VERSION"))
+            .developer_name("Jayashankar R")
+            .version(format!("Version {}", env!("CARGO_PKG_VERSION")))
             .comments(
                 "Set memory, CPU and I/O limits on your own processes with cgroups, and \
                  optionally let a guard freeze or cap a runaway app under memory pressure.",
             )
-            .website("https://github.com/jayashankarvr/rlm")
+            .website("https://jayashankarvr.github.io/rlm/")
             .issue_url("https://github.com/jayashankarvr/rlm/issues")
             .license_type(gtk::License::Apache20)
-            .copyright("© 2025-2026 Jayashankar")
+            .copyright("© 2025-2026 Jayashankar R")
             .build();
         about.present();
     }
@@ -294,7 +295,7 @@ impl Window {
         // Create split view
         let split_view = adw::NavigationSplitView::new();
 
-        let sidebar_page = adw::NavigationPage::new(&sidebar_toolbar, "RLM");
+        let sidebar_page = adw::NavigationPage::new(&sidebar_toolbar, "rlm");
 
         split_view.set_sidebar(Some(&sidebar_page));
         split_view.set_content(Some(&content_page));

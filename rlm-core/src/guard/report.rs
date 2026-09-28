@@ -31,7 +31,7 @@ pub fn pressure_line(s: &Sample) -> String {
 /// One line describing when the guard acts, from its configured trigger.
 pub fn trigger_line(t: &GuardTrigger) -> String {
     format!(
-        "acts when pressure is high and available memory is below {}% or {} MB",
+        "steps in when apps stall and available memory is below {}%, or at once below {} MB",
         t.act_below_available_pct, t.mem_available_floor_mb
     )
 }
@@ -119,7 +119,7 @@ mod tests {
         );
         assert_eq!(
             trigger_line(&common::GuardTrigger::default()),
-            "acts when pressure is high and available memory is below 20% or 400 MB"
+            "steps in when apps stall and available memory is below 20%, or at once below 400 MB"
         );
     }
 

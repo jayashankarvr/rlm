@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.4] - 2026-09-28
+
+### Changed
+
+- `rlm guard status` states when the guard acts in the same words as the desktop app: it steps in when apps stall and available memory is below 20%, or at once below 400 MB.
+- Desktop app: the sidebar shows the name as rlm, the Limit Mode options are Whole app and Single process, and the About window is wider, shows "Version" before the number and links to the project website.
+
+### Fixed
+
+- Desktop app: the selected Limit Mode could be cut off at the default window width.
+
 ## [0.2.3] - 2026-09-28
 
 A pass over the GUI for people who are not cgroup experts.

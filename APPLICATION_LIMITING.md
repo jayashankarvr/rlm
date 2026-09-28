@@ -204,7 +204,7 @@ Limiting by `--name`, `--application` or `--all-pids` asks for confirmation when
 
 The Limit Running page has two modes:
 
-- **Whole app (shared limit)**, the default, groups processes by executable. You
+- **Whole app**, the default, groups processes by executable. You
   select whole apps with each row's Select button; every process of the selected
   apps goes into one cgroup under one shared limit, like `--application`. Expanding
   a row lists its processes for reference, but those child rows cannot be selected
