@@ -374,7 +374,13 @@ enum GuardAction {
     /// Disable and stop the guard user service
     Disable,
     /// Dry-run: print what the guard would do right now, without acting
-    Test,
+    Test {
+        /// Instead, show sample notifications ("paused", then "slowed down",
+        /// then cleared) to preview how the guard's notifications look.
+        /// Touches no cgroup and not the guard.
+        #[arg(long)]
+        notify: bool,
+    },
     /// Show recent guard interventions (freeze, thaw, cap, lift, and failures)
     History {
         /// Number of most recent entries to show
@@ -932,7 +938,8 @@ fn run_guard(action: GuardAction) -> Result<ExitCode> {
         GuardAction::Enable => guard_enable(),
         GuardAction::Disable => systemctl(&["disable", "--now", "rlm-guard"]),
         GuardAction::Status => Ok(guard_status()),
-        GuardAction::Test => Ok(guard_test()),
+        GuardAction::Test { notify: false } => Ok(guard_test()),
+        GuardAction::Test { notify: true } => Ok(guard_test_notify()),
         GuardAction::History { lines } => {
             guard_history(lines);
             Ok(ExitCode::SUCCESS)
@@ -1202,6 +1209,80 @@ fn guard_test() -> ExitCode {
         for a in &actions {
             println!("  {a:?}");
         }
+    }
+    ExitCode::SUCCESS
+}
+
+/// Prints each notification as it is handed to the desktop.
+struct PrintingSink(rlm_core::guard::notify::DesktopSink);
+
+impl rlm_core::guard::notify::NotifySink for PrintingSink {
+    fn show(&mut self, key: &str, title: &str, body: &str) {
+        println!("shown:  {title}\n        {body}");
+        self.0.show(key, title, body);
+    }
+
+    fn close(&mut self, key: &str) {
+        println!("closed: the {key} notification");
+        self.0.close(key);
+    }
+}
+
+/// `rlm guard test --notify`: drive the guard's own notifier through a
+/// sample freeze, cap and release of "firefox", so the user sees exactly
+/// what the guard would show. Nothing is frozen or capped: the actions are
+/// fed to the notifier as if the effector had applied them.
+fn guard_test_notify() -> ExitCode {
+    use rlm_core::guard::notify::{AppNames, DesktopSink, Notifier};
+    use rlm_core::guard::resolve::{Coverage, Mechanism, Resolution, Verdict};
+    use rlm_core::guard::{Action, Applied};
+
+    const STEP: std::time::Duration = std::time::Duration::from_secs(3);
+    // Show the look even when notifications are off in the config.
+    let mut guard = Config::load_validated()
+        .map(|c| c.guard)
+        .unwrap_or_default();
+    guard.notify = true;
+    let mut notifier = Notifier::new(PrintingSink(DesktopSink::spawn()), &guard);
+    let mut names = AppNames::new();
+    let mut name = |key: &str, cg: &str| names.name(key, cg);
+    let res = Resolution {
+        cgroup: "/rlm-notify-preview".into(),
+        unit: None,
+        verdict: Verdict::Freeze,
+        coverage: Coverage::Full,
+        mechanism: Mechanism::Raw,
+    };
+    let app = "firefox".to_string();
+    let done = Some(Applied { cap_bytes: None });
+
+    notifier.record(
+        &Action::Freeze {
+            res: res.clone(),
+            name: app.clone(),
+        },
+        done,
+    );
+    notifier.end_tick(0, None, &mut name);
+    std::thread::sleep(STEP);
+
+    notifier.record(&Action::Thaw { res: res.clone() }, done);
+    notifier.record(
+        &Action::Cap {
+            res: res.clone(),
+            name: app,
+        },
+        Some(Applied {
+            cap_bytes: Some(3_200_000_000),
+        }),
+    );
+    notifier.end_tick(STEP.as_millis() as u64, None, &mut name);
+    std::thread::sleep(STEP);
+
+    notifier.record(&Action::LiftCap { res }, done);
+    notifier.end_tick(2 * STEP.as_millis() as u64, None, &mut name);
+    if !notifier.sink().0.flush(std::time::Duration::from_secs(3)) {
+        eprintln!("warning: the notification server did not answer in time");
     }
     ExitCode::SUCCESS
 }
