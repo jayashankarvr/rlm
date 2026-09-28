@@ -477,7 +477,7 @@ rlm guard disable   <span class="c"># stop and disable the service</span></code>
       <h3 id="guard-safe">How it stays safe</h3>
       <details class="q">
         <summary>Can it kill my app?</summary>
-        <div>No. It only freezes the app's cgroup or sets a soft memory cap. It never sends a signal. The kernel's own out-of-memory handling is unchanged, so a hard limit you set yourself can still end a process.</div>
+        <div>No, the guard never kills anything. It only pauses the app for a few seconds, or slows it down with a soft memory cap, and it undoes both on its own. One separate case: a hard memory limit you set yourself with <code>rlm limit</code> or <code>rlm run</code> works like any memory limit on Linux, so an app that goes past it is ended by the system, not by the guard.</div>
       </details>
       <details class="q">
         <summary>What if the guard crashes while an app is frozen?</summary>
