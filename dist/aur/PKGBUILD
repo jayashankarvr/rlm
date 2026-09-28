@@ -9,7 +9,7 @@ url='https://github.com/jayashankarvr/rlm'
 license=(Apache-2.0)
 makedepends=(cargo gtk4 libadwaita)
 source=("$pkgbase-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('SKIP') # replaced at release time
+sha256sums=('b4409a18adb5112e22f4ae15f7bba6be2fd7eb778880ffec9a114667c9a4a5a3')
 
 prepare() {
   cd "$pkgbase-$pkgver"
