@@ -84,11 +84,7 @@ The `rlm` package ships `rlm`, `rlm-guard`, a systemd user unit for the guard an
 
 ### Arch Linux (AUR)
 
-The AUR packages are `rlm` and `rlm-gtk` (from 0.2.0 on):
-
-```bash
-yay -S rlm rlm-gtk
-```
+The AUR packages `rlm` and `rlm-gtk` are not published yet. The PKGBUILD is in `dist/aur/` if you want to build them yourself with `makepkg -si`.
 
 ### crates.io
 

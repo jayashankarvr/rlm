@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>rlm: resource limits for your own Linux apps</title>
 <meta name="description" content="rlm sets memory, CPU and I/O limits on your own Linux processes without root, and can freeze or cap a runaway app under memory pressure instead of letting it lock up the desktop.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23172033'/%3E%3Crect x='6' y='12' width='6' height='8' fill='%239db8c1'/%3E%3Crect x='13' y='12' width='5' height='8' fill='%236f9aa6'/%3E%3Crect x='19' y='12' width='5' height='8' fill='%23d9a21b'/%3E%3Crect x='25' y='9' width='2' height='14' fill='%23d9a21b'/%3E%3C/svg%3E">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=Instrument+Sans:wght@400;600&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
@@ -22,6 +23,7 @@
   --limit-ink: #7a5600;
   --code-bg: #172033;
   --code-ink: #e6ecf4;
+  --code-dim: #8fa0b8;
   --focus: #2f6fd6;
 }
 @media (prefers-color-scheme: dark) {
@@ -38,36 +40,55 @@
     --limit-ink: #f2cf72;
     --code-bg: #0c1420;
     --code-ink: #dbe4ef;
+    --code-dim: #7f8ea5;
     --focus: #7fb0ff;
   }
 }
 * { box-sizing: border-box; }
-html { -webkit-text-size-adjust: 100%; }
+html { -webkit-text-size-adjust: 100%; scroll-padding-top: 1.5rem; }
 body {
   margin: 0;
   background: var(--bg);
   color: var(--ink);
   font: 400 1.0625rem/1.6 "Instrument Sans", system-ui, sans-serif;
 }
-main { max-width: 44rem; margin: 0 auto; padding: 0 1.25rem 4rem; }
 a { color: inherit; text-decoration-thickness: 1px; text-underline-offset: 3px; }
 a:hover { text-decoration-thickness: 2px; }
 :focus-visible { outline: 3px solid var(--focus); outline-offset: 3px; border-radius: 4px; }
+.skip { position: absolute; left: -999px; }
+.skip:focus { left: 1rem; top: 1rem; background: var(--surface); padding: 0.5rem 0.8rem; z-index: 10; }
 
-header.site {
-  max-width: 44rem; margin: 0 auto; padding: 1.25rem;
-  display: flex; justify-content: space-between; align-items: baseline;
+/* Two columns: a sticky contents sidebar and the reading column. */
+.layout {
+  max-width: 72rem; margin: 0 auto; padding: 0 1.25rem;
+  display: grid; grid-template-columns: 14.5rem minmax(0, 1fr); gap: 3.5rem;
 }
-.wordmark { font: 700 1.35rem/1 "Bricolage Grotesque", sans-serif; letter-spacing: -0.02em; text-decoration: none; }
-header.site nav a { color: var(--muted); margin-left: 1.25rem; font-size: 0.95rem; text-decoration: none; }
-header.site nav a:hover { color: var(--ink); }
+.sidebar { position: sticky; top: 0; align-self: start; height: 100vh; overflow-y: auto; padding: 1.5rem 0 2rem; }
+.wordmark { display: inline-block; font: 700 1.5rem/1 "Bricolage Grotesque", sans-serif; letter-spacing: -0.02em; text-decoration: none; margin-bottom: 1.75rem; }
+.toc summary { display: none; }
+.toc ul { list-style: none; margin: 0; padding: 0; }
+.toc li ul { margin: 0.1rem 0 0.4rem; }
+.toc a {
+  display: block; padding: 0.3rem 0 0.3rem 0.85rem; border-left: 3px solid transparent;
+  color: var(--muted); text-decoration: none; font-size: 0.95rem; line-height: 1.35;
+}
+.toc li ul a { padding-left: 1.6rem; font-size: 0.88rem; }
+.toc a:hover { color: var(--ink); }
+.toc a[aria-current="true"] { color: var(--ink); border-left-color: var(--limit); font-weight: 600; }
+.side-links { margin-top: 1.75rem; padding-top: 1.25rem; border-top: 1px solid var(--line); font-size: 0.9rem; }
+.side-links a { display: block; color: var(--muted); padding: 0.2rem 0; text-decoration: none; }
+.side-links a:hover { color: var(--ink); }
 
-h1, h2 { font-family: "Bricolage Grotesque", sans-serif; letter-spacing: -0.02em; line-height: 1.1; }
-h1 { font-size: clamp(2.2rem, 6vw, 3.4rem); font-weight: 700; margin: 2.5rem 0 1rem; max-width: 16ch; }
-h2 { font-size: 1.75rem; font-weight: 700; margin: 4rem 0 1rem; }
-h3 { font-size: 1.05rem; font-weight: 600; margin: 1.75rem 0 0.4rem; }
+main { max-width: 46rem; padding: 1.5rem 0 4rem; }
+
+h1, h2, h3 { font-family: "Bricolage Grotesque", sans-serif; letter-spacing: -0.015em; line-height: 1.15; }
+h1 { font-size: clamp(2.2rem, 5.5vw, 3.3rem); font-weight: 700; margin: 2.25rem 0 1rem; max-width: 16ch; }
+h2 { font-size: 1.8rem; font-weight: 700; margin: 4.5rem 0 1rem; padding-top: 0.5rem; }
+h3 { font-size: 1.2rem; font-weight: 700; margin: 2.25rem 0 0.6rem; }
 p { margin: 0 0 1rem; }
 .lede { font-size: 1.2rem; color: var(--muted); max-width: 36rem; }
+ul.plain { padding-left: 1.2rem; }
+ul.plain li { margin-bottom: 0.45rem; }
 
 /* The memory bar: the page's one moving part. */
 .meter { margin: 2.5rem 0 0.75rem; }
@@ -79,37 +100,43 @@ p { margin: 0 0 1rem; }
 .seg.a { width: 18%; background: var(--app-3); }
 .seg.b { width: 14%; background: var(--app-2); }
 .seg.c { width: 10%; background: var(--app-3); }
-.seg.run {
-  width: 22%; background: var(--app);
-  animation: grow 5.5s cubic-bezier(.3,.1,.2,1) 0.6s both;
-}
-.cap {
-  position: absolute; top: -6px; bottom: -6px; left: calc(18% + 14% + 10% + 30%);
-  width: 3px; background: var(--limit);
-}
+.seg.run { width: 30%; background: var(--limit); animation: grow 5.5s cubic-bezier(.3,.1,.2,1) 0.6s both; }
+.cap { position: absolute; top: -6px; bottom: -6px; left: 72%; width: 3px; background: var(--limit); }
 .meter-legend { display: flex; justify-content: space-between; gap: 1rem; font-size: 0.9rem; color: var(--muted); }
 .meter-legend .limit-note { color: var(--limit-ink); font-weight: 600; }
 @keyframes grow {
   0%   { width: 8%;  background: var(--app); }
   70%  { width: 30%; background: var(--app); }
-  78%  { width: 30%; background: var(--limit); }
-  100% { width: 30%; background: var(--limit); }
+  78%, 100% { width: 30%; background: var(--limit); }
 }
-@media (prefers-reduced-motion: reduce) {
-  .seg.run { animation: none; width: 30%; background: var(--limit); }
-}
+@media (prefers-reduced-motion: reduce) { .seg.run { animation: none; } }
 
-.facts { list-style: none; padding: 0; margin: 0; }
-.facts li { padding: 0.9rem 0; border-top: 1px solid var(--line); }
+.facts { list-style: none; padding: 0; margin: 0 0 1rem; }
+.facts li { padding: 0.85rem 0; border-top: 1px solid var(--line); }
 .facts li:last-child { border-bottom: 1px solid var(--line); }
 .facts strong { display: block; font-weight: 600; }
 .facts span { color: var(--muted); }
 
-code { font-family: "JetBrains Mono", ui-monospace, monospace; font-size: 0.9em; }
-p code, li code { background: var(--surface); border: 1px solid var(--line); border-radius: 4px; padding: 0.05em 0.3em; }
-pre code { background: none; border: 0; padding: 0; color: inherit; font-size: inherit; }
+code { font-family: "JetBrains Mono", ui-monospace, monospace; font-size: 0.88em; }
+p code, li code, td code { background: var(--surface); border: 1px solid var(--line); border-radius: 4px; padding: 0.05em 0.3em; -webkit-box-decoration-break: clone; box-decoration-break: clone; }
 
-/* Install: tabs per distribution, numbered steps only where order matters. */
+.cmd { position: relative; margin: 0.75rem 0 1.25rem; }
+pre {
+  margin: 0; padding: 2.4rem 1rem 0.9rem; overflow-x: auto;
+  background: var(--code-bg); color: var(--code-ink); border-radius: 8px; color-scheme: dark;
+  font: 400 0.84rem/1.6 "JetBrains Mono", ui-monospace, monospace;
+}
+pre code { background: none; border: 0; padding: 0; color: inherit; font-size: inherit; }
+pre .c { color: var(--code-dim); }
+.copy {
+  position: absolute; top: 0.5rem; right: 0.5rem;
+  font: 600 0.75rem "Instrument Sans", sans-serif;
+  color: var(--code-ink); background: rgba(255,255,255,0.08);
+  border: 1px solid rgba(255,255,255,0.2); border-radius: 6px; padding: 0.3rem 0.55rem; cursor: pointer;
+}
+.copy:hover { background: rgba(255,255,255,0.16); }
+
+/* Install tabs; numbered steps only where order matters. */
 .tabs { display: flex; flex-wrap: wrap; gap: 0.25rem; border-bottom: 1px solid var(--line); margin: 1.5rem 0 0; }
 .tabs button {
   font: 600 0.95rem "Instrument Sans", sans-serif; color: var(--muted);
@@ -127,129 +154,420 @@ ol.steps > li::before {
   border: 2px solid var(--limit); color: var(--limit-ink);
   font: 600 0.8rem/1.3rem "Instrument Sans", sans-serif; text-align: center;
 }
-.cmd { position: relative; margin: 0.5rem 0 0; }
-pre {
-  margin: 0; padding: 2.4rem 1rem 0.9rem; overflow-x: auto;
-  background: var(--code-bg); color: var(--code-ink); border-radius: 8px;
-  color-scheme: dark;
-  font: 400 0.85rem/1.55 "JetBrains Mono", ui-monospace, monospace;
-}
-.copy {
-  position: absolute; top: 0.5rem; right: 0.5rem;
-  font: 600 0.75rem "Instrument Sans", sans-serif;
-  color: var(--code-ink); background: rgba(255,255,255,0.08);
-  border: 1px solid rgba(255,255,255,0.2); border-radius: 6px; padding: 0.3rem 0.55rem; cursor: pointer;
-}
-.copy:hover { background: rgba(255,255,255,0.16); }
-.note { font-size: 0.95rem; color: var(--muted); margin-top: 1rem; }
+.note { font-size: 0.95rem; color: var(--muted); }
 .fingerprint { font-family: "JetBrains Mono", monospace; font-size: 0.8rem; word-spacing: 0.15em; }
 
-.guard-rules { padding-left: 1.2rem; }
-.guard-rules li { margin-bottom: 0.4rem; }
+table { border-collapse: collapse; width: 100%; margin: 1rem 0 1.25rem; font-size: 0.95rem; }
+th, td { text-align: left; padding: 0.55rem 0.75rem 0.55rem 0; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { font-weight: 600; border-bottom-width: 2px; }
+.table-wrap { overflow-x: auto; }
 
-footer { max-width: 44rem; margin: 0 auto; padding: 2rem 1.25rem 3rem; color: var(--muted); font-size: 0.9rem; border-top: 1px solid var(--line); }
+/* Guard questions: each one opens in place. */
+details.q { border-top: 1px solid var(--line); }
+details.q:last-of-type { border-bottom: 1px solid var(--line); }
+details.q summary {
+  cursor: pointer; list-style: none; padding: 0.9rem 2rem 0.9rem 0; position: relative;
+  font-weight: 600;
+}
+details.q summary::-webkit-details-marker { display: none; }
+details.q summary::after {
+  content: ""; position: absolute; right: 0.4rem; top: 1.25rem; width: 0.55rem; height: 0.55rem;
+  border-right: 2px solid var(--muted); border-bottom: 2px solid var(--muted); transform: rotate(45deg);
+  transition: transform .15s;
+}
+details.q[open] summary::after { transform: rotate(-135deg); top: 1.45rem; }
+details.q > div { padding: 0 0 1rem; color: var(--ink); }
+@media (prefers-reduced-motion: reduce) { details.q summary::after { transition: none; } }
+
+footer { border-top: 1px solid var(--line); margin-top: 4rem; padding-top: 1.5rem; color: var(--muted); font-size: 0.9rem; }
 footer a { margin-right: 1.25rem; }
 
-@media (max-width: 34rem) {
-  header.site nav a:first-child { display: none; }
+/* Narrow screens: the contents collapse into a menu above the page. */
+@media (max-width: 56rem) {
+  .layout { grid-template-columns: minmax(0, 1fr); gap: 0; }
+  .sidebar { position: static; height: auto; overflow: visible; padding: 1.25rem 0 0; border-bottom: 1px solid var(--line); }
+  .wordmark { margin-bottom: 1rem; }
+  .toc summary {
+    display: block; cursor: pointer; font-weight: 600; padding: 0.6rem 0.9rem; margin-bottom: 1rem;
+    background: var(--surface); border: 1px solid var(--line); border-radius: 8px;
+  }
+  .toc:not([open]) > nav { display: none; }
+  .toc > nav { padding-bottom: 1rem; }
+  .side-links { display: none; }
+  main { padding-top: 0.5rem; }
   .meter-legend { flex-direction: column; gap: 0.1rem; }
 }
 </style>
 </head>
 <body>
-<header class="site">
-  <a class="wordmark" href="./">rlm</a>
-  <nav>
-    <a href="#install">Install</a>
-    <a href="#guard">Guard</a>
-    <a href="https://github.com/jayashankarvr/rlm">GitHub</a>
-  </nav>
-</header>
-
-<main>
-  <h1>Keep one app from taking the whole machine</h1>
-  <p class="lede">rlm sets memory, CPU and I/O limits on your own Linux processes, without root. Its optional guard freezes or caps a runaway app under memory pressure, instead of letting the desktop lock up.</p>
-
-  <figure class="meter" aria-label="Illustration: several apps share memory; one keeps growing until it reaches its limit and stops there.">
-    <div class="bar" aria-hidden="true">
-      <div class="seg a"></div><div class="seg b"></div><div class="seg c"></div><div class="seg run"></div>
-      <div class="cap"></div>
+<a class="skip" href="#content">Skip to content</a>
+<div class="layout">
+  <aside class="sidebar">
+    <a class="wordmark" href="#top">rlm</a>
+    <details class="toc" id="toc">
+      <summary>Contents</summary>
+      <nav aria-label="Contents">
+        <ul>
+          <li><a href="#top">Overview</a></li>
+          <li><a href="#what">What it does</a></li>
+          <li><a href="#install">Install</a>
+            <ul>
+              <li><a href="#after-install">After installing</a></li>
+              <li><a href="#distros">Supported systems</a></li>
+            </ul>
+          </li>
+          <li><a href="#cli">Using the CLI</a>
+            <ul>
+              <li><a href="#cli-limit">Limit a running app</a></li>
+              <li><a href="#cli-run">Run with limits</a></li>
+              <li><a href="#cli-rules">Rules</a></li>
+              <li><a href="#cli-unlimit">Remove limits</a></li>
+            </ul>
+          </li>
+          <li><a href="#behave">How limits behave</a></li>
+          <li><a href="#gui">Desktop app</a></li>
+          <li><a href="#guard">The guard</a>
+            <ul>
+              <li><a href="#guard-config">Configure it</a></li>
+              <li><a href="#guard-safe">How it stays safe</a></li>
+            </ul>
+          </li>
+          <li><a href="#config">Profiles and config</a></li>
+          <li><a href="#delegation">Cgroup delegation</a></li>
+        </ul>
+      </nav>
+    </details>
+    <div class="side-links">
+      <a href="https://github.com/jayashankarvr/rlm">Source on GitHub</a>
+      <a href="https://github.com/jayashankarvr/rlm/releases">Releases</a>
+      <a href="https://github.com/jayashankarvr/rlm/issues">Report an issue</a>
     </div>
-    <figcaption class="meter-legend">
-      <span>Your other apps keep their memory</span>
-      <span class="limit-note">The runaway one stops at its limit</span>
-    </figcaption>
-  </figure>
+  </aside>
 
-  <h2>What it does</h2>
-  <ul class="facts">
-    <li><strong>Start a program with limits</strong><span><code>rlm run --memory 2G --cpu 200% -- cargo build</code> runs the build with at most 2 GB of memory and two cores.</span></li>
-    <li><strong>Limit something already running</strong><span>By PID, by name, or a whole application with every process in one shared limit.</span></li>
-    <li><strong>Profiles and rules</strong><span>Save named sets of limits, or a rule that applies to an app every time it starts.</span></li>
-    <li><strong>A desktop app too</strong><span>rlm-gtk does the same from a GTK window: pick an app, set limits, apply.</span></li>
-  </ul>
-  <p class="note">rlm uses cgroup v2 through systemd's per-user delegation, so it only ever touches your own processes.</p>
+  <main id="content">
+    <section id="top">
+      <h1>Keep one app from taking the whole machine</h1>
+      <p class="lede">rlm sets memory, CPU and I/O limits on your own Linux processes, without root, from the terminal or a desktop app. Its optional guard freezes or caps a runaway app under memory pressure, instead of letting the desktop lock up.</p>
+      <figure class="meter" aria-label="Illustration: several apps share memory; one keeps growing until it reaches its limit and stops there.">
+        <div class="bar" aria-hidden="true">
+          <div class="seg a"></div><div class="seg b"></div><div class="seg c"></div><div class="seg run"></div>
+          <div class="cap"></div>
+        </div>
+        <figcaption class="meter-legend">
+          <span>Your other apps keep their memory</span>
+          <span class="limit-note">The runaway one stops at its limit</span>
+        </figcaption>
+      </figure>
+    </section>
 
-  <h2 id="install">Install</h2>
-  <div class="tabs" role="tablist" aria-label="Choose your system">
-    <button role="tab" id="t-apt" aria-controls="p-apt" aria-selected="true">Ubuntu and Debian</button>
-    <button role="tab" id="t-rpm" aria-controls="p-rpm" aria-selected="false" tabindex="-1">Fedora</button>
-    <button role="tab" id="t-cargo" aria-controls="p-cargo" aria-selected="false" tabindex="-1">Any distro (cargo)</button>
-  </div>
+    <section id="what">
+      <h2>What it does</h2>
+      <ul class="facts">
+        <li><strong>Start a program with limits</strong><span><code>rlm run --memory 2G --cpu 200% -- cargo build</code> runs the build with at most 2 GB of memory and two cores.</span></li>
+        <li><strong>Limit something already running</strong><span>By PID, by name, a list of PIDs, or a whole application with every process under one shared limit.</span></li>
+        <li><strong>Profiles and rules</strong><span>Four built-in presets plus your own, and rules that apply to an app every time it starts.</span></li>
+        <li><strong>A desktop app</strong><span>rlm-gtk does the same from a GTK window: pick an app, set limits, apply.</span></li>
+        <li><strong>An optional guard</strong><span>rlm-guard watches memory pressure and freezes or caps the app that is growing, never killing it.</span></li>
+      </ul>
+      <p>rlm uses cgroup v2 through systemd's per-user delegation, so it needs no root and only ever touches your own processes.</p>
+      <h3>What it is not</h3>
+      <ul class="plain">
+        <li>Not a replacement for systemd-oomd or earlyoom. Those kill processes; rlm pauses and slows them. You can run both.</li>
+        <li>Run as your user, it has no effect on processes of other users or of root.</li>
+      </ul>
+      <h3>Not yet</h3>
+      <ul class="plain">
+        <li>Protecting the desktop session's own memory with a <code>memory.min</code> chain.</li>
+        <li>Event-driven pressure triggers. The guard samples once per second.</li>
+        <li>Notifications with Resume or Keep paused actions. Today the guard can send a plain warning when pressure rises.</li>
+        <li>A system-wide mode for other users or system services.</li>
+      </ul>
+    </section>
 
-  <section class="panel" id="p-apt" role="tabpanel" aria-labelledby="t-apt">
-    <ol class="steps">
-      <li>Add the signing key
-        <div class="cmd"><pre><code>sudo install -d -m 0755 /etc/apt/keyrings
+    <section id="install">
+      <h2>Install</h2>
+      <div class="tabs" role="tablist" aria-label="Choose your system">
+        <button role="tab" id="t-apt" aria-controls="p-apt" aria-selected="true">Ubuntu and Debian</button>
+        <button role="tab" id="t-rpm" aria-controls="p-rpm" aria-selected="false" tabindex="-1">Fedora and RHEL</button>
+        <button role="tab" id="t-cargo" aria-controls="p-cargo" aria-selected="false" tabindex="-1">Any distro (cargo)</button>
+        <button role="tab" id="t-src" aria-controls="p-src" aria-selected="false" tabindex="-1">From source</button>
+      </div>
+
+      <div class="panel" id="p-apt" role="tabpanel" aria-labelledby="t-apt">
+        <ol class="steps">
+          <li>Add the signing key
+            <div class="cmd"><pre><code>sudo install -d -m 0755 /etc/apt/keyrings
 curl -fsSL https://jayashankarvr.github.io/rlm/rlm-archive-keyring.gpg | sudo tee /etc/apt/keyrings/rlm.gpg &gt;/dev/null</code></pre></div>
-      </li>
-      <li>Add the repository
-        <div class="cmd"><pre><code>echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/rlm.gpg] https://jayashankarvr.github.io/rlm stable main" | sudo tee /etc/apt/sources.list.d/rlm.list</code></pre></div>
-      </li>
-      <li>Install
-        <div class="cmd"><pre><code>sudo apt update
+          </li>
+          <li>Add the repository
+            <div class="cmd"><pre><code>echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/rlm.gpg] https://jayashankarvr.github.io/rlm stable main" | sudo tee /etc/apt/sources.list.d/rlm.list</code></pre></div>
+          </li>
+          <li>Install
+            <div class="cmd"><pre><code>sudo apt update
 sudo apt install rlm rlm-gtk</code></pre></div>
-      </li>
-    </ol>
-    <p class="note">The desktop app, rlm-gtk, needs Ubuntu 24.04 or Debian 13 or newer; rlm alone works from Ubuntu 22.04 and Debian 12. Updates arrive with <code>apt upgrade</code>. Log out and back in once after the first install.</p>
-    <p class="note">Key fingerprint: <span class="fingerprint">C7E1 E11F ED31 3EDB 9A60 9BD7 41F3 0081 BB8A BEC2</span></p>
-  </section>
+          </li>
+        </ol>
+        <p class="note">The desktop app, rlm-gtk, needs Ubuntu 24.04 or Debian 13 or newer; rlm alone works from Ubuntu 22.04 and Debian 12. Updates arrive with <code>apt upgrade</code>.</p>
+        <p class="note">Key fingerprint: <span class="fingerprint">C7E1 E11F ED31 3EDB 9A60 9BD7 41F3 0081 BB8A BEC2</span>. The same key is in the source at <code>dist/apt/rlm-archive-keyring.asc</code>.</p>
+      </div>
 
-  <section class="panel" id="p-rpm" role="tabpanel" aria-labelledby="t-rpm" hidden>
-    <p>Download the .rpm files from the <a href="https://github.com/jayashankarvr/rlm/releases/latest">latest release</a>, then:</p>
-    <div class="cmd"><pre><code>sudo dnf install ./rlm-0*.rpm ./rlm-gtk-0*.rpm</code></pre></div>
-    <p class="note">rlm-gtk needs Fedora 40 or newer. Log out and back in once after installing.</p>
-  </section>
+      <div class="panel" id="p-rpm" role="tabpanel" aria-labelledby="t-rpm" hidden>
+        <p>Download the .rpm files from the <a href="https://github.com/jayashankarvr/rlm/releases/latest">latest release</a>, then:</p>
+        <div class="cmd"><pre><code>sudo dnf install ./rlm-0*.rpm ./rlm-gtk-0*.rpm</code></pre></div>
+        <p class="note">rlm-gtk needs Fedora 40 or RHEL 10 or newer.</p>
+      </div>
 
-  <section class="panel" id="p-cargo" role="tabpanel" aria-labelledby="t-cargo" hidden>
-    <p>With Rust 1.87 or newer:</p>
-    <div class="cmd"><pre><code>cargo install rlmctl</code></pre></div>
-    <p class="note">This installs <code>rlm</code> and <code>rlm-guard</code>. Run <code>rlm doctor</code> to check that your system delegates the cgroup controllers rlm needs. The desktop app comes with the distribution packages.</p>
-  </section>
+      <div class="panel" id="p-cargo" role="tabpanel" aria-labelledby="t-cargo" hidden>
+        <p>With Rust 1.87 or newer:</p>
+        <div class="cmd"><pre><code>cargo install rlmctl</code></pre></div>
+        <p class="note">This installs <code>rlm</code> and <code>rlm-guard</code>. The desktop app is not on crates.io, because it needs the GTK 4 and libadwaita development headers; install it from a distribution package or from source. With cargo you also set up <a href="#delegation">cgroup delegation</a> yourself.</p>
+      </div>
 
-  <h2 id="guard">The guard</h2>
-  <p>When memory runs short, Linux usually freezes the whole desktop for minutes and then kills something. rlm-guard steps in earlier and more gently.</p>
-  <ul class="guard-rules">
-    <li>It acts when apps stall on memory and free memory is below 20%, or at once below 400 MB.</li>
-    <li>It freezes the app that is growing for 5 seconds, then caps it with a soft limit if pressure stays high.</li>
-    <li>A cap is lifted after 30 seconds of calm. It never sends a signal to any process.</li>
-    <li>Your desktop, shells, terminals and audio are never frozen, and it holds at most 3 apps at a time.</li>
-  </ul>
-  <p>Turn it on with <code>rlm guard enable</code>, or with the switch on the Guard page of the desktop app. See what it did with <code>rlm guard history</code>.</p>
+      <div class="panel" id="p-src" role="tabpanel" aria-labelledby="t-src" hidden>
+        <div class="cmd"><pre><code>git clone https://github.com/jayashankarvr/rlm
+cd rlm
+cargo install --path cli        <span class="c"># rlm and rlm-guard</span>
+cargo install --path gtk-gui    <span class="c"># rlm-gtk, needs GTK 4 and libadwaita headers</span>
+./install-desktop.sh            <span class="c"># desktop entry and icon</span></code></pre></div>
+        <p class="note">On Debian and Ubuntu the headers come from <code>libgtk-4-dev libadwaita-1-dev pkg-config</code>. Set up <a href="#delegation">cgroup delegation</a> yourself.</p>
+      </div>
 
-  <h2>Learn more</h2>
-  <p>The <a href="https://github.com/jayashankarvr/rlm#readme">README</a> covers every command, the config file and how the guard stays safe. Questions and bugs go to <a href="https://github.com/jayashankarvr/rlm/issues">GitHub issues</a>.</p>
-</main>
+      <h3 id="after-install">After installing</h3>
+      <ol class="steps">
+        <li>Make sure the memory, cpu and io controllers are delegated to your user. The packages do this for you; for cargo and source installs, see <a href="#delegation">cgroup delegation</a>.</li>
+        <li>Log out and back in, so your user session picks up the delegation.</li>
+        <li>Run <code>rlm doctor</code>. It checks cgroup v2, the delegated controllers, memory pressure information, your config file and the guard.</li>
+        <li>Optional: turn on the guard with <code>rlm guard enable</code>, or with the switch on the Guard page of the desktop app.</li>
+      </ol>
+      <p class="note">After upgrading, restart the guard so the new version runs: <code>systemctl --user restart rlm-guard</code>.</p>
 
-<footer>
-  <a href="https://github.com/jayashankarvr/rlm">Source</a>
-  <a href="https://github.com/jayashankarvr/rlm/releases">Releases</a>
-  <a href="https://crates.io/crates/rlmctl">crates.io</a>
-  <p>Open source under the Apache-2.0 license.</p>
-</footer>
+      <h3 id="distros">Supported systems</h3>
+      <p>The CLI and the guard run on any Linux with cgroup v2, pressure stall information (PSI) and systemd. The desktop app also needs GTK 4 and libadwaita 1.4 or newer. The release packages install on:</p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>System</th><th>CLI and guard</th><th>Desktop app</th></tr></thead>
+          <tbody>
+            <tr><td>Ubuntu</td><td>22.04 and newer</td><td>24.04 and newer</td></tr>
+            <tr><td>Debian</td><td>12 and newer</td><td>13 and newer</td></tr>
+            <tr><td>Fedora</td><td>36 and newer</td><td>40 and newer</td></tr>
+            <tr><td>RHEL, Rocky, Alma</td><td>10 and newer</td><td>10 and newer</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="note">On a system with cgroup v2 but an older glibc, such as RHEL 9, install the CLI and guard with <code>cargo install rlmctl</code>.</p>
+    </section>
+
+    <section id="cli">
+      <h2>Using the CLI</h2>
+
+      <h3 id="cli-limit">Limit a running app</h3>
+      <div class="cmd"><pre><code><span class="c"># One process, by PID</span>
+rlm limit --pid 1234 --memory 512M --cpu 50%
+
+<span class="c"># Every process with this name, each with its own limit</span>
+rlm limit --name firefox --memory 2G
+
+<span class="c"># A whole application: all its processes share one limit</span>
+rlm limit --application firefox --memory 4G --cpu 75%
+
+<span class="c"># Several PIDs sharing one limit</span>
+rlm limit --all-pids 1234,5678,9012 --memory 2G --cpu 50%
+
+<span class="c"># With I/O limits (per second)</span>
+rlm limit --pid 1234 --memory 1G --io-read 50M --io-write 20M
+
+<span class="c"># Preview without applying</span>
+rlm limit --pid 1234 --memory 512M --dry-run</code></pre></div>
+      <ul class="plain">
+        <li>With <code>--application</code> or <code>--all-pids</code>, the processes share the limit: 10 processes with a 4G limit get 4G in total, not 4G each.</li>
+        <li>Sizes accept decimals and <code>B</code>/<code>iB</code> suffixes: <code>512M</code>, <code>1.5G</code>, <code>2GiB</code> and <code>512MB</code> all work. Memory limits below 8M and I/O limits below 64K/s are refused.</li>
+        <li>CPU is a percentage of one core: <code>50%</code> is half a core, <code>200%</code> is two cores.</li>
+        <li>Commands that match more than one process ask for confirmation; <code>--yes</code> skips it, and scripts need it.</li>
+        <li>Your desktop session, shells and audio are on a protect list and are refused unless you pass <code>--force</code>. Processes of other users are always refused.</li>
+      </ul>
+
+      <h3 id="cli-run">Run a command with limits</h3>
+      <div class="cmd"><pre><code>rlm run --memory 1G --cpu 100% -- ./my-program arg1 arg2
+
+<span class="c"># With a profile; flags you add override it</span>
+rlm run --profile browser -- firefox
+rlm run --profile browser --memory 6G -- firefox</code></pre></div>
+
+      <h3 id="cli-rules">Rules that last</h3>
+      <div class="cmd"><pre><code>rlm limit --application firefox --memory 4G --save   <span class="c"># limit now and keep the rule</span>
+rlm rule list
+rlm rule remove firefox</code></pre></div>
+      <p>The guard applies saved rules, to running copies of the app and to new ones, so the guard service must be running. <code>rlm unlimit --application firefox</code> drops the live limit and keeps the rule; add <code>--forget</code> to delete the rule too.</p>
+
+      <h3 id="cli-unlimit">Remove limits</h3>
+      <div class="cmd"><pre><code>rlm unlimit --pid 1234
+rlm unlimit --name firefox
+rlm unlimit --application firefox
+rlm unlimit --cgroup app-firefox</code></pre></div>
+
+      <h3>Other commands</h3>
+      <div class="cmd"><pre><code>rlm status                       <span class="c"># what is limited now, read-only</span>
+rlm profiles                     <span class="c"># built-in presets and your profiles</span>
+rlm doctor                       <span class="c"># check your setup</span>
+rlm export profiles.yaml         <span class="c"># export your profiles</span>
+rlm import profiles.yaml         <span class="c"># import profiles</span></code></pre></div>
+    </section>
+
+    <section id="behave">
+      <h2>How limits behave</h2>
+      <ul class="plain">
+        <li>A memory limit is a real RAM ceiling. rlm sets <code>memory.max</code>, starts reclaim at 90% of it with <code>memory.high</code>, and turns swap off for the limited app so it cannot spill over.</li>
+        <li>Memory a process used before you limited it stays counted where it was; only new allocations count against the limit. To cap an app's whole footprint, start it with <code>rlm run</code>.</li>
+        <li><code>rlm run</code> keeps everything the command started under the limit. If a launcher starts the real app and exits, the app stays limited, and rlm prints the name of its cgroup.</li>
+        <li><code>rlm run</code> exits with the command's exit code, or 128+N if signal N ended it. When the memory limit made the kernel end a process, rlm says so.</li>
+      </ul>
+    </section>
+
+    <section id="gui">
+      <h2>Desktop app</h2>
+      <p>Start it with <code>rlm-gtk</code> or from your app menu. It has five pages; Ctrl+1 to Ctrl+5 switch between them.</p>
+      <ul class="facts">
+        <li><strong>Managed Processes</strong><span>What rlm is limiting now, with Undo after you remove a limit.</span></li>
+        <li><strong>Limit Running</strong><span>Pick whole apps to share one limit, or a single process. Apps are listed by memory use.</span></li>
+        <li><strong>Launch New</strong><span>Start a program or an installed app with limits.</span></li>
+        <li><strong>Profiles</strong><span>The built-in presets and your own; edit a preset and restore it later.</span></li>
+        <li><strong>Guard</strong><span>Turn the guard on or off, and see memory pressure, what it is holding and what it did.</span></li>
+      </ul>
+      <p class="note">The desktop app hides processes on the protect list. Use the CLI with <code>--force</code> if you really need to limit one.</p>
+    </section>
+
+    <section id="guard">
+      <h2>The guard</h2>
+      <p>When memory runs short, Linux usually freezes the whole desktop for minutes and then kills something. rlm-guard steps in earlier and more gently.</p>
+      <ul class="plain">
+        <li>It acts when apps stall on memory and free memory is below 20% of RAM, or at once when free memory drops below 400 MB.</li>
+        <li>It freezes the app that is growing for 5 seconds, then caps it with a soft limit if pressure stays high.</li>
+        <li>A freeze always ends after those 5 seconds; a cap is lifted after 30 seconds of calm.</li>
+        <li>It never sends a signal to any process, and it holds at most 3 apps at a time.</li>
+        <li>It only acts on your own apps and on the cgroups rlm created.</li>
+      </ul>
+      <div class="cmd"><pre><code>rlm guard enable    <span class="c"># install the service if needed, enable and start it</span>
+rlm guard status    <span class="c"># state, config, pressure, what it holds, recent events</span>
+rlm guard test      <span class="c"># what it would do right now, without acting</span>
+rlm guard history   <span class="c"># recent freezes, caps and restores</span>
+rlm guard disable   <span class="c"># stop and disable the service</span></code></pre></div>
+      <p>The full log is in <code>journalctl --user -u rlm-guard</code>.</p>
+
+      <h3 id="guard-config">Configure it</h3>
+      <p>Every setting is optional. These are the defaults, under <code>guard:</code> in <code>~/.config/rlm/config.yaml</code>:</p>
+      <div class="cmd"><pre><code>guard:
+  enabled: true
+  trigger:
+    psi_some_warn: 10
+    psi_some_high: 30
+    psi_full_critical: 10
+    mem_available_floor_mb: 400
+    act_below_available_pct: 20
+  timing:
+    freeze_hold_secs: 5
+    calm_hold_secs: 30
+    freeze_cooldown_secs: 60
+    sample_interval_ms: 1000
+  selection:
+    min_rss_mb: 200
+    protect: []   <span class="c"># names added to the built-in protect list</span>
+  notify: true</code></pre></div>
+      <p class="note">With <code>enabled: false</code> the guard stops freezing and capping but still applies your rules. An invalid config stops the guard with a clear error in <code>rlm guard status</code>; fix the file and run <code>systemctl --user restart rlm-guard</code>.</p>
+
+      <h3 id="guard-safe">How it stays safe</h3>
+      <details class="q">
+        <summary>Can it kill my app?</summary>
+        <div>No. It only freezes the app's cgroup or sets a soft memory cap. It never sends a signal. The kernel's own out-of-memory handling is unchanged, so a hard limit you set yourself can still end a process.</div>
+      </details>
+      <details class="q">
+        <summary>What if the guard crashes while an app is frozen?</summary>
+        <div>Every freeze and cap is written to a journal before it is applied. On its next start, even one that fails on a bad config, the guard reads the journal and restores the app. On a normal stop it undoes everything before exiting. Only one guard runs per user.</div>
+      </details>
+      <details class="q">
+        <summary>Could it freeze my desktop or terminal?</summary>
+        <div>No. The desktop shell and compositor, Xorg and Xwayland, sshd, systemd, dbus, the audio stack, common shells, the guard itself, common terminal emulators and tmux and screen are never frozen. An app that shares a scope with one of them can only be capped. Add your own names under <code>guard.selection.protect</code>.</div>
+      </details>
+      <details class="q">
+        <summary>Why did it not act when my machine was slow?</summary>
+        <div>It needs your apps to be stalling on memory while free memory is below 20% of RAM, or free memory below 400 MB. Slowness from CPU or disk load does not count. An app hitting a limit you set yourself does not count either: the rest of the system is fine.</div>
+      </details>
+      <details class="q">
+        <summary>How hard is a cap?</summary>
+        <div>Soft. It never goes below 90% of the app's current memory or below 256 MiB, and it never loosens a limit that was already tighter. The app slows down while the kernel reclaims memory; it is not killed.</div>
+      </details>
+    </section>
+
+    <section id="config">
+      <h2>Profiles and config</h2>
+      <p>Profiles are named sets of limits. Add your own in <code>~/.config/rlm/config.yaml</code>:</p>
+      <div class="cmd"><pre><code>profiles:
+  browser:
+    memory: "4G"
+    cpu: "200%"
+  dev:
+    memory: "8G"
+    cpu: "400%"
+    io_read: "100M"
+    io_write: "50M"</code></pre></div>
+      <p>A system-wide file at <code>/etc/rlm/config.yaml</code> is read first, and yours overrides it. Profile names are not case-sensitive. These presets are built in:</p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Preset</th><th>Memory</th><th>CPU</th><th>I/O read / write</th></tr></thead>
+          <tbody>
+            <tr><td>Light</td><td>512M</td><td>25%</td><td>none</td></tr>
+            <tr><td>Medium</td><td>2G</td><td>50%</td><td>50M/s / 25M/s</td></tr>
+            <tr><td>Heavy</td><td>4G</td><td>100%</td><td>100M/s / 50M/s</td></tr>
+            <tr><td>Browser</td><td>4G</td><td>75%</td><td>none</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section id="delegation">
+      <h2>Cgroup delegation</h2>
+      <p>rlm writes to cgroups that your systemd user manager owns, so the memory, cpu and io controllers must be delegated to it. The .deb and .rpm packages set this up. For cargo and source installs, run once:</p>
+      <div class="cmd"><pre><code>sudo mkdir -p /etc/systemd/system/user@.service.d
+printf '[Service]\nDelegate=cpu memory io\n' | sudo tee /etc/systemd/system/user@.service.d/rlm-delegate.conf
+sudo systemctl daemon-reload</code></pre></div>
+      <p>Then log out and back in, and run <code>rlm doctor</code> to check.</p>
+    </section>
+
+    <footer>
+      <a href="https://github.com/jayashankarvr/rlm">Source</a>
+      <a href="https://github.com/jayashankarvr/rlm/releases">Releases</a>
+      <a href="https://crates.io/crates/rlmctl">crates.io</a>
+      <a href="https://github.com/jayashankarvr/rlm/blob/main/CHANGELOG.md">Changelog</a>
+      <p>Open source under the Apache-2.0 license.</p>
+    </footer>
+  </main>
+</div>
 
 <script>
-  // Tabs: arrow keys move between them, as with any tab list.
+  // Contents: open by default on wide screens, a menu on narrow ones.
+  const toc = document.getElementById('toc');
+  const wide = window.matchMedia('(min-width: 56.01rem)');
+  const syncToc = () => { toc.open = wide.matches; };
+  syncToc();
+  wide.addEventListener('change', syncToc);
+  toc.querySelectorAll('a').forEach(a => a.addEventListener('click', () => { if (!wide.matches) toc.open = false; }));
+
+  // Mark the section being read in the contents.
+  const links = new Map([...toc.querySelectorAll('a')].map(a => [a.getAttribute('href').slice(1), a]));
+  const targets = [...links.keys()].map(id => document.getElementById(id)).filter(Boolean);
+  let current = null;
+  function markCurrent() {
+    let best = targets[0];
+    for (const t of targets) if (t.getBoundingClientRect().top <= 120) best = t;
+    if (best !== current) {
+      if (current) links.get(current.id).removeAttribute('aria-current');
+      links.get(best.id).setAttribute('aria-current', 'true');
+      current = best;
+    }
+  }
+  document.addEventListener('scroll', markCurrent, { passive: true });
+  markCurrent();
+
+  // Install tabs: arrow keys move between them, as with any tab list.
   const tabs = [...document.querySelectorAll('[role="tab"]')];
   function select(tab) {
     for (const t of tabs) {
@@ -267,15 +585,19 @@ sudo apt install rlm rlm-gtk</code></pre></div>
       if (d) { e.preventDefault(); select(tabs[(i + d + tabs.length) % tabs.length]); }
     });
   });
-  // Copy buttons on every command block.
+
+  // A Copy button on every command block. Comments are left out of the copy.
   for (const block of document.querySelectorAll('.cmd')) {
     const btn = document.createElement('button');
     btn.className = 'copy';
     btn.type = 'button';
     btn.textContent = 'Copy';
     btn.addEventListener('click', async () => {
+      const code = block.querySelector('code').cloneNode(true);
+      code.querySelectorAll('.c').forEach(c => c.remove());
+      const text = code.textContent.split('\n').map(l => l.trimEnd()).join('\n');
       try {
-        await navigator.clipboard.writeText(block.querySelector('code').innerText);
+        await navigator.clipboard.writeText(text);
         btn.textContent = 'Copied';
       } catch {
         btn.textContent = 'Select and copy';
