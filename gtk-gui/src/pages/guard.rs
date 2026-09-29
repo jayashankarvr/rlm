@@ -258,7 +258,7 @@ pub fn pressure_summary(sample: Option<&Sample>, t: &GuardTrigger, acting: bool)
     }
 }
 
-/// The Policy row in plain words, from the guard config. Below the free
+/// The Policy row in plain words, from the guard config. Below the available
 /// memory floor the guard acts without waiting for stalls (the level is
 /// Critical there), so the wording does not claim stalls are always needed.
 pub fn policy_summary(g: &GuardConfig) -> String {
@@ -268,7 +268,7 @@ pub fn policy_summary(g: &GuardConfig) -> String {
     }
     let t = &g.trigger;
     format!(
-        "Steps in when apps stall and free memory is below {}%, or at once below {}",
+        "Steps in when apps stall and available memory is below {}%, or at once below {}",
         t.act_below_available_pct,
         mb_text(t.mem_available_floor_mb)
     )
@@ -975,7 +975,7 @@ mod tests {
             pressure_words(&sample(5.0, 4.0, 2000, 15155), &t, false),
             "no memory pressure"
         );
-        // Below the free-memory floor the guard is Critical with no PSI at all.
+        // Below the available-memory floor the guard is Critical with no PSI at all.
         assert_eq!(
             pressure_words(&sample(0.0, 0.0, 300, 15155), &t, false),
             "high memory pressure"
@@ -1020,7 +1020,7 @@ mod tests {
     fn policy_and_config_in_plain_words() {
         assert_eq!(
             policy_summary(&GuardConfig::default()),
-            "Steps in when apps stall and free memory is below 20%, or at once below 400 MB"
+            "Steps in when apps stall and available memory is below 20%, or at once below 400 MB"
         );
         let off = GuardConfig {
             enabled: false,
