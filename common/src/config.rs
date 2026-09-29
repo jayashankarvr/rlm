@@ -295,6 +295,19 @@ pub const BUILTIN_PROTECT: &[&str] = &[
     "screen",
 ];
 
+/// Why a rule keyed by the program name `exe` would stop matching after an
+/// update, if it would: a name with no letters (such as `2.1.283`) is a
+/// version number, and the next release installs a program with a new one.
+pub fn versioned_rule_name(exe: &str) -> Option<String> {
+    if exe.chars().any(char::is_alphabetic) {
+        None
+    } else {
+        Some(format!(
+            "This app's program name is a version number ({exe}), so a saved rule would stop matching after an update."
+        ))
+    }
+}
+
 /// Built-in protect names plus the user's additions from `guard.selection.protect`.
 pub fn protect_set(extra: &[String]) -> HashSet<String> {
     BUILTIN_PROTECT
@@ -595,6 +608,19 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn versioned_program_names_make_no_rule() {
+        assert_eq!(
+            versioned_rule_name("2.1.283").as_deref(),
+            Some(
+                "This app's program name is a version number (2.1.283), so a saved rule would stop matching after an update."
+            )
+        );
+        assert!(versioned_rule_name("").is_some());
+        assert_eq!(versioned_rule_name("firefox"), None);
+        assert_eq!(versioned_rule_name("python3.12"), None);
+    }
 
     #[test]
     fn app_rule_to_limit_parses_fields() {

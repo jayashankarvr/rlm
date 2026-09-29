@@ -31,12 +31,53 @@ pub use types::{Action, Intervention, Level, ProcInfo, PsiSource, Sample, Target
 /// Prefers `$XDG_STATE_HOME/rlm` (`~/.local/state/rlm` by default), matching
 /// the XDG-first convention `common::Config` uses for `config_dir()`. When no
 /// state dir can be resolved (e.g. `$HOME` unset) it falls back to
-/// `$XDG_RUNTIME_DIR/rlm`; that dir is per-user and mode 0700, and the
-/// journal is boot_id-guarded, so losing it at reboot costs nothing. It never
-/// falls back to a shared, world-writable dir such as `/tmp`, where another
-/// user could pre-create or read the files. `None` means neither dir is known.
+/// `$XDG_RUNTIME_DIR/rlm`, but only when that dir is owned by us and not group
+/// or world writable (see [`private_runtime_dir`]). The journal is
+/// boot_id-guarded, so losing it at reboot costs nothing. It never falls back
+/// to a shared, world-writable dir such as `/tmp`, where another user could
+/// pre-create or read the files. `None` means neither dir is usable.
 pub fn guard_file(name: &str) -> Option<PathBuf> {
-    guard_file_from(dirs::state_dir(), dirs::runtime_dir(), name)
+    let state = dirs::state_dir();
+    let runtime = if state.is_none() {
+        private_runtime_dir()
+    } else {
+        None
+    };
+    guard_file_from(state, runtime, name)
+}
+
+/// `$XDG_RUNTIME_DIR`, or `None` when it is unset or not private to us: not
+/// owned by our uid, or group or world writable. A rejected dir is logged once.
+fn private_runtime_dir() -> Option<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    let dir = dirs::runtime_dir()?;
+    let uid = crate::process::current_uid();
+    match std::fs::metadata(&dir) {
+        Ok(m) if runtime_dir_is_private(m.uid(), m.mode(), uid) => Some(dir),
+        Ok(m) => {
+            WARNED.call_once(|| {
+                tracing::warn!(
+                    "ignoring XDG_RUNTIME_DIR {}: owner uid {} mode {:o}, expected owner {} \
+                     and not group or world writable",
+                    dir.display(),
+                    m.uid(),
+                    m.mode() & 0o7777,
+                    uid
+                )
+            });
+            None
+        }
+        Err(e) => {
+            WARNED.call_once(|| tracing::warn!("ignoring XDG_RUNTIME_DIR {}: {e}", dir.display()));
+            None
+        }
+    }
+}
+
+/// Whether a runtime dir with this owner and mode is safe for guard files.
+fn runtime_dir_is_private(owner: u32, mode: u32, uid: u32) -> bool {
+    owner == uid && mode & 0o022 == 0
 }
 
 fn guard_file_from(
@@ -87,6 +128,18 @@ mod tests {
             Some(PathBuf::from("/run/user/1000/rlm/guard-journal.jsonl"))
         );
         assert_eq!(guard_file_from(None, None, "guard-journal.jsonl"), None);
+    }
+
+    #[test]
+    fn runtime_dir_is_used_only_when_private_to_us() {
+        assert!(runtime_dir_is_private(1000, 0o40700, 1000));
+        assert!(runtime_dir_is_private(1000, 0o40750, 1000));
+        // Owned by someone else.
+        assert!(!runtime_dir_is_private(0, 0o40700, 1000));
+        // Group or world writable.
+        assert!(!runtime_dir_is_private(1000, 0o40770, 1000));
+        assert!(!runtime_dir_is_private(1000, 0o40702, 1000));
+        assert!(!runtime_dir_is_private(1000, 0o41777, 1000));
     }
 
     #[test]

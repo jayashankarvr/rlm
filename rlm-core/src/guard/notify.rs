@@ -3,10 +3,12 @@
 //! The daemon loop hands every applied [`Action`] to a [`Notifier`], which
 //! keeps one notification per app: "<App> paused" after a freeze, replaced
 //! in place by "<App> slowed down" after a cap, and closed when the app is
-//! released. Failed freezes and caps show nothing (they are in the history
-//! and the journal). An optional early warning ("Memory is running low")
-//! is sent at most once a minute while pressure is High or Critical and no
-//! app is held.
+//! released. A thaw that fails replaces it with "<App> could not be
+//! resumed", which stays until a later release of that cgroup succeeds, the
+//! cgroup is gone, or the guard shuts down. Failed freezes and caps show
+//! nothing (they are in the history and the journal). An optional early
+//! warning ("Memory is running low") is sent at most once a minute while
+//! pressure is High or Critical and no app is held.
 //!
 //! Notifications never feed back into guard decisions: the [`Notifier`]
 //! only reads what the effector already did. The desktop transport,
@@ -85,6 +87,14 @@ pub fn slowed_text(app: &str, cap_bytes: u64) -> (String, String) {
             "Held to about {} until memory frees up.",
             format_size(cap_bytes)
         ),
+    )
+}
+
+/// Title and body for an app whose thaw failed, so it may still be frozen.
+pub fn failed_resume_text(app: &str) -> (String, String) {
+    (
+        format!("{app} could not be resumed"),
+        "It may stay paused. Run rlm guard status for details.".to_string(),
     )
 }
 
@@ -257,6 +267,11 @@ pub struct Notifier<S: NotifySink> {
     shown: HashMap<String, (String, String)>,
     /// Apps released by a thaw during the current tick.
     thawed: HashSet<String>,
+    /// Cgroups whose thaw failed, so they may still be frozen, with their app.
+    stuck: HashMap<String, String>,
+    /// Whether a cgroup directory still exists. A `stuck` entry whose
+    /// cgroup is gone is dropped: nothing is left that could stay frozen.
+    cgroup_exists: Box<dyn Fn(&str) -> bool>,
     pressure_shown: bool,
     last_pressure_ms: Option<u64>,
 }
@@ -271,6 +286,8 @@ impl<S: NotifySink> Notifier<S> {
             names: HashMap::new(),
             shown: HashMap::new(),
             thawed: HashSet::new(),
+            stuck: HashMap::new(),
+            cgroup_exists: Box::new(|cg| super::cgfs::abs(cg).is_dir()),
             pressure_shown: false,
             last_pressure_ms: None,
         }
@@ -316,15 +333,27 @@ impl<S: NotifySink> Notifier<S> {
                     },
                 );
             }
-            // A release closes the notification even if the undo reported
-            // an error: the guard no longer holds the cgroup either way.
+            // A failed thaw may leave the app frozen, so its notification
+            // says so instead of closing.
             Action::Thaw { res } => {
                 if let Some(h) = self.held.remove(&res.cgroup) {
-                    self.thawed.insert(h.app);
+                    if applied.is_some() {
+                        self.thawed.insert(h.app);
+                    } else {
+                        self.stuck.insert(res.cgroup.clone(), h.app);
+                    }
+                }
+                if applied.is_some() {
+                    self.stuck.remove(&res.cgroup);
                 }
             }
+            // A cap lift closes the notification even if it reported an
+            // error: the guard no longer holds the cgroup either way.
             Action::LiftCap { res } => {
                 self.held.remove(&res.cgroup);
+                if applied.is_some() {
+                    self.stuck.remove(&res.cgroup);
+                }
             }
         }
     }
@@ -340,6 +369,10 @@ impl<S: NotifySink> Notifier<S> {
         name: &mut dyn FnMut(&str, &str) -> String,
     ) {
         let thawed = std::mem::take(&mut self.thawed);
+        // The policy has dropped a cgroup whose thaw failed, so no later
+        // release will clear it; stop saying it may be paused once it is gone.
+        let exists = &self.cgroup_exists;
+        self.stuck.retain(|cg, _| exists(cg));
         if !self.flags.notify {
             return;
         }
@@ -374,6 +407,16 @@ impl<S: NotifySink> Notifier<S> {
             };
             want.entry(h.app.clone()).or_insert(text);
         }
+        let mut stuck: Vec<(&String, &String)> = self.stuck.iter().collect();
+        stuck.sort();
+        for (cgroup, app) in stuck {
+            if !self.names.contains_key(app) {
+                self.names.insert(app.clone(), name(app, cgroup));
+            }
+            let display = self.names.get(app).map_or(app.as_str(), |n| n.as_str());
+            want.entry(app.clone())
+                .or_insert_with(|| failed_resume_text(display));
+        }
 
         let mut gone: Vec<String> = self
             .shown
@@ -386,9 +429,12 @@ impl<S: NotifySink> Notifier<S> {
             self.sink.close(&app);
             self.shown.remove(&app);
         }
-        let (held, shown) = (&self.held, &self.shown);
-        self.names
-            .retain(|app, _| shown.contains_key(app) || held.values().any(|h| h.app == *app));
+        let (held, shown, stuck) = (&self.held, &self.shown, &self.stuck);
+        self.names.retain(|app, _| {
+            shown.contains_key(app)
+                || held.values().any(|h| h.app == *app)
+                || stuck.values().any(|a| a == app)
+        });
         let mut changed: Vec<(String, (String, String))> = want
             .into_iter()
             .filter(|(app, text)| self.shown.get(app) != Some(text))
@@ -416,6 +462,7 @@ impl<S: NotifySink> Notifier<S> {
 
     /// Close every notification this notifier has open (guard shutdown).
     pub fn close_all(&mut self) {
+        self.stuck.clear();
         let mut apps: Vec<String> = self.shown.drain().map(|(app, _)| app).collect();
         apps.sort();
         for app in apps {
@@ -863,7 +910,9 @@ mod tests {
             notify_pressure: pressure,
             ..GuardConfig::default()
         };
-        Notifier::new(Fake::default(), &cfg)
+        let mut n = Notifier::new(Fake::default(), &cfg);
+        n.cgroup_exists = Box::new(|_| true);
+        n
     }
 
     fn names(key: &str, _cg: &str) -> String {
@@ -969,6 +1018,68 @@ mod tests {
         n.take();
         n.record(&Action::LiftCap { res: res("/a") }, None);
         n.end_tick(1_000, Memory::Fine, &mut names);
+        assert_eq!(n.take(), vec![Call::Close("firefox".into())]);
+    }
+
+    fn not_resumed() -> Call {
+        let (t, b) = failed_resume_text("Firefox");
+        Call::Show("firefox".into(), t, b)
+    }
+
+    #[test]
+    fn a_failed_thaw_replaces_the_notification_instead_of_closing() {
+        assert_eq!(
+            failed_resume_text("Firefox"),
+            (
+                "Firefox could not be resumed".to_string(),
+                "It may stay paused. Run rlm guard status for details.".to_string()
+            )
+        );
+        let mut n = notifier(true, false);
+        n.record(&freeze("/a"), ok());
+        n.end_tick(0, Memory::Low, &mut names);
+        n.take();
+        n.record(&Action::Thaw { res: res("/a") }, None);
+        n.end_tick(5_000, Memory::Fine, &mut names);
+        assert_eq!(n.take(), vec![not_resumed()]);
+        n.end_tick(6_000, Memory::Fine, &mut names);
+        assert!(n.take().is_empty(), "stays up");
+        n.close_all();
+        assert_eq!(n.take(), vec![Call::Close("firefox".into())]);
+    }
+
+    #[test]
+    fn a_failed_thaw_notice_closes_once_its_cgroup_is_gone() {
+        let exists = std::rc::Rc::new(std::cell::Cell::new(true));
+        let mut n = notifier(true, false);
+        let e = exists.clone();
+        n.cgroup_exists = Box::new(move |cg| cg != "/a" || e.get());
+        n.record(&freeze("/a"), ok());
+        n.end_tick(0, Memory::Low, &mut names);
+        n.record(&Action::Thaw { res: res("/a") }, None);
+        n.end_tick(5_000, Memory::Fine, &mut names);
+        assert_eq!(n.take(), vec![paused(), not_resumed()]);
+        exists.set(false);
+        n.end_tick(6_000, Memory::Fine, &mut names);
+        assert_eq!(n.take(), vec![Call::Close("firefox".into())]);
+        n.end_tick(7_000, Memory::Fine, &mut names);
+        assert!(n.take().is_empty());
+    }
+
+    #[test]
+    fn a_later_successful_release_closes_the_failed_thaw_notice() {
+        let mut n = notifier(true, false);
+        n.record(&freeze("/a"), ok());
+        n.end_tick(0, Memory::Low, &mut names);
+        n.record(&Action::Thaw { res: res("/a") }, None);
+        n.end_tick(5_000, Memory::Low, &mut names);
+        n.take();
+        n.record(&freeze("/a"), ok());
+        n.end_tick(6_000, Memory::Low, &mut names);
+        assert_eq!(n.take(), vec![paused()]);
+        n.record(&Action::Thaw { res: res("/a") }, ok());
+        n.end_tick(11_000, Memory::Fine, &mut names);
+        n.end_tick(12_000, Memory::Fine, &mut names);
         assert_eq!(n.take(), vec![Call::Close("firefox".into())]);
     }
 

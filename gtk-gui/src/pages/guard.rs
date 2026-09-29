@@ -140,17 +140,21 @@ fn rlm_binary_for(current_exe: Option<&std::path::Path>) -> PathBuf {
 const GUARD_VERB_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Run `cmd` with stdin and stdout closed and return its exit status and
-/// stderr, or `None` if it did not exit within `timeout` (it is then killed
-/// and reaped). stderr is drained on a separate thread so a chatty child
-/// cannot block on a full pipe; after exit we wait at most a second for it,
-/// since a grandchild may still hold the pipe open.
+/// stderr, or `None` if it did not exit within `timeout`. The child runs in
+/// its own process group, so on timeout the whole group is killed (with any
+/// `systemctl` it started) and the child is reaped. stderr is drained on a
+/// separate thread so a chatty child cannot block on a full pipe; after exit
+/// we wait at most a second for it, since a grandchild may still hold the
+/// pipe open.
 fn output_with_timeout(
     mut cmd: std::process::Command,
     timeout: Duration,
 ) -> std::io::Result<Option<(std::process::ExitStatus, String)>> {
     use std::io::Read;
+    use std::os::unix::process::CommandExt;
     use std::process::Stdio;
     let mut child = cmd
+        .process_group(0)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -171,6 +175,16 @@ fn output_with_timeout(
             return Ok(Some((status, text)));
         }
         if Instant::now() >= deadline {
+            // The group id is the child's pid (process_group(0)). The child
+            // is not reaped yet, so the id cannot have been reused.
+            if let Ok(pgid) = i32::try_from(child.id()) {
+                // SAFETY: kill() only sends a signal; a negative pid names
+                // the process group, which holds just the child and its own
+                // children.
+                unsafe {
+                    libc::kill(-pgid, libc::SIGKILL);
+                }
+            }
             let _ = child.kill();
             let _ = child.wait();
             return Ok(None);
@@ -244,7 +258,7 @@ pub fn pressure_summary(sample: Option<&Sample>, t: &GuardTrigger, acting: bool)
     }
 }
 
-/// The Policy row in plain words, from the guard config. Below the free
+/// The Policy row in plain words, from the guard config. Below the available
 /// memory floor the guard acts without waiting for stalls (the level is
 /// Critical there), so the wording does not claim stalls are always needed.
 pub fn policy_summary(g: &GuardConfig) -> String {
@@ -254,7 +268,7 @@ pub fn policy_summary(g: &GuardConfig) -> String {
     }
     let t = &g.trigger;
     format!(
-        "Steps in when apps stall and free memory is below {}%, or at once below {}",
+        "Steps in when apps stall and available memory is below {}%, or at once below {}",
         t.act_below_available_pct,
         mb_text(t.mem_available_floor_mb)
     )
@@ -809,6 +823,38 @@ mod tests {
         assert!(start.elapsed() < Duration::from_secs(5));
     }
 
+    #[test]
+    fn output_with_timeout_kills_the_childs_own_children_too() {
+        // Like `rlm guard enable` waiting on a hung `systemctl`.
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("pid");
+        let script = format!("sleep 30 & echo $! > '{}'; wait", pid_file.display());
+        let r = output_with_timeout(sh(&script), Duration::from_millis(300)).unwrap();
+        assert!(r.is_none());
+        let pid: i32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        // The orphan is reaped by init or a subreaper; until then it is a zombie.
+        let gone = |pid: i32| {
+            std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .map(|s| {
+                    s.rsplit(')')
+                        .next()
+                        .unwrap_or("")
+                        .trim_start()
+                        .starts_with('Z')
+                })
+                .unwrap_or(true)
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !gone(pid) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(gone(pid), "grandchild {pid} still running");
+    }
+
     fn svc(a: &str, e: &str) -> ServiceState {
         ServiceState {
             active: a.into(),
@@ -929,7 +975,7 @@ mod tests {
             pressure_words(&sample(5.0, 4.0, 2000, 15155), &t, false),
             "no memory pressure"
         );
-        // Below the free-memory floor the guard is Critical with no PSI at all.
+        // Below the available-memory floor the guard is Critical with no PSI at all.
         assert_eq!(
             pressure_words(&sample(0.0, 0.0, 300, 15155), &t, false),
             "high memory pressure"
@@ -974,7 +1020,7 @@ mod tests {
     fn policy_and_config_in_plain_words() {
         assert_eq!(
             policy_summary(&GuardConfig::default()),
-            "Steps in when apps stall and free memory is below 20%, or at once below 400 MB"
+            "Steps in when apps stall and available memory is below 20%, or at once below 400 MB"
         );
         let off = GuardConfig {
             enabled: false,

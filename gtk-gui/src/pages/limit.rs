@@ -1046,8 +1046,14 @@ fn apply_limits(state: &Rc<RefCell<LimitState>>) {
                     // basename, so only save when every selected PID is the same
                     // app, otherwise the saved match_exe would be misleading.
                     if state.save_rule_switch.is_active() {
-                        match common_exe_basename(&state.all_processes.borrow(), &pids) {
-                            Some(exe) => match save_app_rule(
+                        let exe = common_exe_basename(&state.all_processes.borrow(), &pids);
+                        // A version-number name changes with every update, so a
+                        // rule keyed by it would stop matching.
+                        match (exe.as_deref().and_then(common::versioned_rule_name), exe) {
+                            (Some(problem), _) => msg.push_str(&format!(
+                                ". {problem} Limits were applied without saving a rule."
+                            )),
+                            (None, Some(exe)) => match save_app_rule(
                                 &exe,
                                 memory.clone(),
                                 cpu.clone(),
@@ -1070,7 +1076,7 @@ fn apply_limits(state: &Rc<RefCell<LimitState>>) {
                                 }
                                 Err(e) => msg.push_str(&format!("; could not save rule: {e}")),
                             },
-                            None => msg.push_str(
+                            (None, None) => msg.push_str(
                                 "; (rule not saved: select instances of a single application)",
                             ),
                         }

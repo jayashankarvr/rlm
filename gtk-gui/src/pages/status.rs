@@ -507,6 +507,11 @@ impl StatusPage {
         }
         let result = restore_limit(row)
             .and_then(|limit| manager.apply_limit_to_multiple(&alive, &limit, &row.cgroup));
+        // The launch's own cleanup poll stopped when the cgroup was removed,
+        // so start another one for the restored cgroup.
+        if result.is_ok() && super::run::is_launch_cgroup(&row.cgroup) {
+            super::run::schedule_cleanup(manager.clone(), row.cgroup.clone());
+        }
         self.refresh();
         match result {
             Ok(warnings) if warnings.is_empty() => {}
