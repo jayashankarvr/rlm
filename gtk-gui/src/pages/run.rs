@@ -526,30 +526,8 @@ fn run_command(state: &Rc<RefCell<RunState>>) {
         }
         if !cleanup_once(&manager_clone, &name) {
             // Remove the cgroup once the processes the launcher left behind
-            // have exited too, so it does not linger empty. Keep polling
-            // while the directory exists, even if cgroup.events is unreadable.
-            // Give up after a minute of failed removals (e.g. a child
-            // cgroup or a permission error) instead of retrying forever.
-            let manager = manager_clone.clone();
-            let name = name.clone();
-            let mut failed_removals = 0u32;
-            glib::timeout_add_seconds_local(5, move || {
-                match cleanup_step(manager.cgroup_exists(&name), manager.is_populated(&name)) {
-                    CleanupStep::Done => glib::ControlFlow::Break,
-                    CleanupStep::Wait => glib::ControlFlow::Continue,
-                    CleanupStep::TryRemove => {
-                        if matches!(manager.remove_if_empty(&name), Ok(true)) {
-                            return glib::ControlFlow::Break;
-                        }
-                        failed_removals += 1;
-                        if failed_removals >= 12 {
-                            glib::ControlFlow::Break
-                        } else {
-                            glib::ControlFlow::Continue
-                        }
-                    }
-                }
-            });
+            // have exited too, so it does not linger empty.
+            schedule_cleanup(manager_clone.clone(), name.clone());
         }
         let text = if lines.is_empty() {
             format!("Process {pid} exited")
@@ -609,6 +587,38 @@ fn cleanup_once(manager: &CgroupManager, name: &str) -> bool {
         CleanupStep::Wait => false,
         CleanupStep::TryRemove => matches!(manager.remove_if_empty(name), Ok(true)),
     }
+}
+
+/// Poll every 5 s and remove cgroup `name` once it is empty. Keeps polling
+/// while the directory exists, even if cgroup.events is unreadable, and gives
+/// up after a minute of failed removals (e.g. a child cgroup or a permission
+/// error) instead of retrying forever.
+pub(super) fn schedule_cleanup(manager: Arc<CgroupManager>, name: String) {
+    let mut failed_removals = 0u32;
+    glib::timeout_add_seconds_local(5, move || {
+        match cleanup_step(manager.cgroup_exists(&name), manager.is_populated(&name)) {
+            CleanupStep::Done => glib::ControlFlow::Break,
+            CleanupStep::Wait => glib::ControlFlow::Continue,
+            CleanupStep::TryRemove => {
+                if matches!(manager.remove_if_empty(&name), Ok(true)) {
+                    return glib::ControlFlow::Break;
+                }
+                failed_removals += 1;
+                if failed_removals >= 12 {
+                    glib::ControlFlow::Break
+                } else {
+                    glib::ControlFlow::Continue
+                }
+            }
+        }
+    });
+}
+
+/// Whether `cgroup` holds a launched command (`gtk-*` from Launch New,
+/// `run-*` from `rlm run`), which nothing but a cleanup poll removes once
+/// it empties.
+pub(super) fn is_launch_cgroup(cgroup: &str) -> bool {
+    cgroup.starts_with("gtk-") || cgroup.starts_with("run-")
 }
 
 fn show_status(label: &gtk::Label, message: &str, is_error: bool) {
@@ -721,5 +731,14 @@ mod tests {
         assert_eq!(cleanup_step(true, Some(true)), CleanupStep::Wait);
         assert_eq!(cleanup_step(true, Some(false)), CleanupStep::TryRemove);
         assert_eq!(cleanup_step(true, None), CleanupStep::TryRemove);
+    }
+
+    #[test]
+    fn only_launch_cgroups_need_the_cleanup_poll() {
+        assert!(is_launch_cgroup("gtk-123-0"));
+        assert!(is_launch_cgroup("run-45-2"));
+        assert!(!is_launch_cgroup("app-firefox"));
+        assert!(!is_launch_cgroup("pid-42"));
+        assert!(!is_launch_cgroup("multi-7"));
     }
 }
