@@ -1211,6 +1211,7 @@ version = "0.2.5"
 dependencies = [
  "gtk4",
  "libadwaita",
+ "libc",
  "open",
  "rlmctl-common",
  "rlmctl-core",

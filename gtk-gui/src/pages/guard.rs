@@ -140,17 +140,21 @@ fn rlm_binary_for(current_exe: Option<&std::path::Path>) -> PathBuf {
 const GUARD_VERB_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Run `cmd` with stdin and stdout closed and return its exit status and
-/// stderr, or `None` if it did not exit within `timeout` (it is then killed
-/// and reaped). stderr is drained on a separate thread so a chatty child
-/// cannot block on a full pipe; after exit we wait at most a second for it,
-/// since a grandchild may still hold the pipe open.
+/// stderr, or `None` if it did not exit within `timeout`. The child runs in
+/// its own process group, so on timeout the whole group is killed (with any
+/// `systemctl` it started) and the child is reaped. stderr is drained on a
+/// separate thread so a chatty child cannot block on a full pipe; after exit
+/// we wait at most a second for it, since a grandchild may still hold the
+/// pipe open.
 fn output_with_timeout(
     mut cmd: std::process::Command,
     timeout: Duration,
 ) -> std::io::Result<Option<(std::process::ExitStatus, String)>> {
     use std::io::Read;
+    use std::os::unix::process::CommandExt;
     use std::process::Stdio;
     let mut child = cmd
+        .process_group(0)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -171,6 +175,16 @@ fn output_with_timeout(
             return Ok(Some((status, text)));
         }
         if Instant::now() >= deadline {
+            // The group id is the child's pid (process_group(0)). The child
+            // is not reaped yet, so the id cannot have been reused.
+            if let Ok(pgid) = i32::try_from(child.id()) {
+                // SAFETY: kill() only sends a signal; a negative pid names
+                // the process group, which holds just the child and its own
+                // children.
+                unsafe {
+                    libc::kill(-pgid, libc::SIGKILL);
+                }
+            }
             let _ = child.kill();
             let _ = child.wait();
             return Ok(None);
@@ -807,6 +821,38 @@ mod tests {
         let r = output_with_timeout(sh("exec sleep 30"), Duration::from_millis(200)).unwrap();
         assert!(r.is_none());
         assert!(start.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn output_with_timeout_kills_the_childs_own_children_too() {
+        // Like `rlm guard enable` waiting on a hung `systemctl`.
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("pid");
+        let script = format!("sleep 30 & echo $! > '{}'; wait", pid_file.display());
+        let r = output_with_timeout(sh(&script), Duration::from_millis(300)).unwrap();
+        assert!(r.is_none());
+        let pid: i32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        // The orphan is reaped by init or a subreaper; until then it is a zombie.
+        let gone = |pid: i32| {
+            std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .map(|s| {
+                    s.rsplit(')')
+                        .next()
+                        .unwrap_or("")
+                        .trim_start()
+                        .starts_with('Z')
+                })
+                .unwrap_or(true)
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !gone(pid) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(gone(pid), "grandchild {pid} still running");
     }
 
     fn svc(a: &str, e: &str) -> ServiceState {
