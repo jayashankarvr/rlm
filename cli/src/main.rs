@@ -988,15 +988,6 @@ fn guard_enable() -> Result<ExitCode> {
     let current_exe = std::env::current_exe().ok();
     let path_env = std::env::var_os("PATH");
     let guard_bin = guard_unit::find_guard_binary(current_exe.as_deref(), path_env.as_deref());
-    if let Some(bin) = &guard_bin {
-        if let Some(problem) = guard_unit::unit_path_problem(bin) {
-            eprintln!(
-                "error: cannot write a unit for {}: {problem}. Install rlm-guard under a plain path and rerun: rlm guard enable",
-                bin.display()
-            );
-            return Ok(ExitCode::FAILURE);
-        }
-    }
     let system_dirs: Vec<&std::path::Path> = guard_unit::SYSTEM_UNIT_DIRS
         .iter()
         .map(std::path::Path::new)
@@ -1007,6 +998,16 @@ fn guard_enable() -> Result<ExitCode> {
         guard_bin.as_deref(),
         &unit_path,
     );
+    if let (Some(problem), Some(bin)) = (
+        guard_unit::plan_path_problem(&plan, guard_bin.as_deref()),
+        &guard_bin,
+    ) {
+        eprintln!(
+            "error: cannot write a unit for {}: {problem}. Install rlm-guard under a plain path and rerun: rlm guard enable",
+            bin.display()
+        );
+        return Ok(ExitCode::FAILURE);
+    }
     let mut unit_written = false;
     match plan {
         guard_unit::EnablePlan::NoBinary => {

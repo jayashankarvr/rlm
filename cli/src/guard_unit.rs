@@ -175,6 +175,15 @@ pub fn plan_enable(
     }
 }
 
+/// Why the user unit `plan` would write cannot point at `bin`, if it would
+/// write one. Plans that write nothing never fail on the binary's path.
+pub fn plan_path_problem(plan: &EnablePlan, bin: Option<&Path>) -> Option<&'static str> {
+    match (plan, bin) {
+        (EnablePlan::WriteUserUnit { .. }, Some(bin)) => unit_path_problem(bin),
+        _ => None,
+    }
+}
+
 /// Error for `rlm guard enable` when `systemctl --user is-enabled` reports
 /// the unit as masked (`masked` or `masked-runtime`). A masked user unit is
 /// a symlink to `/dev/null` at the user unit path, which would otherwise read
@@ -436,6 +445,22 @@ mod tests {
             plan_enable(false, Some("[Service]\nExecStart=/mine\n"), Some(bin), unit),
             EnablePlan::UserUnitCustom
         );
+    }
+
+    #[test]
+    fn path_problems_matter_only_when_a_unit_is_written() {
+        let unit = Path::new("/h/.config/systemd/user/rlm-guard.service");
+        let bad = Path::new("/h/it's/rlm-guard");
+        let plan = plan_enable(true, None, Some(bad), unit);
+        assert_eq!(plan, EnablePlan::UseSystemUnit);
+        assert_eq!(plan_path_problem(&plan, Some(bad)), None);
+        let plan = plan_enable(false, Some("[Service]\nExecStart=/mine\n"), Some(bad), unit);
+        assert_eq!(plan_path_problem(&plan, Some(bad)), None);
+        let plan = plan_enable(false, None, Some(bad), unit);
+        assert!(plan_path_problem(&plan, Some(bad)).is_some());
+        let good = Path::new("/h/.cargo/bin/rlm-guard");
+        let plan = plan_enable(false, None, Some(good), unit);
+        assert_eq!(plan_path_problem(&plan, Some(good)), None);
     }
 
     #[test]
