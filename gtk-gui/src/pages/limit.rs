@@ -1050,12 +1050,9 @@ fn apply_limits(state: &Rc<RefCell<LimitState>>) {
                         // A version-number name changes with every update, so a
                         // rule keyed by it would stop matching.
                         match (exe.as_deref().and_then(common::versioned_rule_name), exe) {
-                            (Some(problem), _) => {
-                                msg = format!(
-                                    "{problem} Limits were applied without saving a rule{}.",
-                                    skipped_note(gone)
-                                );
-                            }
+                            (Some(problem), _) => msg.push_str(&format!(
+                                ". {problem} Limits were applied without saving a rule."
+                            )),
                             (None, Some(exe)) => match save_app_rule(
                                 &exe,
                                 memory.clone(),
