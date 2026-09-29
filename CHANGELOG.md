@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.6] - 2026-09-29
+
+### Fixed
+
+- The guard keeps its lock, journal and history in `$XDG_RUNTIME_DIR` only when that directory is yours and not writable by others.
+- When the guard cannot resume a paused app, its notification says "<App> could not be resumed" instead of disappearing. It closes once the app is released, exits or the guard stops.
+- `rlm guard enable` checks the path of `rlm-guard` only when it is about to write a user unit, so a packaged or custom unit is no longer refused.
+- `rlm limit --save` with an invalid config file now fails before applying any limit, instead of applying and then failing to save the rule.
+- A rule is no longer saved for an app whose program name is only a version number (such as `2.1.283`), because it would stop matching after an update. The CLI refuses `--save` before acting; the desktop app applies the limits and says why no rule was saved.
+- Desktop app: when turning the guard on or off takes too long, the `systemctl` it started is stopped too.
+- Desktop app: after Undo on a limit started from Launch New, the cgroup is removed once its processes exit, instead of staying behind empty.
+- Desktop app and website: the guard's policy says "available memory", like the CLI.
+
 ## [0.2.5] - 2026-09-28
 
 ### Changed
