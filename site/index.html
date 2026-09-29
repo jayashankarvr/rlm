@@ -440,7 +440,7 @@ rlm import profiles.yaml         <span class="c"># import profiles</span></code>
       <h2>The guard</h2>
       <p>When memory runs short, Linux usually freezes the whole desktop for minutes and then kills something. rlm-guard steps in earlier and more gently.</p>
       <ul class="plain">
-        <li>It acts when apps stall on memory and free memory is below 20% of RAM, or at once when free memory drops below 400 MB.</li>
+        <li>It acts when apps stall on memory and available memory is below 20% of RAM, or at once when available memory drops below 400 MB.</li>
         <li>It freezes the app that is growing for 5 seconds, then caps it with a soft limit if pressure stays high.</li>
         <li>A freeze always ends after those 5 seconds; a cap is lifted after 30 seconds of calm.</li>
         <li>It never sends a signal to any process, and it holds at most 3 apps at a time.</li>
@@ -493,7 +493,7 @@ rlm guard disable   <span class="c"># stop and disable the service</span></code>
       </details>
       <details class="q">
         <summary>Why did it not act when my machine was slow?</summary>
-        <div>It needs your apps to be stalling on memory while free memory is below 20% of RAM, or free memory below 400 MB. Slowness from CPU or disk load does not count. An app hitting a limit you set yourself does not count either: the rest of the system is fine.</div>
+        <div>It needs your apps to be stalling on memory while available memory is below 20% of RAM, or available memory below 400 MB. Slowness from CPU or disk load does not count. An app hitting a limit you set yourself does not count either: the rest of the system is fine.</div>
       </details>
       <details class="q">
         <summary>How hard is a cap?</summary>
