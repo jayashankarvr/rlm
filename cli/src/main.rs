@@ -107,17 +107,24 @@ fn validate_limit_args(save: bool, application: Option<&str>) -> Result<()> {
 /// error (with the file and the parse error) rather than a silent fallback
 /// to defaults that would drop the user's protected apps. With `--force` the
 /// protect list is not consulted, so the command continues on the defaults
-/// and returns a warning to print instead.
+/// and returns a warning to print instead. `--save` writes the rule into
+/// the config, so with `save` an invalid config is always an error, decided
+/// here before anything is applied.
 fn config_for_limit(
     loaded: Result<Config>,
     force: bool,
+    save: bool,
     path: &str,
 ) -> std::result::Result<(Config, Option<String>), String> {
     match loaded {
         Ok(c) => Ok((c, None)),
         Err(e) => {
             let line = rlm_core::guard::report::config_error_line(path, &e);
-            if force {
+            if save {
+                Err(format!(
+                    "error: config {line}\n  --save writes the rule into this file, so it needs a valid config. Fix the file, or run without --save. Nothing was limited."
+                ))
+            } else if force {
                 Ok((
                     Config::default(),
                     Some(format!(
@@ -463,6 +470,7 @@ fn run() -> Result<ExitCode> {
             let config = match config_for_limit(
                 Config::load(),
                 force,
+                save,
                 &rlm_core::guard::report::config_error_path(),
             ) {
                 Ok((config, warning)) => {
@@ -1318,16 +1326,29 @@ mod tests {
     fn limit_refuses_an_invalid_config_unless_forced() {
         let path = "/h/.config/rlm/config.yaml";
         let bad = || Err(Error::Config("failed to parse: unknown field".into()));
-        let msg = config_for_limit(bad(), false, path).unwrap_err();
+        let msg = config_for_limit(bad(), false, false, path).unwrap_err();
         assert!(msg.contains(path), "{msg}");
         assert!(msg.contains("unknown field"), "{msg}");
         assert!(msg.contains("--force"), "{msg}");
-        let (cfg, warning) = config_for_limit(bad(), true, path).unwrap();
+        let (cfg, warning) = config_for_limit(bad(), true, false, path).unwrap();
         assert!(cfg.guard.selection.protect.is_empty());
         let warning = warning.unwrap();
         assert!(warning.starts_with("warning:") && warning.contains(path));
-        let (_, none) = config_for_limit(Ok(Config::default()), false, path).unwrap();
+        let (_, none) = config_for_limit(Ok(Config::default()), false, false, path).unwrap();
         assert_eq!(none, None);
+    }
+
+    #[test]
+    fn save_needs_a_valid_config_even_with_force() {
+        let path = "/h/.config/rlm/config.yaml";
+        let bad = || Err(Error::Config("failed to parse: unknown field".into()));
+        for force in [false, true] {
+            let msg = config_for_limit(bad(), force, true, path).unwrap_err();
+            assert!(msg.starts_with("error: config"), "{msg}");
+            assert!(msg.contains(path) && msg.contains("unknown field"), "{msg}");
+            assert!(msg.contains("--save"), "{msg}");
+        }
+        assert!(config_for_limit(Ok(Config::default()), true, true, path).is_ok());
     }
 
     #[test]
