@@ -92,12 +92,22 @@ fn needs_cgroup_manager(cmd: &Commands) -> bool {
 /// `--save` persists a rule keyed by the application executable; without
 /// `--application` there is nothing to key it by. clap's `requires` on
 /// `--save` does not actually enforce this (see the regression test), so it
-/// is checked explicitly here before anything else runs.
+/// is checked explicitly here before anything else runs. A rule keyed by a
+/// version-number program name would stop matching after an update, so
+/// `--save` refuses one before anything is applied.
 fn validate_limit_args(save: bool, application: Option<&str>) -> Result<()> {
-    if save && application.is_none() {
+    if !save {
+        return Ok(());
+    }
+    let Some(app) = application else {
         return Err(Error::InvalidArgs(
             "--save requires --application (there is nothing else to key the saved rule by)".into(),
         ));
+    };
+    if let Some(problem) = common::versioned_rule_name(app) {
+        return Err(Error::InvalidArgs(format!(
+            "--save: {problem} Nothing was limited; run without --save to limit it without a rule."
+        )));
     }
     Ok(())
 }
@@ -1416,6 +1426,16 @@ mod tests {
         assert!(validate_limit_args(true, None).is_err());
         assert!(validate_limit_args(true, Some("firefox")).is_ok());
         assert!(validate_limit_args(false, None).is_ok());
+    }
+
+    #[test]
+    fn save_refuses_a_version_number_program_name() {
+        let e = validate_limit_args(true, Some("2.1.283"))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("version number (2.1.283)"), "{e}");
+        assert!(e.contains("without --save"), "{e}");
+        assert!(validate_limit_args(false, Some("2.1.283")).is_ok());
     }
 
     #[test]
