@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- README: a memory limit turns swap off so the app does not thrash swap at its limit, and past it the kernel's OOM killer ends a process in it; the old wording said "does not thrash the disk" and "the kernel stops it".
+- `scripts/demo-memory-pressure.sh`: an option given without a value prints usage instead of a bash error, values with a leading zero (`08`) are read as decimal, and the `--hold` error says "more than 5 seconds shorter".
+
 ## [0.2.7] - 2026-09-30
 
 ### Changed

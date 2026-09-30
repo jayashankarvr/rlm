@@ -42,7 +42,7 @@ systemd can already limit a command: `systemd-run --user --scope -p MemoryMax=2G
 
 - Apps that are already running. A browser is spread over many processes, often in more than one scope. `rlm limit --application firefox` finds all of them and puts them under one shared limit, without restarting anything.
 - Limits that come back. A saved rule applies to an app every time it starts, and profiles give names to limit sets you use often.
-- Limits that behave well. A memory limit also sets `memory.high` at 90% so reclaim starts before the hard limit, and turns swap off for that app, so at its limit it does not thrash the disk; if it still needs more, the kernel stops it instead.
+- Limits that behave well. A memory limit also sets `memory.high` at 90% so reclaim starts before the hard limit, and turns swap off for that app (where the kernel supports it), so at its limit it does not thrash swap; if it still needs more, the kernel's OOM killer ends a process in it.
 - A desktop app, for people who do not want to learn cgroups.
 
 earlyoom, nohang and systemd-oomd solve a different problem. When memory is nearly gone they end a process or a whole cgroup, so the system survives at the cost of that app. rlm-guard steps in earlier: it pauses the app that is growing for a few seconds, then, if pressure stays high, slows it with a soft cap, and gives it back once memory frees up. Nothing is killed. If memory still runs out, those tools and the kernel's own OOM killer work as before, so you can run them side by side.

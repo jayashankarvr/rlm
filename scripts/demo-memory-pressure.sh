@@ -41,21 +41,29 @@ usage() {
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --yes | -y) ASSUME_YES=1; shift ;;
-        --step-mb) STEP_MB="$2"; shift 2 ;;
-        --hold) HOLD_SECS="$2"; shift 2 ;;
-        --margin-mb) MARGIN_MB="$2"; shift 2 ;;
-        --max-seconds) MAX_SECONDS="$2"; shift 2 ;;
+        --step-mb | --hold | --margin-mb | --max-seconds)
+            [[ $# -ge 2 ]] || { echo "$1 needs a value" >&2; usage; }
+            case "$1" in
+                --step-mb) STEP_MB="$2" ;;
+                --hold) HOLD_SECS="$2" ;;
+                --margin-mb) MARGIN_MB="$2" ;;
+                --max-seconds) MAX_SECONDS="$2" ;;
+            esac
+            shift 2 ;;
         -h | --help) usage ;;
         *) echo "unknown option: $1" >&2; usage ;;
     esac
 done
 
-for n in "$STEP_MB" "$HOLD_SECS" "$MARGIN_MB" "$MAX_SECONDS"; do
-    [[ "$n" =~ ^[0-9]+$ && "$n" -gt 0 ]] || { echo "options take positive whole numbers" >&2; exit 2; }
+for var in STEP_MB HOLD_SECS MARGIN_MB MAX_SECONDS; do
+    [[ "${!var}" =~ ^[0-9]{1,9}$ ]] || { echo "options take positive whole numbers" >&2; exit 2; }
+    # Base 10, so a leading zero (08) is not read as octal.
+    printf -v "$var" '%d' "$((10#${!var}))"
+    (( ${!var} > 0 )) || { echo "options take positive whole numbers" >&2; exit 2; }
 done
 
 (( HOLD_SECS + 5 < MAX_SECONDS )) \
-    || { echo "--hold must be at least 5 seconds shorter than --max-seconds, or the hog has no time to grow" >&2; exit 2; }
+    || { echo "--hold must be more than 5 seconds shorter than --max-seconds, or the hog has no time to grow" >&2; exit 2; }
 
 say() { printf '[demo] %s\n' "$*"; }
 die() { printf '[demo] %s\n' "$*" >&2; exit 1; }
