@@ -5,7 +5,7 @@
 //! in place by "<App> slowed down" after a cap, and closed when the app is
 //! released. A thaw that fails replaces it with "<App> could not be
 //! resumed", which stays until a later release of that cgroup succeeds, the
-//! cgroup is gone, or the guard shuts down. Failed freezes and caps show
+//! cgroup is gone or no longer frozen, or the guard shuts down. Failed freezes and caps show
 //! nothing (they are in the history and the journal). An optional early
 //! warning ("Memory is running low") is sent at most once a minute while
 //! pressure is High or Critical and no app is held.
@@ -245,9 +245,11 @@ pub struct Notifier<S: NotifySink> {
     thawed: HashSet<String>,
     /// Cgroups whose thaw failed, so they may still be frozen, with their app.
     stuck: HashMap<String, String>,
-    /// Whether a cgroup directory still exists. A `stuck` entry whose
-    /// cgroup is gone is dropped: nothing is left that could stay frozen.
-    cgroup_exists: Box<dyn Fn(&str) -> bool>,
+    /// Whether a cgroup may still be frozen: it exists and its
+    /// `cgroup.events` says `frozen 1`. A `stuck` entry for which this is
+    /// false is dropped: the cgroup is gone, or something (a later thaw by
+    /// hand, or the app's cgroup being recreated) left it running.
+    still_frozen: Box<dyn Fn(&str) -> bool>,
     pressure_shown: bool,
     last_pressure_ms: Option<u64>,
 }
@@ -263,7 +265,7 @@ impl<S: NotifySink> Notifier<S> {
             shown: HashMap::new(),
             thawed: HashSet::new(),
             stuck: HashMap::new(),
-            cgroup_exists: Box::new(|cg| super::cgfs::abs(cg).is_dir()),
+            still_frozen: Box::new(|cg| super::cgfs::read_frozen(cg) == Some(true)),
             pressure_shown: false,
             last_pressure_ms: None,
         }
@@ -346,9 +348,10 @@ impl<S: NotifySink> Notifier<S> {
     ) {
         let thawed = std::mem::take(&mut self.thawed);
         // The policy has dropped a cgroup whose thaw failed, so no later
-        // release will clear it; stop saying it may be paused once it is gone.
-        let exists = &self.cgroup_exists;
-        self.stuck.retain(|cg, _| exists(cg));
+        // release will clear it; stop saying it may be paused once it is
+        // gone or no longer frozen.
+        let frozen = &self.still_frozen;
+        self.stuck.retain(|cg, _| frozen(cg));
         if !self.flags.notify {
             return;
         }
@@ -887,7 +890,7 @@ mod tests {
             ..GuardConfig::default()
         };
         let mut n = Notifier::new(Fake::default(), &cfg);
-        n.cgroup_exists = Box::new(|_| true);
+        n.still_frozen = Box::new(|_| true);
         n
     }
 
@@ -1025,21 +1028,32 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_thaw_notice_closes_once_its_cgroup_is_gone() {
-        let exists = std::rc::Rc::new(std::cell::Cell::new(true));
+    fn a_failed_thaw_notice_closes_once_its_cgroup_is_gone_or_thawed() {
+        let frozen = std::rc::Rc::new(std::cell::Cell::new(true));
         let mut n = notifier(true, false);
-        let e = exists.clone();
-        n.cgroup_exists = Box::new(move |cg| cg != "/a" || e.get());
+        let f = frozen.clone();
+        n.still_frozen = Box::new(move |cg| cg != "/a" || f.get());
         n.record(&freeze("/a"), ok());
         n.end_tick(0, Memory::Low, &mut names);
         n.record(&Action::Thaw { res: res("/a") }, None);
         n.end_tick(5_000, Memory::Fine, &mut names);
         assert_eq!(n.take(), vec![paused(), not_resumed()]);
-        exists.set(false);
+        n.end_tick(5_500, Memory::Fine, &mut names);
+        assert!(n.take().is_empty(), "stays up while still frozen");
+        frozen.set(false);
         n.end_tick(6_000, Memory::Fine, &mut names);
         assert_eq!(n.take(), vec![Call::Close("firefox".into())]);
         n.end_tick(7_000, Memory::Fine, &mut names);
         assert!(n.take().is_empty());
+    }
+
+    #[test]
+    fn the_default_check_reads_the_frozen_state() {
+        let n = Notifier::new(Fake::default(), &GuardConfig::default());
+        assert!(
+            !(n.still_frozen)("/rlm-test-no-such-cgroup-for-notify"),
+            "a missing cgroup is not frozen"
+        );
     }
 
     #[test]
