@@ -36,6 +36,17 @@ rlm sets memory, CPU and I/O limits on your own Linux processes without root, fr
 - Not a replacement for systemd-oomd or earlyoom. Those kill processes; rlm pauses and slows them. You can run both.
 - Run as your user, it has no effect on processes of other users or of root.
 
+### Why not systemd-run, earlyoom or systemd-oomd?
+
+systemd can already limit a command: `systemd-run --user --scope -p MemoryMax=2G cargo build` works, and for a one-off command that may be all you need. rlm is for the cases around it:
+
+- Apps that are already running. A browser is spread over many processes, often in more than one scope. `rlm limit --application firefox` finds all of them and puts them under one shared limit, without restarting anything.
+- Limits that come back. A saved rule applies to an app every time it starts, and profiles give names to limit sets you use often.
+- Limits that behave well. A memory limit also sets `memory.high` at 90% so reclaim starts before the hard limit, and turns swap off for that app so it cannot push the rest of the desktop into swap.
+- A desktop app, for people who do not want to learn cgroups.
+
+earlyoom, nohang and systemd-oomd solve a different problem. When memory is nearly gone they end a process or a whole cgroup, so the system survives at the cost of that app. rlm-guard steps in earlier: it pauses the app that is growing for a few seconds, then slows it with a soft cap, and gives it back once memory frees up. Nothing is killed. If memory still runs out, those tools and the kernel's own OOM killer work as before, so you can run them side by side.
+
 ## Supported distros
 
 The CLI and the guard run on any Linux with cgroup v2, PSI and systemd. The GUI (rlm-gtk) also needs GTK 4 and libadwaita 1.4 or newer.
