@@ -840,10 +840,10 @@ fn run() -> Result<ExitCode> {
                 println!("no processes currently managed");
             } else {
                 println!(
-                    "{:<8} {:<25} {:>12} {:>15} {:>10} {:>15}",
-                    "PID", "NAME", "MEMORY", "CPU", "I/O", "TYPE"
+                    "{}",
+                    status_line("PID", "NAME", "MEMORY", "CPU", "I/O", "TYPE")
                 );
-                println!("{}", "-".repeat(85));
+                println!("{}", "-".repeat(STATUS_WIDTH));
 
                 for p in processes {
                     let mem = p.memory_max.map(format_bytes).unwrap_or_else(|| "-".into());
@@ -856,18 +856,23 @@ fn run() -> Result<ExitCode> {
                     } else {
                         "-".to_string()
                     };
-                    let type_info = if p.is_shared {
-                        if let Some(count) = p.process_count {
-                            format!("shared ({} procs)", count)
-                        } else {
-                            "shared".to_string()
-                        }
-                    } else {
-                        "individual".to_string()
+                    let type_info = status_type(p.is_shared, p.process_count);
+                    let comm = (p.name != "?").then_some(p.name.as_str());
+                    let exe = rlm_core::appname::exe_of_pid(p.pid);
+                    let name = match exe.as_deref() {
+                        Some(exe) => rlm_core::appname::program_name(exe, comm),
+                        None => p.name.as_str(),
                     };
                     println!(
-                        "{:<8} {:<25} {:>12} {:>15} {:>10} {:>15}",
-                        p.pid, p.name, mem, cpu, io, type_info
+                        "{}",
+                        status_line(
+                            &p.pid.to_string(),
+                            &fit_name(name),
+                            &mem,
+                            &cpu,
+                            &io,
+                            &type_info
+                        )
                     );
                 }
                 println!("\nNote: 'shared' means multiple processes share the same limit pool");
@@ -1247,6 +1252,37 @@ impl rlm_core::guard::notify::NotifySink for PrintingSink {
     }
 }
 
+/// Width of the NAME column of `rlm status`.
+const NAME_WIDTH: usize = 24;
+/// Width of an `rlm status` line up to the end of the longest usual TYPE.
+const STATUS_WIDTH: usize = 80;
+
+/// One line of the `rlm status` table.
+fn status_line(pid: &str, name: &str, mem: &str, cpu: &str, io: &str, kind: &str) -> String {
+    format!("{pid:<8} {name:<NAME_WIDTH$} {mem:>8} {cpu:>6} {io:>8}  {kind}")
+}
+
+/// The TYPE column: "shared (1 process)", "shared (9 processes)", "shared"
+/// when the count is unknown, or "individual".
+fn status_type(is_shared: bool, count: Option<usize>) -> String {
+    match (is_shared, count) {
+        (true, Some(1)) => "shared (1 process)".to_string(),
+        (true, Some(n)) => format!("shared ({n} processes)"),
+        (true, None) => "shared".to_string(),
+        (false, _) => "individual".to_string(),
+    }
+}
+
+/// `name` cut to the NAME column, ending in "..." when it was longer.
+fn fit_name(name: &str) -> String {
+    if name.chars().count() <= NAME_WIDTH {
+        name.to_string()
+    } else {
+        let head: String = name.chars().take(NAME_WIDTH - 3).collect();
+        format!("{head}...")
+    }
+}
+
 /// `rlm guard test --notify`: drive the guard's own notifier through a
 /// sample freeze, cap and release of "firefox", so the user sees exactly
 /// what the guard would show. Nothing is frozen or capped: the actions are
@@ -1331,6 +1367,35 @@ fn guard_history(lines: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn status_rows_use_full_names_and_count_processes_in_english() {
+        assert_eq!(status_type(true, Some(1)), "shared (1 process)");
+        assert_eq!(status_type(true, Some(9)), "shared (9 processes)");
+        assert_eq!(status_type(true, None), "shared");
+        assert_eq!(status_type(false, Some(1)), "individual");
+        assert_eq!(fit_name("gnome-calculator"), "gnome-calculator");
+        assert_eq!(fit_name(&"x".repeat(NAME_WIDTH)), "x".repeat(NAME_WIDTH));
+        assert_eq!(
+            fit_name("org.example.AVeryLongProgramName"),
+            "org.example.AVeryLong..."
+        );
+        assert_eq!(
+            status_line("PID", "NAME", "MEMORY", "CPU", "I/O", "TYPE"),
+            "PID      NAME                       MEMORY    CPU      I/O  TYPE"
+        );
+        assert_eq!(
+            status_line(
+                "1217697",
+                "gnome-calculator",
+                "1.0G",
+                "50%",
+                "-",
+                "shared (1 process)"
+            ),
+            "1217697  gnome-calculator             1.0G    50%        -  shared (1 process)"
+        );
+    }
 
     #[test]
     fn limit_refuses_an_invalid_config_unless_forced() {

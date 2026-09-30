@@ -110,31 +110,7 @@ pub fn format_size(bytes: u64) -> String {
     }
 }
 
-/// A friendly name for the app key the guard uses (an exe basename, or
-/// `<basename>@<cgroup leaf>` for runtimes). In order: the `Name` of an
-/// installed desktop entry that runs this program (`desktop` maps program
-/// basename to name), else the process name `comm` when the basename has no
-/// letters (a versioned binary such as `2.1.283`), else the basename with its
-/// first letter upper-cased. The `@leaf` suffix is never shown.
-pub fn display_name(key: &str, desktop: &HashMap<String, String>, comm: Option<&str>) -> String {
-    let base = key.split('@').next().unwrap_or(key);
-    let has_letters = |s: &str| s.chars().any(char::is_alphabetic);
-    let program = match comm {
-        Some(c) if !has_letters(base) && has_letters(c) => c.trim(),
-        _ => base,
-    };
-    if let Some(name) = desktop.get(program).or_else(|| desktop.get(base)) {
-        return name.clone();
-    }
-    if program.is_empty() {
-        return "An app".to_string();
-    }
-    let mut chars = program.chars();
-    match chars.next() {
-        Some(first) => first.to_uppercase().chain(chars).collect(),
-        None => String::new(),
-    }
-}
+pub use crate::appname::display_name;
 
 /// Resolves app keys to [`display_name`]s from the system: installed
 /// desktop entries (read once) and, for versioned binaries, the process name
@@ -1435,32 +1411,5 @@ mod tests {
     #[test]
     fn notifications_use_the_server_default_lifetime() {
         assert_eq!(EXPIRE_TIMEOUT, -1);
-    }
-
-    #[test]
-    fn display_names() {
-        let mut desktop = HashMap::new();
-        desktop.insert("code".to_string(), "Visual Studio Code".to_string());
-        desktop.insert("claude".to_string(), "Claude".to_string());
-        assert_eq!(display_name("code", &desktop, None), "Visual Studio Code");
-        assert_eq!(display_name("firefox", &desktop, None), "Firefox");
-        assert_eq!(display_name("node@app-x.scope", &desktop, None), "Node");
-        assert_eq!(
-            display_name("python3@run-u12.service", &desktop, None),
-            "Python3"
-        );
-        assert_eq!(
-            display_name("2.1.283", &HashMap::new(), Some("claude")),
-            "Claude"
-        );
-        assert_eq!(display_name("2.1.283", &desktop, Some("claude")), "Claude");
-        assert_eq!(display_name("2.1.283", &desktop, None), "2.1.283");
-        assert_eq!(
-            display_name("firefox", &desktop, Some("Isolated Web Co")),
-            "Firefox",
-            "comm is only used when the basename has no letters"
-        );
-        assert_eq!(display_name("élan", &desktop, None), "Élan");
-        assert_eq!(display_name("", &desktop, None), "An app");
     }
 }

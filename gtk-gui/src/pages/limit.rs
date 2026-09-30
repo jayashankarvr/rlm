@@ -711,9 +711,14 @@ fn filter_processes(state: &Rc<RefCell<LimitState>>, query: &str) {
         // Group processes by executable
         let groups = rlm_core::process::group_by_executable(&processes);
 
+        // Each group with its friendly name ("Google Chrome" for chrome).
         let matching: Vec<_> = groups
             .iter()
-            .filter(|g| g.name.to_lowercase().contains(&query_lower))
+            .map(|g| {
+                let comm = g.processes.first().map(|p| p.name.as_str());
+                (g, rlm_core::appname::friendly_name(&g.name, comm))
+            })
+            .filter(|(g, app)| matches_query(&query_lower, &[app, &g.name]))
             .collect();
         total = matching.len();
         let filtered_groups: Vec<_> = matching.into_iter().take(MAX_APP_ROWS).collect();
@@ -728,15 +733,17 @@ fn filter_processes(state: &Rc<RefCell<LimitState>>, query: &str) {
             });
             list.append(&row);
         } else {
-            for group in filtered_groups {
+            for (group, app) in filtered_groups {
                 let row = adw::ExpanderRow::new();
-                row.set_title(&glib::markup_escape_text(&group.name));
                 let count = group.processes.len();
-                row.set_subtitle(&format!(
+                let detail = format!(
                     "{count} {}, {}",
                     if count == 1 { "process" } else { "processes" },
                     format_memory(group.rss_kb())
-                ));
+                );
+                let (title, subtitle) = row_texts(&app, &group.name, &detail);
+                row.set_title(&glib::markup_escape_text(&title));
+                row.set_subtitle(&glib::markup_escape_text(&subtitle));
                 let row_name = format!("group-{}", group.name.replace('/', "_"));
                 row.set_widget_name(&row_name);
                 state_ref
@@ -785,7 +792,14 @@ fn filter_processes(state: &Rc<RefCell<LimitState>>, query: &str) {
         let query_pid: Option<u32> = query.parse().ok();
         let matching: Vec<_> = processes
             .iter()
-            .filter(|p| p.name.to_lowercase().contains(&query_lower) || query_pid == Some(p.pid))
+            .map(|p| {
+                let app = rlm_core::appname::friendly_name(p.display_name(), Some(&p.name));
+                (p, app)
+            })
+            .filter(|(p, app)| {
+                query_pid == Some(p.pid)
+                    || matches_query(&query_lower, &[app, p.display_name(), &p.name])
+            })
             .collect();
         total = matching.len();
         let filtered: Vec<_> = matching.into_iter().take(MAX_PROCESS_ROWS).collect();
@@ -800,10 +814,12 @@ fn filter_processes(state: &Rc<RefCell<LimitState>>, query: &str) {
             });
             list.append(&row);
         } else {
-            for proc in filtered {
+            for (proc, app) in filtered {
                 let row = adw::ActionRow::new();
-                row.set_title(&glib::markup_escape_text(&proc.name));
-                row.set_subtitle(&format!("PID {}, {}", proc.pid, format_memory(proc.rss_kb)));
+                let detail = format!("PID {}, {}", proc.pid, format_memory(proc.rss_kb));
+                let (title, subtitle) = row_texts(&app, proc.display_name(), &detail);
+                row.set_title(&glib::markup_escape_text(&title));
+                row.set_subtitle(&glib::markup_escape_text(&subtitle));
                 row.set_activatable(true);
                 row.set_widget_name(&format!("proc-{}", proc.pid));
 
@@ -848,6 +864,25 @@ fn filter_processes(state: &Rc<RefCell<LimitState>>, query: &str) {
     state_ref.rebuilding.set(false);
     update_summary(&state_ref);
     fit_list_height(list);
+}
+
+/// Whether any of `names` contains `query_lower` (already lower-cased),
+/// ignoring case. An empty query matches everything.
+fn matches_query(query_lower: &str, names: &[&str]) -> bool {
+    names.iter().any(|n| n.to_lowercase().contains(query_lower))
+}
+
+/// Title and subtitle of a row for the app called `app` whose program is
+/// `program`: the friendly name as title, and the program name in front of
+/// `detail` when it is not just the same name, so the program people know
+/// from a terminal stays visible.
+fn row_texts(app: &str, program: &str, detail: &str) -> (String, String) {
+    let subtitle = if app.to_lowercase() == program.to_lowercase() {
+        detail.to_string()
+    } else {
+        format!("{program}, {detail}")
+    };
+    (app.to_string(), subtitle)
 }
 
 /// Memory in KB as "900 KB", "512 MB" or "1.2 GB".
@@ -1248,6 +1283,34 @@ mod tests {
         let merged = merge_start_times(&old, fresh, &[]);
         assert_eq!(merged.get(&10), Some(&900));
         assert_eq!(merged.get(&11), None);
+    }
+
+    #[test]
+    fn rows_show_the_app_name_and_keep_the_program_name() {
+        assert_eq!(
+            row_texts("Google Chrome", "chrome", "24 processes, 3.8 GB"),
+            (
+                "Google Chrome".to_string(),
+                "chrome, 24 processes, 3.8 GB".to_string()
+            )
+        );
+        assert_eq!(
+            row_texts("Firefox", "firefox", "3 processes, 1.2 GB"),
+            ("Firefox".to_string(), "3 processes, 1.2 GB".to_string())
+        );
+        assert_eq!(
+            row_texts("Claude", "2.1.284", "PID 7, 512 MB").1,
+            "2.1.284, PID 7, 512 MB"
+        );
+    }
+
+    #[test]
+    fn search_matches_the_app_or_the_program_name() {
+        assert!(matches_query("chrome", &["Google Chrome", "chrome"]));
+        assert!(matches_query("google", &["Google Chrome", "chrome"]));
+        assert!(matches_query("2.1", &["Claude", "2.1.284"]));
+        assert!(matches_query("", &["Claude", "2.1.284"]));
+        assert!(!matches_query("firefox", &["Google Chrome", "chrome"]));
     }
 
     #[test]

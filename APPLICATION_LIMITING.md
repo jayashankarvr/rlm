@@ -43,15 +43,16 @@ rlm limit --name firefox --memory 1G --cpu 50%  # Each firefox process gets 1G
 
 ## Checking Status
 
-`rlm status` shows whether limits are shared or individual. The TYPE column is `shared (N procs)` for a shared cgroup and `individual` for a single process:
+`rlm status` shows whether limits are shared or individual. The NAME column is the program's full executable name, and the TYPE column is `shared (N processes)` for a shared cgroup and `individual` for a single process:
 
 ```bash
 $ rlm status
-PID      NAME                            MEMORY             CPU        I/O            TYPE
--------------------------------------------------------------------------------------
-1234     firefox                           4.0G             75%          - shared (12 procs)
-5678     chrome                            6.0G            100%    limited shared (8 procs)
-9012     myapp                             1.0G             50%          -      individual
+PID      NAME                       MEMORY    CPU      I/O  TYPE
+--------------------------------------------------------------------------------
+1234     firefox                      4.0G    75%        -  shared (12 processes)
+5678     chrome                       6.0G   100%  limited  shared (8 processes)
+7788     gnome-calculator           512.0M    50%        -  shared (1 process)
+9012     myapp                        1.0G    50%        -  individual
 
 Note: 'shared' means multiple processes share the same limit pool
 ```
