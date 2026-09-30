@@ -17,7 +17,8 @@
 #   freed the moment it exits; nothing is left in tmpfs.
 # - `timeout -s KILL` ends it after --max-seconds, even if this script is
 #   killed or its terminal closed. The timer runs inside the demo's scope, so
-#   it waits while the guard has the hog paused (5 s by default).
+#   if the guard has the hog paused at that moment, the kill lands once it is
+#   resumed (5 s by default).
 # - Ctrl+C, or this script exiting for any reason, stops the scope.
 #
 # Usage: scripts/demo-memory-pressure.sh [--yes] [--step-mb N] [--hold S]
@@ -52,6 +53,9 @@ done
 for n in "$STEP_MB" "$HOLD_SECS" "$MARGIN_MB" "$MAX_SECONDS"; do
     [[ "$n" =~ ^[0-9]+$ && "$n" -gt 0 ]] || { echo "options take positive whole numbers" >&2; exit 2; }
 done
+
+(( HOLD_SECS + 5 < MAX_SECONDS )) \
+    || { echo "--hold must be at least 5 seconds shorter than --max-seconds, or the hog has no time to grow" >&2; exit 2; }
 
 say() { printf '[demo] %s\n' "$*"; }
 die() { printf '[demo] %s\n' "$*" >&2; exit 1; }
