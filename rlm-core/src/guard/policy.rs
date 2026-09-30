@@ -34,7 +34,7 @@ pub const MAX_COLD_DEFER_TICKS: u32 = 3;
 
 /// The level a sample reaches on its own, from the rise thresholds alone
 /// (no hysteresis): Critical when PSI `full` reaches `psi_full_critical` or
-/// free memory is below `mem_available_floor_mb`, High when `some` reaches
+/// available memory is below `mem_available_floor_mb`, High when `some` reaches
 /// `psi_some_high` or `full` reaches [`FULL_HIGH_RISE`], Warn when `some`
 /// reaches `psi_some_warn`. The engine enters a level on exactly these rules;
 /// callers that only show the pressure (the GUI) use this to agree with it.
