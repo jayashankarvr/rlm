@@ -10,7 +10,7 @@ pkgbase = rlm
 	makedepends = gtk4
 	makedepends = libadwaita
 	source = rlm-0.2.7.tar.gz::https://github.com/jayashankarvr/rlm/archive/refs/tags/v0.2.7.tar.gz
-	sha256sums = SKIP
+	sha256sums = 7f47e115f73491bd85599934c70f06a302242810ba38255dd28cfcb59d1bacdd
 
 pkgname = rlm
 	pkgdesc = Unprivileged cgroup v2 resource limits (rlm) with an optional freeze-or-cap guard (rlm-guard)
