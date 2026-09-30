@@ -2,7 +2,7 @@
 
 rlm sets memory, CPU and I/O limits on your own Linux processes without root, from a CLI or a GTK app, and can run a small guard that freezes or caps a runaway app under memory pressure instead of killing it.
 
-![rlm run, rlm status and rlm guard status in a terminal](https://raw.githubusercontent.com/jayashankarvr/rlm/main/docs/assets/hero.svg)
+![The rlm desktop app on its Guard page, next to a "Firefox paused" notification from the guard](https://raw.githubusercontent.com/jayashankarvr/rlm/main/docs/assets/hero-dark.png)
 
 ## What it does today
 
@@ -150,6 +150,8 @@ systemctl --user restart rlm-guard
 
 ## CLI usage
 
+![rlm run, rlm status and rlm guard status in a terminal](https://raw.githubusercontent.com/jayashankarvr/rlm/main/docs/assets/hero.svg)
+
 ### Limit a running process
 
 ```bash
@@ -240,6 +242,10 @@ Launch with `rlm-gtk`. Pages:
 - **Guard**: service state, pressure, active interventions and history, plus switches for the guard and its notifications
 
 The menu button in the sidebar opens Keyboard Shortcuts and About (version and license). Ctrl+1 to Ctrl+5 switch pages. Ctrl+Q quits. The GUI hides processes on the protect list; use the CLI with `--force` if you really need to limit one.
+
+![Limit Running with Chrome and Node selected to share one limit](https://raw.githubusercontent.com/jayashankarvr/rlm/main/docs/assets/gui-limit.png)
+
+![The Guard page: switches for the guard and its notifications, then its status](https://raw.githubusercontent.com/jayashankarvr/rlm/main/docs/assets/gui-guard.png)
 
 ## Freeze guard
 

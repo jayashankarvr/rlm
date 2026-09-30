@@ -90,6 +90,12 @@ p { margin: 0 0 1rem; }
 ul.plain { padding-left: 1.2rem; }
 ul.plain li { margin-bottom: 0.45rem; }
 
+/* Screenshots of the desktop app. */
+.shots { display: grid; gap: 1.25rem; margin: 1.5rem 0; }
+.shots figure { margin: 0; }
+.shots img { display: block; width: 100%; height: auto; border-radius: 12px; box-shadow: 0 12px 32px rgba(0,0,0,.25); }
+.shots figcaption { color: var(--muted); font-size: 0.9rem; margin-top: 0.5rem; }
+
 /* The memory bar: the page's one moving part. */
 .meter { margin: 2.5rem 0 0.75rem; }
 .bar {
@@ -433,12 +439,19 @@ rlm import profiles.yaml         <span class="c"># import profiles</span></code>
         <li><strong>Profiles</strong><span>The built-in presets and your own; edit a preset and restore it later.</span></li>
         <li><strong>Guard</strong><span>Turn the guard and its notifications on or off, and see memory pressure, what it is holding and what it did.</span></li>
       </ul>
+      <div class="shots">
+        <figure><img src="img/limit.png" width="900" height="600" loading="lazy" alt="Limit Running page with Chrome and Node selected, ready to share one limit"><figcaption>Limit Running: pick apps, and they share one limit.</figcaption></figure>
+        <figure><img src="img/managed.png" width="900" height="600" loading="lazy" alt="Managed Processes page listing Calculator with a 1 GB memory limit"><figcaption>Managed Processes: what rlm is limiting now.</figcaption></figure>
+      </div>
       <p class="note">The desktop app hides processes on the protect list. Use the CLI with <code>--force</code> if you really need to limit one.</p>
     </section>
 
     <section id="guard">
       <h2>The guard</h2>
       <p>When memory runs short, Linux usually freezes the whole desktop for minutes and then kills something. rlm-guard steps in earlier and more gently.</p>
+      <div class="shots">
+        <figure><img src="img/guard.png" width="900" height="600" loading="lazy" alt="Guard page with switches for the guard and its notifications, and the guard's status"><figcaption>The Guard page in the desktop app.</figcaption></figure>
+      </div>
       <ul class="plain">
         <li>It acts when apps stall on memory and available memory is below 20% of RAM, or at once when available memory drops below 400 MB.</li>
         <li>It freezes the app that is growing for 5 seconds, then caps it with a soft limit if pressure stays high.</li>
