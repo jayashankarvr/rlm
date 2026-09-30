@@ -21,6 +21,18 @@ pub fn read_frozen(cg: &str) -> Option<bool> {
     parse_frozen(&content)
 }
 
+/// Whether a freeze is requested (`cgroup.freeze` reads 1). This turns true
+/// at once, while `frozen` in cgroup.events waits until every task has
+/// stopped. `None` if unreadable (e.g. the cgroup is gone).
+pub fn read_freeze(cg: &str) -> Option<bool> {
+    let content = fs::read_to_string(abs(cg).join("cgroup.freeze")).ok()?;
+    match content.trim() {
+        "1" => Some(true),
+        "0" => Some(false),
+        _ => None,
+    }
+}
+
 /// Whether the cgroup (or any descendant) holds a process, from
 /// `cgroup.events`. `None` if unreadable (e.g. the cgroup is gone).
 pub fn is_populated(cg: &str) -> Option<bool> {

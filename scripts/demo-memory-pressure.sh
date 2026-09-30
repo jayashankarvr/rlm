@@ -15,8 +15,9 @@
 #   (mem_available_floor_mb) plus 1 GB.
 # - The hog is a python3 process holding plain memory, so its memory is
 #   freed the moment it exits; nothing is left in tmpfs.
-# - `timeout -s KILL` ends it after --max-seconds whatever else happens,
-#   even if this script is killed or its terminal closed.
+# - `timeout -s KILL` ends it after --max-seconds, even if this script is
+#   killed or its terminal closed. The timer runs inside the demo's scope, so
+#   it waits while the guard has the hog paused (5 s by default).
 # - Ctrl+C, or this script exiting for any reason, stops the scope.
 #
 # Usage: scripts/demo-memory-pressure.sh [--yes] [--step-mb N] [--hold S]
@@ -135,16 +136,23 @@ while time.monotonic() - start < grow_until:
     if need <= 0:
         break
     # Repeating one nonzero byte writes every page, so all of it is resident.
-    held.append(b"\x5a" * (need * 1024 * 1024))
+    held.append(bytearray(b"\x5a") * (need * 1024 * 1024))
     held_mb += need
     print(f"[hog] holding {held_mb} MB, available {available_mb()} MB", flush=True)
     time.sleep(1)
 
 print(f"[hog] holding {held_mb} MB for up to {hold_secs} s", flush=True)
 end = time.monotonic() + hold_secs
+tick = 0
 while time.monotonic() < end and time.monotonic() - start < max_secs - 2:
-    time.sleep(5)
-    print(f"[hog] available {available_mb()} MB", flush=True)
+    # Write to every page again, so memory is in active use and the kernel
+    # has to work to find room; that is the stall the guard watches for.
+    for b in held:
+        b[::4096] = bytes([tick & 0xFF]) * len(range(0, len(b), 4096))
+    tick += 1
+    time.sleep(1)
+    if tick % 5 == 0:
+        print(f"[hog] available {available_mb()} MB", flush=True)
 print("[hog] done, exiting", flush=True)
 '
 

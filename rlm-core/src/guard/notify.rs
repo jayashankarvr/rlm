@@ -245,8 +245,10 @@ pub struct Notifier<S: NotifySink> {
     thawed: HashSet<String>,
     /// Cgroups whose thaw failed, so they may still be frozen, with their app.
     stuck: HashMap<String, String>,
-    /// Whether a cgroup may still be frozen: it exists and its
-    /// `cgroup.events` says `frozen 1`. A `stuck` entry for which this is
+    /// Whether a cgroup may still be frozen: it exists and either a freeze
+    /// is requested (`cgroup.freeze` is 1; tasks in uninterruptible sleep can
+    /// keep `frozen` at 0 for a while) or `cgroup.events` says `frozen 1`.
+    /// A `stuck` entry for which this is
     /// false is dropped: the cgroup is gone, or something (a later thaw by
     /// hand, or the app's cgroup being recreated) left it running.
     still_frozen: Box<dyn Fn(&str) -> bool>,
@@ -265,7 +267,10 @@ impl<S: NotifySink> Notifier<S> {
             shown: HashMap::new(),
             thawed: HashSet::new(),
             stuck: HashMap::new(),
-            still_frozen: Box::new(|cg| super::cgfs::read_frozen(cg) == Some(true)),
+            still_frozen: Box::new(|cg| {
+                super::cgfs::read_freeze(cg) == Some(true)
+                    || super::cgfs::read_frozen(cg) == Some(true)
+            }),
             pressure_shown: false,
             last_pressure_ms: None,
         }

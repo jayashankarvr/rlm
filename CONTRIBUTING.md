@@ -59,12 +59,14 @@ Tests that touch real cgroups are `#[ignore]` and opt-in. They create `test-*` a
 
 ## Recording a demo
 
-`scripts/demo-memory-pressure.sh` puts the desktop under memory pressure so rlm-guard can be recorded stepping in. It refuses to run unless rlm-guard is active. It starts a python3 memory hog as you, in its own scope (`rlm-demo-hog-<pid>.scope` under `app.slice`) so the guard sees it as an app of its own. The hog grows by 200 MB a second until available memory is just below the guard's trigger (read from `rlm guard status`, 20% of RAM by default), holds for up to 60 seconds, then exits and frees its memory. It never goes below the guard's floor plus 1 GB, `timeout -s KILL` ends the hog after 240 seconds whatever happens, and Ctrl+C stops it at once. `--help` lists the options.
+`scripts/demo-memory-pressure.sh` puts the desktop under memory pressure so rlm-guard can be recorded stepping in. It refuses to run unless rlm-guard is active. It starts a python3 memory hog as you, in its own scope (`rlm-demo-hog-<pid>.scope` under `app.slice`) so the guard sees it as an app of its own. The hog grows by 200 MB a second until available memory is just below the guard's trigger (read from `rlm guard status`, 20% of RAM by default), holds for up to 60 seconds, then exits and frees its memory. It never goes below the guard's floor plus 1 GB, `timeout -s KILL` ends the hog after 240 seconds (plus any time the guard holds it paused), and Ctrl+C stops it at once. While it holds, the hog keeps writing to its memory so the kernel has to work for room. `--help` lists the options.
 
 1. Save your work and close anything you would mind being paused.
 2. Start the screen recorder. On GNOME, Ctrl+Shift+Alt+R starts and stops a screencast (saved in `~/Videos/Screencasts`).
 3. Run `scripts/demo-memory-pressure.sh` and confirm. Watch for the "Python3 paused" notification and the Guard page in rlm-gtk.
 4. Stop the recording once the script says the hog stopped.
+
+The guard steps in only when apps actually stall on memory, so on a machine with plenty of cache to drop it may do nothing. Run it again with a larger `--margin-mb` to go further below the trigger; it still never goes below the floor plus 1 GB.
 
 ## Reporting Issues
 
