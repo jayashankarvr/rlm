@@ -11,6 +11,11 @@ const APP_ID: &str = "io.github.rlm.gtk";
 
 fn main() -> gtk::glib::ExitCode {
     rlm_core::logging::init(tracing::Level::WARN);
+    // Read the installed apps' names off the UI thread; the pages that show
+    // them wait for this read only if they need a name before it is done.
+    std::thread::spawn(|| {
+        rlm_core::appname::desktop_names();
+    });
 
     let app = adw::Application::builder().application_id(APP_ID).build();
 

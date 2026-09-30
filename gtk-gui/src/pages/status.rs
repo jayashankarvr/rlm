@@ -26,7 +26,7 @@ const ACTION_TOAST_SECS: u32 = 10;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RowView {
     pub cgroup: String,
-    /// The first process's name, as plain text.
+    /// The app's friendly name, as plain text.
     pub name: String,
     /// Row title, markup-escaped.
     pub title: String,
@@ -48,12 +48,29 @@ pub enum StatusView {
     Rows(Vec<RowView>),
 }
 
-pub fn row_view(p: &ProcessStatus) -> RowView {
-    let name = glib::markup_escape_text(&p.name);
-    let title = match (p.is_shared, p.process_count) {
-        (true, Some(count)) => format!("{name} (PID {}, {count} processes)", p.pid),
-        (true, None) => format!("{name} (PID {}, shared)", p.pid),
-        (false, _) => format!("{name} (PID {})", p.pid),
+/// "1 process" or "N processes".
+pub fn processes_text(count: usize) -> String {
+    let noun = if count == 1 { "process" } else { "processes" };
+    format!("{count} {noun}")
+}
+
+/// The friendly name of the app in a cgroup, from its first process: the
+/// installed desktop entry's name when there is one, else the program name.
+pub fn app_name(p: &ProcessStatus) -> String {
+    let comm = (p.name != "?").then_some(p.name.as_str());
+    let exe = rlm_core::appname::exe_of_pid(p.pid);
+    match exe.as_deref().or(comm) {
+        Some(program) => rlm_core::appname::friendly_name(program, comm),
+        None => p.name.clone(),
+    }
+}
+
+/// The row for `p`, whose app is called `app` (see [`app_name`]).
+pub fn row_view(p: &ProcessStatus, app: &str) -> RowView {
+    let who = match (p.is_shared, p.process_count) {
+        (true, Some(count)) => format!("PID {}, {}", p.pid, processes_text(count)),
+        (true, None) => format!("PID {}, shared", p.pid),
+        (false, _) => format!("PID {}", p.pid),
     };
 
     let mut limits = Vec::new();
@@ -70,9 +87,9 @@ pub fn row_view(p: &ProcessStatus) -> RowView {
         limits.push(format!("I/O Write: {}/s", format_bytes(w)));
     }
     let mut subtitle = if limits.is_empty() {
-        "No limits set".to_string()
+        format!("{who} | No limits set")
     } else {
-        limits.join(" | ")
+        format!("{who} | {}", limits.join(" | "))
     };
     if p.is_shared {
         subtitle.push_str(" (shared among all processes)");
@@ -80,8 +97,8 @@ pub fn row_view(p: &ProcessStatus) -> RowView {
 
     RowView {
         cgroup: p.cgroup_name.clone(),
-        name: p.name.clone(),
-        title,
+        name: app.to_string(),
+        title: glib::markup_escape_text(app).to_string(),
         subtitle: glib::markup_escape_text(&subtitle).to_string(),
         memory_max: p.memory_max,
         cpu_percent: p.cpu_quota,
@@ -91,13 +108,16 @@ pub fn row_view(p: &ProcessStatus) -> RowView {
 }
 
 /// The page's view from the result of reading rlm's cgroups, or `None` when
-/// there is no cgroup manager.
-pub fn build_view(result: Option<common::Result<Vec<ProcessStatus>>>) -> StatusView {
+/// there is no cgroup manager. `name` gives each cgroup's app name.
+pub fn build_view(
+    result: Option<common::Result<Vec<ProcessStatus>>>,
+    name: impl Fn(&ProcessStatus) -> String,
+) -> StatusView {
     match result {
         None => StatusView::Unavailable,
         Some(Err(e)) => StatusView::Error(e.to_string()),
         Some(Ok(procs)) if procs.is_empty() => StatusView::Empty,
-        Some(Ok(procs)) => StatusView::Rows(procs.iter().map(row_view).collect()),
+        Some(Ok(procs)) => StatusView::Rows(procs.iter().map(|p| row_view(p, &name(p))).collect()),
     }
 }
 
@@ -329,6 +349,7 @@ impl StatusPage {
             self.manager
                 .as_ref()
                 .map(|m| rlm_core::status::get_managed_processes(m)),
+            app_name,
         );
         if self.last.borrow().as_ref() == Some(&view) {
             return;
@@ -549,39 +570,64 @@ mod tests {
     }
 
     #[test]
+    fn process_counts_read_as_english() {
+        assert_eq!(processes_text(1), "1 process");
+        assert_eq!(processes_text(0), "0 processes");
+        assert_eq!(processes_text(9), "9 processes");
+        let mut one = proc("gnome-calculato", "app-gnome-calculator", true);
+        one.pid = 1217697;
+        one.process_count = Some(1);
+        one.cpu_quota = None;
+        one.io_write_bps = None;
+        one.memory_max = Some(1024 * 1024 * 1024);
+        let r = row_view(&one, "Calculator");
+        assert_eq!(r.title, "Calculator");
+        assert_eq!(
+            r.subtitle,
+            "PID 1217697, 1 process | Memory: 1.0G (shared among all processes)"
+        );
+    }
+
+    #[test]
     fn view_states() {
-        assert_eq!(build_view(None), StatusView::Unavailable);
-        assert_eq!(build_view(Some(Ok(vec![]))), StatusView::Empty);
+        assert_eq!(build_view(None, app_name), StatusView::Unavailable);
+        assert_eq!(build_view(Some(Ok(vec![])), app_name), StatusView::Empty);
         assert!(matches!(
-            build_view(Some(Err(common::Error::Config("x".into())))),
+            build_view(Some(Err(common::Error::Config("x".into()))), app_name),
             StatusView::Error(_)
         ));
-        let v = build_view(Some(Ok(vec![proc("firefox", "app-firefox", true)])));
+        let v = build_view(Some(Ok(vec![proc("firefox", "app-firefox", true)])), |_| {
+            "Firefox".to_string()
+        });
         let StatusView::Rows(rows) = v else {
             panic!("expected rows")
         };
-        assert_eq!(rows[0].title, "firefox (PID 42, 3 processes)");
+        assert_eq!(rows[0].title, "Firefox");
+        assert_eq!(rows[0].name, "Firefox");
         assert_eq!(
             rows[0].subtitle,
-            "Memory: 512.0M | CPU: 50% | I/O Write: 10.0M/s (shared among all processes)"
+            "PID 42, 3 processes | Memory: 512.0M | CPU: 50% | I/O Write: 10.0M/s \
+             (shared among all processes)"
         );
     }
 
     #[test]
     fn same_processes_give_an_equal_view() {
-        let a = build_view(Some(Ok(vec![proc("a", "pid-42", false)])));
-        let b = build_view(Some(Ok(vec![proc("a", "pid-42", false)])));
+        let name = |p: &ProcessStatus| p.name.clone();
+        let a = build_view(Some(Ok(vec![proc("a", "pid-42", false)])), name);
+        let b = build_view(Some(Ok(vec![proc("a", "pid-42", false)])), name);
         assert_eq!(a, b);
-        let c = build_view(Some(Ok(vec![proc("b", "pid-42", false)])));
+        let c = build_view(Some(Ok(vec![proc("b", "pid-42", false)])), name);
         assert_ne!(a, c);
     }
 
     #[test]
     fn rows_are_kept_while_the_same_cgroups_are_listed() {
-        let a = row_view(&proc("a", "pid-1", false));
-        let mut b = row_view(&proc("b", "app-b", true));
+        let a = row_view(&proc("a", "pid-1", false), "A");
+        let mut b = row_view(&proc("b", "app-b", true), "B");
         let old = vec!["pid-1".to_string(), "app-b".to_string()];
-        b.title = "b (PID 7, 9 processes)".into();
+        b.title = "Other".into();
+        b.subtitle = "PID 7, 9 processes | Memory: 1.0G".into();
         assert!(same_cgroups(&old, &[a.clone(), b.clone()]));
         assert!(!same_cgroups(&old, &[b.clone(), a.clone()]));
         assert!(!same_cgroups(&old, &[a]));
@@ -626,14 +672,15 @@ mod tests {
 
     #[test]
     fn names_are_escaped_in_the_title_only() {
-        let r = row_view(&proc("a<b&c", "pid-42", false));
-        assert_eq!(r.title, "a&lt;b&amp;c (PID 42)");
+        let r = row_view(&proc("x", "pid-42", false), "a<b&c");
+        assert_eq!(r.title, "a&lt;b&amp;c");
         assert_eq!(r.name, "a<b&c");
+        assert!(r.subtitle.starts_with("PID 42 | Memory: 512.0M"));
     }
 
     #[test]
     fn restore_limit_matches_the_row() {
-        let r = row_view(&proc("a", "pid-42", false));
+        let r = row_view(&proc("a", "pid-42", false), "A");
         let l = restore_limit(&r).unwrap();
         assert_eq!(l.memory.unwrap().bytes(), 512 * 1024 * 1024);
         assert_eq!(l.cpu.unwrap().percent(), 50);

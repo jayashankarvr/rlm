@@ -1,3 +1,4 @@
+pub mod appname;
 mod cgroup;
 pub mod desktop;
 pub mod exit;

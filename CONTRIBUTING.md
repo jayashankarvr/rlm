@@ -57,6 +57,15 @@ Tests that touch real cgroups are `#[ignore]` and opt-in. They create `test-*` a
 5. AUR: the tag tarball must exist first. In `dist/aur`, run `updpkgsums` to replace `sha256sums=('SKIP')` with the real checksum, then `makepkg --printsrcinfo > .SRCINFO`, build in a clean chroot, and push `PKGBUILD`, `rlm.install` and `.SRCINFO` to the AUR.
 6. Copy the CHANGELOG section into the GitHub release notes.
 
+## Recording a demo
+
+`scripts/demo-memory-pressure.sh` puts the desktop under memory pressure so rlm-guard can be recorded stepping in. It refuses to run unless rlm-guard is active. It starts a python3 memory hog as you, in its own scope (`rlm-demo-hog-<pid>.scope` under `app.slice`) so the guard sees it as an app of its own. The hog grows by 200 MB a second until available memory is just below the guard's trigger (read from `rlm guard status`, 20% of RAM by default), holds for up to 60 seconds, then exits and frees its memory. It never goes below the guard's floor plus 1 GB, `timeout -s KILL` ends the hog after 240 seconds whatever happens, and Ctrl+C stops it at once. `--help` lists the options.
+
+1. Save your work and close anything you would mind being paused.
+2. Start the screen recorder. On GNOME, Ctrl+Shift+Alt+R starts and stops a screencast (saved in `~/Videos/Screencasts`).
+3. Run `scripts/demo-memory-pressure.sh` and confirm. Watch for the "Python3 paused" notification and the Guard page in rlm-gtk.
+4. Stop the recording once the script says the hog stopped.
+
 ## Reporting Issues
 
 Please include:
