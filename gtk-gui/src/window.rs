@@ -119,7 +119,10 @@ impl Window {
 
         // Page navigation shortcuts (Ctrl+1 onwards). Selecting the sidebar
         // row (rather than switching the stack directly) keeps the highlight
-        // in sync with the visible page.
+        // in sync with the visible page. Selecting alone leaves keyboard
+        // focus (and the list's cursor) where it was, so the row that had
+        // focus, usually the first, would keep its focus ring while another
+        // page shows; focusing the selected row moves both with it.
         for (i, (id, _, _)) in NAV_PAGES.iter().enumerate() {
             let action = gio::SimpleAction::new(&format!("goto-{id}"), None);
             let window_clone = self.clone();
@@ -127,6 +130,7 @@ impl Window {
                 if let Some(list) = window_clone.imp().sidebar.borrow().as_ref() {
                     if let Some(row) = list.row_at_index(i as i32) {
                         list.select_row(Some(&row));
+                        row.grab_focus();
                     }
                 }
             });
