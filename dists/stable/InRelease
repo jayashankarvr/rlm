@@ -4,27 +4,27 @@ Hash: SHA512
 Architectures: amd64
 Codename: stable
 Components: main
-Date: Tue, 29 Sep 2026 03:37:47 +0000
+Date: Wed, 30 Sep 2026 15:00:30 +0000
 Description: rlm: resource limits for your own processes
 Label: rlm
 Origin: rlm
 Suite: stable
 MD5Sum:
- 6b103a1396e452e25290f0823cb27e85            60939 main/binary-amd64/Packages
- 99cb0e129cee8eb5b2aa7531dc636a97             9783 main/binary-amd64/Packages.gz
+ 7aede8990c58d236abd2fdcb46cdfca6            64042 main/binary-amd64/Packages
+ 802091f8879e4dd31067c478b661363d            10423 main/binary-amd64/Packages.gz
 SHA1:
- 320ec3616af81b4d9bf3f708f5cf4ca8da62b365            60939 main/binary-amd64/Packages
- c9a228f73e3fc8e2cd5775e31eaa0806d0b6e3e4             9783 main/binary-amd64/Packages.gz
+ 1aee46491153c18a6dec587f53fe17b23857ba0e            64042 main/binary-amd64/Packages
+ 962258c334b8a4d1cd5d718231b240d4cfb1a601            10423 main/binary-amd64/Packages.gz
 SHA256:
- e2e4c734e48e0616fb1eb8965f8bf98a68bc8917d6051814bd97c6c2afc99af2            60939 main/binary-amd64/Packages
- 58daab58d3d66bec70cae15fcfa6f816ddb4a9525e402b93abf366ab9aa2f8f9             9783 main/binary-amd64/Packages.gz
+ 60c3e4d13edee6e78141ffc724957eb077a6e5b18b21673d3c5af619d8286bc2            64042 main/binary-amd64/Packages
+ ff6e5d7e7fba1e028bd93b84c9d6309ce67e70e172327fb92a3a5183240558ce            10423 main/binary-amd64/Packages.gz
 SHA512:
- 4439bcd1c24c1eb3a4a9808d3536df02af2d187b6dcf885f8df1b46320f55ee571fb8b1dac9fe3ab3d4db14be37e74f42479286db1ed343a889d78eea746cfa2            60939 main/binary-amd64/Packages
- 2393586ce01c53c27c0c8e489637f4af3f1085346546d9c8bb32e8ae2209e6d6e1b07651702d28109e71a06fad0a7797bfeb29a6ecce11636f25c7f7140b83d0             9783 main/binary-amd64/Packages.gz
+ 5a74914276b095a632cb228f69d73ffb465a5102f989f59c0c44c5445f8cee302db2c1db1d13881b5a3396640d443aaaf8203403646183b2314f2a9e3fad2ead            64042 main/binary-amd64/Packages
+ f7ab81ff54f27551a01fb81c35803617c2521dc0746bf6bd15562f4aa0d306364ca505abfcc54700a71dae0d4e48faaba9d6ba45d4c4d55c71bf4411f9aee86c            10423 main/binary-amd64/Packages.gz
 -----BEGIN PGP SIGNATURE-----
 
-iHUEARYKAB0WIQTH4eEf7TE+25pgm9dB8wCBu4q+wgUCarsyiwAKCRBB8wCBu4q+
-wp6MAP9qHAya7b6xtcMyaI8ydfp05aTZaEbE/9Gf3FgPwuSwHQEA8TuWGyVg1ZC4
-EsdimWTt0vPaz3HhD/bonMbDAqyHWw0=
-=/oRI
+iHUEARYKAB0WIQTH4eEf7TE+25pgm9dB8wCBu4q+wgUCar0kDgAKCRBB8wCBu4q+
+wrWoAP4oVIOWrhykVvPulfbQptptraOQKsBDo75esuP3qx8LfQEA45Ag71S9MW1u
+pTOiCxdNQB4EbOQJWOfYwvcaoUQgvgo=
+=OsyN
 -----END PGP SIGNATURE-----
