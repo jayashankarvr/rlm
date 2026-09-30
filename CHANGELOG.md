@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.7] - 2026-09-30
+
+### Changed
+
+- The desktop app shows apps by their menu name: "Calculator" instead of "gnome-calculato", and "Claude" with its version number underneath instead of "2.1.285". Limit Running search matches both names.
+- `rlm status` shows the full program name (up to 24 characters) instead of the kernel's 15-character process name.
+- Process counts read "1 process" and "N processes" in the desktop app and `rlm status`.
+- The README and website open with a screenshot of the desktop app, and the README explains when to use rlm instead of `systemd-run`, earlyoom or systemd-oomd.
+
+### Fixed
+
+- Desktop app: after switching pages with Ctrl+1 to Ctrl+5 or a page button, keyboard focus moves to the new page's sidebar row, so the focus ring no longer stays on Managed Processes.
+- The "could not be resumed" notification now also closes when the app is no longer paused, not only when it exits.
+
+### Added
+
+- `scripts/demo-memory-pressure.sh`: a gradual, capped memory hog for recording the guard at work. It refuses to run unless the guard is active and stops by itself after 4 minutes.
+
 ## [0.2.6] - 2026-09-29
 
 ### Fixed
