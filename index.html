@@ -5,7 +5,16 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>rlm: resource limits for your own Linux apps</title>
 <meta name="description" content="rlm sets memory, CPU and I/O limits on your own Linux processes without root, and can freeze or cap a runaway app under memory pressure instead of letting it lock up the desktop.">
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23172033'/%3E%3Crect x='6' y='12' width='6' height='8' fill='%239db8c1'/%3E%3Crect x='13' y='12' width='5' height='8' fill='%236f9aa6'/%3E%3Crect x='19' y='12' width='5' height='8' fill='%23d9a21b'/%3E%3Crect x='25' y='9' width='2' height='14' fill='%23d9a21b'/%3E%3C/svg%3E">
+<link rel="icon" type="image/svg+xml" href="icon.svg">
+<link rel="apple-touch-icon" href="img/apple-touch-icon.png">
+<meta property="og:type" content="website">
+<meta property="og:title" content="rlm: resource limits for your own Linux apps">
+<meta property="og:description" content="Memory, CPU and I/O limits for your own Linux apps, without root. An optional guard pauses or slows a runaway app instead of letting the desktop freeze.">
+<meta property="og:url" content="https://jayashankarvr.github.io/rlm/">
+<meta property="og:image" content="https://jayashankarvr.github.io/rlm/img/social.png">
+<meta property="og:image:width" content="1280">
+<meta property="og:image:height" content="640">
+<meta name="twitter:card" content="summary_large_image">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=Instrument+Sans:wght@400;600&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
@@ -64,7 +73,7 @@ a:hover { text-decoration-thickness: 2px; }
   display: grid; grid-template-columns: 14.5rem minmax(0, 1fr); gap: 3.5rem;
 }
 .sidebar { position: sticky; top: 0; align-self: start; height: 100vh; overflow-y: auto; padding: 1.5rem 0 2rem; }
-.wordmark { display: inline-block; font: 700 1.5rem/1 "Bricolage Grotesque", sans-serif; letter-spacing: -0.02em; text-decoration: none; margin-bottom: 1.75rem; }
+.wordmark { display: inline-flex; align-items: center; gap: 0.5rem; font: 700 1.5rem/1 "Bricolage Grotesque", sans-serif; letter-spacing: -0.02em; text-decoration: none; margin-bottom: 1.75rem; }
 .toc summary { display: none; }
 .toc ul { list-style: none; margin: 0; padding: 0; }
 .toc li ul { margin: 0.1rem 0 0.4rem; }
@@ -75,6 +84,7 @@ a:hover { text-decoration-thickness: 2px; }
 .toc li ul a { padding-left: 1.6rem; font-size: 0.88rem; }
 .toc a:hover { color: var(--ink); }
 .toc a[aria-current="true"] { color: var(--ink); border-left-color: var(--limit); font-weight: 600; }
+.wordmark img { width: 1.9rem; height: 1.9rem; }
 .side-links { margin-top: 1.75rem; padding-top: 1.25rem; border-top: 1px solid var(--line); font-size: 0.9rem; }
 .side-links a { display: block; color: var(--muted); padding: 0.2rem 0; text-decoration: none; }
 .side-links a:hover { color: var(--ink); }
@@ -209,7 +219,7 @@ footer a { margin-right: 1.25rem; }
 <a class="skip" href="#content">Skip to content</a>
 <div class="layout">
   <aside class="sidebar">
-    <a class="wordmark" href="#top">rlm</a>
+    <a class="wordmark" href="#top"><img src="icon.svg" alt="" width="30" height="30">rlm</a>
     <details class="toc" id="toc">
       <summary>Contents</summary>
       <nav aria-label="Contents">
