@@ -262,7 +262,7 @@ footer a { margin-right: 1.25rem; }
 
   <main id="content">
     <section id="top">
-      <h1>Keep one app from taking the whole machine</h1>
+      <h1>Don't let any app take over your machine</h1>
       <p class="lede">rlm sets memory, CPU and I/O limits on your own Linux processes, without root, from the terminal or a desktop app. Its optional guard freezes or caps a runaway app under memory pressure, instead of letting the desktop lock up.</p>
       <figure class="meter" aria-label="Illustration: several apps share memory; one keeps growing until it reaches its limit and stops there.">
         <div class="bar" aria-hidden="true">
@@ -355,7 +355,7 @@ cargo install --path gtk-gui    <span class="c"># rlm-gtk, needs GTK 4 and libad
         <li>Run <code>rlm doctor</code>. It checks cgroup v2, the delegated controllers, memory pressure information, your config file and the guard.</li>
         <li>Optional: turn on the guard with <code>rlm guard enable</code>, or with the switch on the Guard page of the desktop app.</li>
       </ol>
-      <p class="note">After upgrading, restart the guard so the new version runs: <code>systemctl --user restart rlm-guard</code>.</p>
+      <p class="note">After upgrading, restart the guard so the new version runs: <code>systemctl --user daemon-reload</code>, then <code>systemctl --user restart rlm-guard</code>. The reload picks up the service file a package upgrade may have replaced.</p>
 
       <h3 id="distros">Supported systems</h3>
       <p>The CLI and the guard run on any Linux with cgroup v2, pressure stall information (PSI) and systemd. The desktop app also needs GTK 4 and libadwaita 1.4 or newer. The release packages install on:</p>
