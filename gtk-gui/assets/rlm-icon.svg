@@ -1,12 +1,12 @@
 <svg width="128" height="128" viewBox="0 0 128 128" xmlns="http://www.w3.org/2000/svg">
   <defs>
     <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0" stop-color="#3b82f6"/>
-      <stop offset="1" stop-color="#1d4ed8"/>
+      <stop offset="0" stop-color="#4a4a4f"/>
+      <stop offset="1" stop-color="#1e1e21"/>
     </linearGradient>
     <linearGradient id="shield" x1="0" y1="0" x2="0" y2="1">
       <stop offset="0" stop-color="#ffffff"/>
-      <stop offset="1" stop-color="#e9eef9"/>
+      <stop offset="1" stop-color="#e4e4e7"/>
     </linearGradient>
   </defs>
 
@@ -18,15 +18,15 @@
         fill="url(#shield)"/>
 
   <!-- gauge = resource level being watched & limited -->
-  <!-- safe (green) half -->
-  <path d="M46 80 A18 18 0 0 1 64 62" fill="none" stroke="#2ec27e"
+  <!-- safe (grey) half -->
+  <path d="M46 80 A18 18 0 0 1 64 62" fill="none" stroke="#a1a1aa"
         stroke-width="6" stroke-linecap="round"/>
-  <!-- high (red) half -->
-  <path d="M64 62 A18 18 0 0 1 82 80" fill="none" stroke="#e01b24"
+  <!-- high (black) half -->
+  <path d="M64 62 A18 18 0 0 1 82 80" fill="none" stroke="#18181b"
         stroke-width="6" stroke-linecap="round"/>
 
   <!-- needle held in the safe zone -->
-  <path d="M64 80 L53 67" fill="none" stroke="#1b3a6b"
+  <path d="M64 80 L53 67" fill="none" stroke="#18181b"
         stroke-width="5" stroke-linecap="round"/>
-  <circle cx="64" cy="80" r="4.5" fill="#1b3a6b"/>
+  <circle cx="64" cy="80" r="4.5" fill="#18181b"/>
 </svg>
