@@ -20,6 +20,7 @@ use super::policy::is_scarce;
 use super::types::{Action, Level, Sample};
 use common::GuardConfig;
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::process::Command;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -184,6 +185,15 @@ fn comm_in(cgroup: &str, exe: &str) -> Option<String> {
         .filter(|c| !c.is_empty())
 }
 
+/// Whether the cgroup directory `dir` may still be frozen: a freeze is
+/// requested (`cgroup.freeze` is 1) or `cgroup.events` says `frozen 1`.
+/// False when neither can be read.
+fn frozen_at(dir: &Path) -> bool {
+    let read = |file: &str| std::fs::read_to_string(dir.join(file)).ok();
+    read("cgroup.freeze").and_then(|c| super::cgfs::parse_freeze(&c)) == Some(true)
+        || read("cgroup.events").and_then(|c| super::cgfs::parse_frozen(&c)) == Some(true)
+}
+
 /// The two notification settings, the only ones the guard applies live.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NotifyFlags {
@@ -267,10 +277,7 @@ impl<S: NotifySink> Notifier<S> {
             shown: HashMap::new(),
             thawed: HashSet::new(),
             stuck: HashMap::new(),
-            still_frozen: Box::new(|cg| {
-                super::cgfs::read_freeze(cg) == Some(true)
-                    || super::cgfs::read_frozen(cg) == Some(true)
-            }),
+            still_frozen: Box::new(|cg| frozen_at(&super::cgfs::abs(cg))),
             pressure_shown: false,
             last_pressure_ms: None,
         }
@@ -1059,6 +1066,36 @@ mod tests {
             !(n.still_frozen)("/rlm-test-no-such-cgroup-for-notify"),
             "a missing cgroup is not frozen"
         );
+    }
+
+    #[test]
+    fn a_requested_or_finished_freeze_counts_as_frozen() {
+        // A temp directory with the two files stands in for the cgroup.
+        let dir = tempfile::tempdir().unwrap();
+        let set = |freeze: &str, frozen: &str| {
+            std::fs::write(dir.path().join("cgroup.freeze"), freeze).unwrap();
+            std::fs::write(
+                dir.path().join("cgroup.events"),
+                format!("populated 1\nfrozen {frozen}\n"),
+            )
+            .unwrap();
+        };
+        set("1\n", "0");
+        assert!(
+            frozen_at(dir.path()),
+            "freeze requested, tasks still stopping"
+        );
+        set("0\n", "1");
+        assert!(frozen_at(dir.path()), "frozen, the request since dropped");
+        set("1\n", "1");
+        assert!(frozen_at(dir.path()));
+        set("0\n", "0");
+        assert!(!frozen_at(dir.path()), "thawed");
+        set("x", "0");
+        assert!(!frozen_at(dir.path()), "an unreadable request is no freeze");
+        std::fs::remove_file(dir.path().join("cgroup.freeze")).unwrap();
+        std::fs::write(dir.path().join("cgroup.events"), "frozen 1\n").unwrap();
+        assert!(frozen_at(dir.path()), "events alone still say frozen");
     }
 
     #[test]

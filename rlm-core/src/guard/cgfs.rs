@@ -26,11 +26,7 @@ pub fn read_frozen(cg: &str) -> Option<bool> {
 /// stopped. `None` if unreadable (e.g. the cgroup is gone).
 pub fn read_freeze(cg: &str) -> Option<bool> {
     let content = fs::read_to_string(abs(cg).join("cgroup.freeze")).ok()?;
-    match content.trim() {
-        "1" => Some(true),
-        "0" => Some(false),
-        _ => None,
-    }
+    parse_freeze(&content)
 }
 
 /// Whether the cgroup (or any descendant) holds a process, from
@@ -200,6 +196,15 @@ pub fn parse_frozen(events: &str) -> Option<bool> {
     })
 }
 
+/// Pure parser: the contents of cgroup.freeze, `None` unless it is 0 or 1.
+pub fn parse_freeze(content: &str) -> Option<bool> {
+    match content.trim() {
+        "1" => Some(true),
+        "0" => Some(false),
+        _ => None,
+    }
+}
+
 /// Pure parser: the "populated <0|1>" line of cgroup.events, or `None` if
 /// absent.
 pub fn parse_populated(events: &str) -> Option<bool> {
@@ -258,6 +263,17 @@ mod tests {
         assert_eq!(parse_frozen("populated 1\nfrozen 0\n"), Some(false));
         assert_eq!(parse_frozen("populated 1\nfrozen 1\n"), Some(true));
         assert_eq!(parse_frozen("populated 1\n"), None);
+    }
+
+    #[test]
+    fn parse_freeze_reads_the_requested_state() {
+        assert_eq!(parse_freeze("1"), Some(true));
+        assert_eq!(parse_freeze("0"), Some(false));
+        assert_eq!(parse_freeze("1\n"), Some(true));
+        assert_eq!(parse_freeze("0\n"), Some(false));
+        assert_eq!(parse_freeze(""), None);
+        assert_eq!(parse_freeze("2"), None);
+        assert_eq!(parse_freeze("x"), None);
     }
 
     #[test]
