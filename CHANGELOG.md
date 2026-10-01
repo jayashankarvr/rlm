@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- New app icon in grey, white and black instead of blue. The README hero image uses it too.
+
 ### Fixed
 
 - README: a memory limit turns swap off so the app does not thrash swap at its limit, and past it the kernel's OOM killer ends a process in it; the old wording said "does not thrash the disk" and "the kernel stops it".
