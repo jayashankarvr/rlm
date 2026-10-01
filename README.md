@@ -142,9 +142,10 @@ cargo install --path gtk-gui    # rlm-gtk (needs GTK4 and libadwaita headers)
 3. Run `rlm doctor`. It checks cgroup v2, delegated controllers, PSI, your config file and the guard binary, unit and service.
 4. Optional: run `rlm guard enable`. When no packaged unit exists (crates.io and source installs), it writes `~/.config/systemd/user/rlm-guard.service` pointing at your `rlm-guard`, then enables and starts it with `systemctl --user`.
 
-After you upgrade the binary, restart the guard so the new version runs:
+After you upgrade the binary, restart the guard so the new version runs. The `daemon-reload` picks up the service file a package upgrade may have replaced; without it, systemctl warns that the unit file changed on disk.
 
 ```bash
+systemctl --user daemon-reload
 systemctl --user restart rlm-guard
 ```
 
