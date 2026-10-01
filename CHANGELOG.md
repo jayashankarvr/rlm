@@ -11,12 +11,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - README: a memory limit turns swap off so the app does not thrash swap at its limit, and past it the kernel's OOM killer ends a process in it; the old wording said "does not thrash the disk" and "the kernel stops it".
 - Desktop app: the window opens without waiting for the installed apps' names. Limit Running and Managed Processes show program names until the names are read, then show the app names, keeping what is selected.
-- Google Chrome shows as "Google Chrome" instead of "Chrome", in the desktop app and in the guard's notifications. An app whose menu entry starts it through a link or script in another directory (Chrome's `/usr/bin/google-chrome-stable` runs `/opt/google/chrome/chrome`) is now named by the directory it is installed in.
+- `scripts/demo-memory-pressure.sh`: an option given without a value prints usage instead of a bash error, values with a leading zero (`08`) are read as decimal, and the `--hold` error says "more than 5 seconds shorter".
+- Google Chrome shows as "Google Chrome" instead of "Chrome", in the desktop app and in the guard's notifications. Its menu entry runs `/usr/bin/google-chrome-stable`, which links to `/opt/google/chrome/google-chrome`, a script that runs `chrome`. An app whose entry leads to a program in its own directory like this is now named by that directory. Shared directories (any `bin`, library directories, the home folder and the folders in it) and runtimes such as `java`, `node` or `electron30` never name an app this way.
 
 ### Changed
 
-- Tests cover reading `cgroup.freeze` and the check that keeps a "could not be resumed" notification open while the app is still paused.
-- `scripts/demo-memory-pressure.sh`: an option given without a value prints usage instead of a bash error, values with a leading zero (`08`) are read as decimal, and the `--hold` error says "more than 5 seconds shorter".
+- `rlmctl-core` library: `desktop::names_by_program` is replaced by `desktop::installed_names`, which returns `DesktopNames`; `appname::display_name` and `appname::friendly_name` take the directory of the process's executable as a new argument.
 
 ## [0.2.7] - 2026-09-30
 

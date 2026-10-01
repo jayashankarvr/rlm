@@ -12,7 +12,8 @@ use std::sync::OnceLock;
 /// A friendly name for an app key (an exe basename, or
 /// `<basename>@<cgroup leaf>` as the guard uses for runtimes). In order: the
 /// `Name` of an installed desktop entry that runs this program, else of the
-/// app installed in `exe_dir` (the directory of the process's executable),
+/// app installed in `exe_dir` (the directory of the process's executable;
+/// not for an interpreter or runtime such as `java`, which runs any app),
 /// else the process name `comm` when the basename has no letters (a
 /// versioned binary such as `2.1.283`), else the basename with its first
 /// letter upper-cased. The `@leaf` suffix is never shown.
@@ -28,7 +29,12 @@ pub fn display_name(
         .programs
         .get(program)
         .or_else(|| desktop.programs.get(base))
-        .or_else(|| exe_dir.and_then(|d| desktop.dirs.get(d)));
+        .or_else(|| {
+            let runtime = crate::desktop::is_launcher(program);
+            exe_dir
+                .filter(|_| !runtime)
+                .and_then(|d| desktop.dirs.get(d))
+        });
     if let Some(name) = name {
         return name.clone();
     }
@@ -176,6 +182,22 @@ mod tests {
             "a program's own entry comes first"
         );
         assert_eq!(display_name("chrome", &desktop, None, None), "Chrome");
+        // A runtime's directory names no app, even if an entry claimed it.
+        desktop.dirs.insert(
+            PathBuf::from("/usr/lib/jvm/java-17/bin"),
+            "OpenJDK 17 Monitoring & Management Console".into(),
+        );
+        let jvm = Some(Path::new("/usr/lib/jvm/java-17/bin"));
+        assert_eq!(display_name("java", &desktop, Some("java"), jvm), "Java");
+        assert_eq!(
+            display_name(
+                "electron30",
+                &desktop,
+                None,
+                Some(Path::new("/opt/google/chrome"))
+            ),
+            "Electron30"
+        );
         assert_eq!(
             display_name("chrome", &desktop, None, Some(Path::new("/opt/other"))),
             "Chrome"

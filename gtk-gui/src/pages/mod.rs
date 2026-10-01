@@ -32,12 +32,19 @@ pub fn plain_toast(title: &str) -> adw::Toast {
 
 /// Run `f` once on the main thread after the installed apps' names (read on
 /// a background thread at startup) are loaded, so a page drawn before then
-/// can show them. Checks every 100 ms.
+/// can show them. Checks every 100 ms and gives up after 30 s (the read
+/// failed; the pages keep the program names).
 pub fn when_app_names_load(f: impl FnOnce() + 'static) {
     let mut f = Some(f);
+    let mut checks_left = 300;
     glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
         if rlm_core::appname::loaded_desktop_names().is_none() {
-            return glib::ControlFlow::Continue;
+            checks_left -= 1;
+            return if checks_left > 0 {
+                glib::ControlFlow::Continue
+            } else {
+                glib::ControlFlow::Break
+            };
         }
         if let Some(f) = f.take() {
             f();

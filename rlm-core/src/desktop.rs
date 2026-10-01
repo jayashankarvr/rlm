@@ -121,7 +121,9 @@ fn names_from_entries(entries: &[Entry]) -> HashMap<String, String> {
 /// App install directory to app name, from `entries`: the directory of the
 /// file each entry's program really is, as `resolve` finds it (following
 /// symlinks, so `/usr/bin/google-chrome-stable` gives `/opt/google/chrome`).
-/// The entries [`names_from_entries`] skips are skipped here too. A
+/// The entries [`names_from_entries`] skips are skipped here too, and so
+/// are those whose file is an interpreter or runtime (its directory holds
+/// whatever app it runs) or an AppImage (AppImages share a folder). A
 /// directory many apps share (see [`is_shared_dir`]) is left out, and so is
 /// one whose entries disagree on the name.
 fn dirs_from_entries(
@@ -134,9 +136,13 @@ fn dirs_from_entries(
         let Some(file) = own_program(e).and_then(|p| resolve(&p)) else {
             continue;
         };
-        let Some(dir) = file.parent() else {
+        let (Some(dir), Some(name)) = (file.parent(), file.file_name().and_then(|n| n.to_str()))
+        else {
             continue;
         };
+        if is_launcher(name) || name.to_lowercase().ends_with(".appimage") {
+            continue;
+        }
         if !is_shared_dir(dir, home) {
             by_dir.entry(dir.to_path_buf()).or_default().push(e);
         }
@@ -153,14 +159,21 @@ fn resolve_program(program: &str) -> Option<PathBuf> {
     if program.contains('/') {
         return fs::canonicalize(program).ok();
     }
-    std::env::split_paths(&std::env::var_os("PATH")?)
+    find_on_path(program, std::env::split_paths(&std::env::var_os("PATH")?))
+}
+
+/// The first file named `program` in `dirs`, symlinks followed. Relative
+/// directories are skipped: they depend on where this process happens to
+/// run.
+fn find_on_path(program: &str, dirs: impl Iterator<Item = PathBuf>) -> Option<PathBuf> {
+    dirs.filter(|dir| dir.is_absolute())
         .filter_map(|dir| fs::canonicalize(dir.join(program)).ok())
         .find(|file| file.is_file())
 }
 
 /// Whether `dir` holds the programs of many apps, so living there says
-/// nothing about which app a program belongs to: the bin and library
-/// directories of the system and of the user (`home`), and the like.
+/// nothing about which app a program belongs to: any `bin` or `sbin`, the
+/// library directories, `home` and the folders right in it, and the like.
 fn is_shared_dir(dir: &Path, home: Option<&Path>) -> bool {
     const SHARED: &[&str] = &[
         "/",
@@ -186,6 +199,7 @@ fn is_shared_dir(dir: &Path, home: Option<&Path>) -> bool {
         "/var/lib/flatpak/exports/bin",
         "/app/bin",
         "/run/current-system/sw/bin",
+        "/usr/local/go/bin",
     ];
     const SHARED_IN_HOME: &[&str] = &[
         "",
@@ -194,8 +208,24 @@ fn is_shared_dir(dir: &Path, home: Option<&Path>) -> bool {
         ".cargo/bin",
         ".nix-profile/bin",
         ".local/share/flatpak/exports/bin",
+        "Applications",
+        "Downloads",
+        "Desktop",
+        "go/bin",
+        ".bun/bin",
+        ".deno/bin",
+        ".npm-global/bin",
+        ".volta/bin",
+        ".local/share/pnpm",
+        ".dotnet/tools",
     ];
     if SHARED.iter().any(|s| dir == Path::new(s)) {
+        return true;
+    }
+    if dir.file_name().is_some_and(|n| n == "bin" || n == "sbin") {
+        return true;
+    }
+    if home.is_some_and(|h| dir.parent() == Some(h)) {
         return true;
     }
     // Multiarch library directories such as /usr/lib/x86_64-linux-gnu.
@@ -255,7 +285,13 @@ fn launches_something_else(arg: &str) -> bool {
 
 /// Interpreters and launchers: an entry that runs one of these names some
 /// other app, so its `Name` must not label every process of that program.
-fn is_launcher(program: &str) -> bool {
+/// Versioned runtimes (`electron30`, `python3.12`, `node22`, `java-17`)
+/// count too.
+pub(crate) fn is_launcher(program: &str) -> bool {
+    const RUNTIMES: &[&str] = &[
+        "java", "javaw", "node", "nodejs", "electron", "python", "perl", "ruby", "php", "lua",
+        "mono", "dotnet", "wine", "gjs", "bun", "deno",
+    ];
     const EXACT: &[&str] = &[
         "sh",
         "bash",
@@ -281,7 +317,9 @@ fn is_launcher(program: &str) -> bool {
         "xdg-open",
         "gio",
     ];
-    EXACT.contains(&program) || program.starts_with("python")
+    let unversioned =
+        program.trim_end_matches(|c: char| c.is_ascii_digit() || matches!(c, '.' | '-' | '_'));
+    EXACT.contains(&program) || RUNTIMES.contains(&unversioned) || program.starts_with("python")
 }
 
 /// The basename of the program a raw desktop file `Exec` value runs, looking
@@ -904,6 +942,16 @@ mod tests {
             "/home/u/bin",
             "/home/u/.local/bin",
             "/home/u/.local/bin/",
+            "/home/u/Applications",
+            "/home/u/go/bin",
+            "/home/u/.bun/bin",
+            "/home/u/.local/share/pnpm",
+            "/home/u/.dotnet/tools",
+            "/home/u/Downloads",
+            "/home/u/somefolder",
+            "/usr/local/go/bin",
+            "/usr/lib/jvm/java-17-openjdk/bin",
+            "/opt/tool/sbin",
         ] {
             assert!(is_shared_dir(Path::new(dir), home), "{dir}");
         }
@@ -912,17 +960,78 @@ mod tests {
             "/usr/lib/firefox",
             "/usr/share/code",
             "/home/u/apps/tool",
-            "/home/v/.local/bin",
         ] {
             assert!(!is_shared_dir(Path::new(dir), home), "{dir}");
         }
-        assert!(!is_shared_dir(Path::new("/home/u/.local/bin"), None));
+        assert!(!is_shared_dir(Path::new("/home/u/somefolder"), None));
+    }
+
+    #[test]
+    fn runtimes_and_appimages_do_not_claim_a_directory() {
+        let home = Path::new("/home/u");
+        let resolve = resolver(&[
+            (
+                "/usr/lib/jvm/java-17-openjdk/bin/jconsole",
+                "/usr/lib/jvm/java-17-openjdk/bin/jconsole",
+            ),
+            ("electron30", "/usr/lib/electron30/electron"),
+            ("/usr/bin/foo", "/usr/lib/electron30/electron"),
+            ("/usr/bin/bar", "/usr/lib/node22/node"),
+            ("/opt/apps/Foo.AppImage", "/opt/apps/Foo.AppImage"),
+            ("/opt/apps/Baz.appimage", "/opt/apps/Baz.appimage"),
+        ]);
+        let dirs = dirs_from_entries(
+            &[
+                entry(
+                    "jconsole",
+                    "OpenJDK 17 Monitoring & Management Console",
+                    "/usr/lib/jvm/java-17-openjdk/bin/jconsole",
+                    None,
+                ),
+                entry("foo-asar", "Foo", "electron30 /usr/lib/foo/app.asar", None),
+                entry("foo", "Foo", "/usr/bin/foo", None),
+                entry("bar", "Bar", "/usr/bin/bar", None),
+                entry("foo-appimage", "Foo", "/opt/apps/Foo.AppImage", None),
+                entry("baz-appimage", "Baz", "/opt/apps/Baz.appimage", None),
+            ],
+            &resolve,
+            Some(home),
+        );
+        assert!(dirs.is_empty(), "{dirs:?}");
+    }
+
+    #[test]
+    fn a_bare_program_is_found_on_absolute_path_entries_only() {
+        let root = tempfile::tempdir().unwrap();
+        let bin = root.path().join("bin");
+        let app = root.path().join("app");
+        fs::create_dir(&bin).unwrap();
+        fs::create_dir(&app).unwrap();
+        fs::write(app.join("tool"), "").unwrap();
+        std::os::unix::fs::symlink(app.join("tool"), bin.join("tool")).unwrap();
+        fs::create_dir(bin.join("adir")).unwrap();
+        let found = find_on_path("tool", [PathBuf::from("rel"), bin.clone()].into_iter());
+        assert_eq!(found, Some(fs::canonicalize(app.join("tool")).unwrap()));
+        assert_eq!(find_on_path("adir", [bin.clone()].into_iter()), None);
+        assert_eq!(find_on_path("none", [bin].into_iter()), None);
+        // A relative entry is never searched, even when it leads to the file
+        // from the current directory.
+        let up = std::env::current_dir().unwrap().components().count() - 1;
+        let rel = PathBuf::from("../".repeat(up)).join(app.strip_prefix("/").unwrap());
+        assert!(rel.join("tool").is_file());
+        assert_eq!(find_on_path("tool", [rel].into_iter()), None);
     }
 
     #[test]
     fn interpreters_do_not_take_an_apps_name() {
         assert!(is_launcher("python3.14"));
         assert!(is_launcher("flatpak"));
+        assert!(is_launcher("electron30"));
+        assert!(is_launcher("node22"));
+        assert!(is_launcher("java-17"));
+        assert!(is_launcher("ruby3.2"));
         assert!(!is_launcher("firefox"));
+        assert!(!is_launcher("chrome"));
+        assert!(!is_launcher("javascript-tool"));
     }
 }
