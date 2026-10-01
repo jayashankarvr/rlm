@@ -5,11 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
-
-### Changed
-
-- New app icon in grey, white and black instead of blue. The README hero image uses it too.
+## [0.2.8] - 2026-10-01
 
 ### Fixed
 
@@ -20,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- New app icon in grey, white and black instead of blue. The README hero image uses it too.
 - `rlmctl-core` library: `desktop::names_by_program` is replaced by `desktop::installed_names`, which returns `DesktopNames`; `appname::display_name` and `appname::friendly_name` take the directory of the process's executable as a new argument.
 
 ## [0.2.7] - 2026-09-30
