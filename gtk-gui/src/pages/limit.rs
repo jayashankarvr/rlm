@@ -409,6 +409,14 @@ pub fn create(manager: Option<Arc<CgroupManager>>) -> gtk::Widget {
     toast_overlay.set_child(Some(&page));
     let widget: gtk::Widget = with_action_bar(&toast_overlay, &status_label, &apply_btn).upcast();
 
+    // The installed apps' names may still be loading; once they are, show
+    // them. filter_processes keeps the selection, as on every rebuild.
+    let state_clone = state.clone();
+    let search_entry_clone = search_entry.clone();
+    super::when_app_names_load(move || {
+        filter_processes(&state_clone, search_entry_clone.text().as_str());
+    });
+
     // Reload the list each time the page is shown (the window's stack maps
     // only the visible page), so it never offers processes from hours ago.
     // filter_processes keeps the PID field and highlights its rows again.

@@ -336,6 +336,13 @@ impl StatusPage {
         });
 
         this.refresh();
+        // Redraw with the installed apps' names once they are loaded.
+        let weak = Rc::downgrade(&this);
+        super::when_app_names_load(move || {
+            if let Some(page) = weak.upgrade() {
+                page.refresh();
+            }
+        });
         this
     }
 

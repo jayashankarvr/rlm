@@ -5,6 +5,7 @@ pub mod run;
 pub mod status;
 
 use adw::prelude::*;
+use gtk::glib;
 
 /// Show `toast` in the toast overlay that contains `widget`. Does nothing if
 /// `widget` is not inside one, for example before it is added to the window.
@@ -27,4 +28,20 @@ pub fn gui_error(e: &common::Error) -> String {
 /// them are not read as markup.
 pub fn plain_toast(title: &str) -> adw::Toast {
     adw::Toast::new(&gtk::glib::markup_escape_text(title))
+}
+
+/// Run `f` once on the main thread after the installed apps' names (read on
+/// a background thread at startup) are loaded, so a page drawn before then
+/// can show them. Checks every 100 ms.
+pub fn when_app_names_load(f: impl FnOnce() + 'static) {
+    let mut f = Some(f);
+    glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
+        if rlm_core::appname::loaded_desktop_names().is_none() {
+            return glib::ControlFlow::Continue;
+        }
+        if let Some(f) = f.take() {
+            f();
+        }
+        glib::ControlFlow::Break
+    });
 }

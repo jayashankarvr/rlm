@@ -42,17 +42,26 @@ pub fn program_name<'a>(exe: &'a str, comm: Option<&'a str>) -> &'a str {
     }
 }
 
+static NAMES: OnceLock<HashMap<String, String>> = OnceLock::new();
+
 /// Installed application names keyed by program basename, read from the
 /// desktop entries on first use and cached for the life of the process.
+/// The first call waits for the read.
 pub fn desktop_names() -> &'static HashMap<String, String> {
-    static NAMES: OnceLock<HashMap<String, String>> = OnceLock::new();
     NAMES.get_or_init(crate::desktop::names_by_program)
 }
 
+/// The cached [`desktop_names`] if they have been read, without waiting:
+/// `None` until the first [`desktop_names`] call has finished.
+pub fn loaded_desktop_names() -> Option<&'static HashMap<String, String>> {
+    NAMES.get()
+}
+
 /// [`display_name`] of the program `exe` (a basename) whose process name is
-/// `comm`, using the cached [`desktop_names`].
+/// `comm`, using the cached [`desktop_names`]. Never waits for them: until
+/// they are read, the name falls back to the basename rules.
 pub fn friendly_name(exe: &str, comm: Option<&str>) -> String {
-    display_name(exe, desktop_names(), comm)
+    display_name(exe, loaded_desktop_names().unwrap_or(&HashMap::new()), comm)
 }
 
 /// The executable basename of `pid`: the target of `/proc/<pid>/exe`
