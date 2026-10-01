@@ -60,7 +60,10 @@ pub fn app_name(p: &ProcessStatus) -> String {
     let comm = (p.name != "?").then_some(p.name.as_str());
     let exe = rlm_core::appname::exe_of_pid(p.pid);
     match exe.as_deref().or(comm) {
-        Some(program) => rlm_core::appname::friendly_name(program, comm),
+        Some(program) => {
+            let dir = rlm_core::appname::exe_dir_of_pid(p.pid);
+            rlm_core::appname::friendly_name(program, comm, dir.as_deref())
+        }
         None => p.name.clone(),
     }
 }

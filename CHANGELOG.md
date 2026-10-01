@@ -10,6 +10,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - README: a memory limit turns swap off so the app does not thrash swap at its limit, and past it the kernel's OOM killer ends a process in it; the old wording said "does not thrash the disk" and "the kernel stops it".
+- Desktop app: the window opens without waiting for the installed apps' names. Limit Running and Managed Processes show program names until the names are read, then show the app names, keeping what is selected.
+- Google Chrome shows as "Google Chrome" instead of "Chrome", in the desktop app and in the guard's notifications. An app whose menu entry starts it through a link or script in another directory (Chrome's `/usr/bin/google-chrome-stable` runs `/opt/google/chrome/chrome`) is now named by the directory it is installed in.
+
+### Changed
+
+- Tests cover reading `cgroup.freeze` and the check that keeps a "could not be resumed" notification open while the app is still paused.
 - `scripts/demo-memory-pressure.sh`: an option given without a value prints usage instead of a bash error, values with a leading zero (`08`) are read as decimal, and the `--hold` error says "more than 5 seconds shorter".
 
 ## [0.2.7] - 2026-09-30

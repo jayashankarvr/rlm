@@ -9,6 +9,7 @@ use gtk::glib;
 use rlm_core::CgroupManager;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::path::Path;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Instant;
@@ -724,7 +725,8 @@ fn filter_processes(state: &Rc<RefCell<LimitState>>, query: &str) {
             .iter()
             .map(|g| {
                 let comm = g.processes.first().map(|p| p.name.as_str());
-                (g, rlm_core::appname::friendly_name(&g.name, comm))
+                let dir = g.executable.as_deref().and_then(Path::parent);
+                (g, rlm_core::appname::friendly_name(&g.name, comm, dir))
             })
             .filter(|(g, app)| matches_query(&query_lower, &[app, &g.name]))
             .collect();
@@ -801,7 +803,8 @@ fn filter_processes(state: &Rc<RefCell<LimitState>>, query: &str) {
         let matching: Vec<_> = processes
             .iter()
             .map(|p| {
-                let app = rlm_core::appname::friendly_name(p.display_name(), Some(&p.name));
+                let dir = p.executable.as_deref().and_then(Path::parent);
+                let app = rlm_core::appname::friendly_name(p.display_name(), Some(&p.name), dir);
                 (p, app)
             })
             .filter(|(p, app)| {

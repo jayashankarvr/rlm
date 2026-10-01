@@ -62,10 +62,25 @@ pub fn list_applications() -> Result<Vec<DesktopApp>> {
     Ok(apps)
 }
 
-/// Installed application names keyed by the basename of the program their
-/// `Exec` runs (`firefox` to `Firefox`). See [`names_from_entries`].
-pub fn names_by_program() -> HashMap<String, String> {
-    names_from_entries(&desktop_entries())
+/// Installed application names, from the desktop entries.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct DesktopNames {
+    /// By the basename of the program an entry's `Exec` runs (`firefox` to
+    /// `Firefox`). See [`names_from_entries`].
+    pub programs: HashMap<String, String>,
+    /// By the directory an app is installed in (`/opt/google/chrome` to
+    /// `Google Chrome`), for a process whose program no entry runs by name.
+    /// See [`dirs_from_entries`].
+    pub dirs: HashMap<PathBuf, String>,
+}
+
+/// The installed applications' [`DesktopNames`].
+pub fn installed_names() -> DesktopNames {
+    let entries = desktop_entries();
+    DesktopNames {
+        programs: names_from_entries(&entries),
+        dirs: dirs_from_entries(&entries, resolve_program, dirs::home_dir().as_deref()),
+    }
 }
 
 /// Program basename to app name, from `entries`. Entries that run an
@@ -78,16 +93,13 @@ pub fn names_by_program() -> HashMap<String, String> {
 fn names_from_entries(entries: &[Entry]) -> HashMap<String, String> {
     let mut by_program: HashMap<String, Vec<&Entry>> = HashMap::new();
     for e in entries {
-        let Some(args) = exec_args(&e.exec) else {
+        let Some(program) = own_program(e) else {
             continue;
         };
-        let Some(program) = program_of(&args) else {
-            continue;
-        };
-        if is_launcher(&program) || args.iter().any(|a| launches_something_else(a)) {
-            continue;
+        let program = basename(&program);
+        if !program.is_empty() {
+            by_program.entry(program).or_default().push(e);
         }
-        by_program.entry(program).or_default().push(e);
     }
     let mut names = HashMap::new();
     for (program, entries) in by_program {
@@ -104,6 +116,110 @@ fn names_from_entries(entries: &[Entry]) -> HashMap<String, String> {
         }
     }
     names
+}
+
+/// App install directory to app name, from `entries`: the directory of the
+/// file each entry's program really is, as `resolve` finds it (following
+/// symlinks, so `/usr/bin/google-chrome-stable` gives `/opt/google/chrome`).
+/// The entries [`names_from_entries`] skips are skipped here too. A
+/// directory many apps share (see [`is_shared_dir`]) is left out, and so is
+/// one whose entries disagree on the name.
+fn dirs_from_entries(
+    entries: &[Entry],
+    resolve: impl Fn(&str) -> Option<PathBuf>,
+    home: Option<&Path>,
+) -> HashMap<PathBuf, String> {
+    let mut by_dir: HashMap<PathBuf, Vec<&Entry>> = HashMap::new();
+    for e in entries {
+        let Some(file) = own_program(e).and_then(|p| resolve(&p)) else {
+            continue;
+        };
+        let Some(dir) = file.parent() else {
+            continue;
+        };
+        if !is_shared_dir(dir, home) {
+            by_dir.entry(dir.to_path_buf()).or_default().push(e);
+        }
+    }
+    by_dir
+        .into_iter()
+        .filter_map(|(dir, entries)| Some((dir, single_name(entries.into_iter())?)))
+        .collect()
+}
+
+/// The file an Exec program really is, symlinks followed: a path as it
+/// stands, a bare name as found on `PATH`.
+fn resolve_program(program: &str) -> Option<PathBuf> {
+    if program.contains('/') {
+        return fs::canonicalize(program).ok();
+    }
+    std::env::split_paths(&std::env::var_os("PATH")?)
+        .filter_map(|dir| fs::canonicalize(dir.join(program)).ok())
+        .find(|file| file.is_file())
+}
+
+/// Whether `dir` holds the programs of many apps, so living there says
+/// nothing about which app a program belongs to: the bin and library
+/// directories of the system and of the user (`home`), and the like.
+fn is_shared_dir(dir: &Path, home: Option<&Path>) -> bool {
+    const SHARED: &[&str] = &[
+        "/",
+        "/bin",
+        "/sbin",
+        "/lib",
+        "/lib64",
+        "/opt",
+        "/usr/bin",
+        "/usr/sbin",
+        "/usr/games",
+        "/usr/lib",
+        "/usr/lib32",
+        "/usr/lib64",
+        "/usr/libexec",
+        "/usr/share",
+        "/usr/local/bin",
+        "/usr/local/sbin",
+        "/usr/local/games",
+        "/usr/local/lib",
+        "/usr/local/libexec",
+        "/snap/bin",
+        "/var/lib/flatpak/exports/bin",
+        "/app/bin",
+        "/run/current-system/sw/bin",
+    ];
+    const SHARED_IN_HOME: &[&str] = &[
+        "",
+        "bin",
+        ".local/bin",
+        ".cargo/bin",
+        ".nix-profile/bin",
+        ".local/share/flatpak/exports/bin",
+    ];
+    if SHARED.iter().any(|s| dir == Path::new(s)) {
+        return true;
+    }
+    // Multiarch library directories such as /usr/lib/x86_64-linux-gnu.
+    let multiarch = dir
+        .parent()
+        .is_some_and(|p| p == Path::new("/usr/lib") || p == Path::new("/lib"))
+        && dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.contains("-linux-"));
+    multiarch || home.is_some_and(|h| SHARED_IN_HOME.iter().any(|s| dir == h.join(s)))
+}
+
+/// The program an entry runs, as its `Exec` names it (past an `env`
+/// wrapper). `None` for an entry that runs an interpreter or launcher, or
+/// passes arguments launching something else (a web app, a game shortcut,
+/// a terminal command): its `Name` is not the program's.
+fn own_program(e: &Entry) -> Option<String> {
+    let args = exec_args(&e.exec)?;
+    let program = program_arg(&args)?;
+    if is_launcher(&basename(program)) || args.iter().any(|a| launches_something_else(a)) {
+        return None;
+    }
+    Some(program.to_string())
 }
 
 /// The one name all `entries` share, `None` if there are none or several.
@@ -187,6 +303,17 @@ fn exec_args(value: &str) -> Option<Vec<String>> {
 
 /// The basename of the program `args` run, past an `env` wrapper.
 fn program_of(args: &[String]) -> Option<String> {
+    let base = basename(program_arg(args)?);
+    (!base.is_empty()).then_some(base)
+}
+
+/// The last part of a path, the whole of it when it has no `/`.
+fn basename(program: &str) -> String {
+    program.rsplit('/').next().unwrap_or(program).to_string()
+}
+
+/// The program `args` run as they name it, past an `env` wrapper.
+fn program_arg(args: &[String]) -> Option<&str> {
     let mut args = args.iter();
     let mut program = args.next()?;
     if program == "env" {
@@ -202,8 +329,7 @@ fn program_of(args: &[String]) -> Option<String> {
             }
         };
     }
-    let base = program.rsplit('/').next().unwrap_or(program);
-    (!base.is_empty()).then(|| base.to_string())
+    Some(program.as_str())
 }
 
 /// A shown application entry: its `Name`, raw `Exec` value, file name
@@ -650,6 +776,147 @@ mod tests {
         let names =
             names_from_entries(&[entry("a", "A", "tool", None), entry("b", "B", "tool", None)]);
         assert_eq!(names.get("tool"), None, "still ambiguous");
+    }
+
+    /// A fake filesystem: where each Exec program really is.
+    fn resolver(files: &[(&str, &str)]) -> impl Fn(&str) -> Option<PathBuf> {
+        let files: HashMap<String, PathBuf> = files
+            .iter()
+            .map(|(p, f)| (p.to_string(), PathBuf::from(f)))
+            .collect();
+        move |program| files.get(program).cloned()
+    }
+
+    #[test]
+    fn an_app_is_indexed_by_the_directory_its_program_leads_to() {
+        let resolve = resolver(&[
+            (
+                "/usr/bin/google-chrome-stable",
+                "/opt/google/chrome/google-chrome",
+            ),
+            (
+                "/opt/google/chrome/google-chrome",
+                "/opt/google/chrome/google-chrome",
+            ),
+            ("firefox", "/usr/lib/firefox/firefox"),
+        ]);
+        let entries = [
+            entry(
+                "google-chrome",
+                "Google Chrome",
+                "/usr/bin/google-chrome-stable %U",
+                None,
+            ),
+            // A web app runs the same program; it must not claim the
+            // directory (nor make it ambiguous).
+            entry(
+                "chrome-abc-Default",
+                "YouTube",
+                "/opt/google/chrome/google-chrome --profile-directory=Default --app-id=abc",
+                None,
+            ),
+            entry("firefox", "Firefox", "firefox %u", None),
+            entry("ghost", "Ghost", "/usr/bin/ghost", None),
+        ];
+        let dirs = dirs_from_entries(&entries, &resolve, None);
+        assert_eq!(
+            dirs.get(Path::new("/opt/google/chrome"))
+                .map(String::as_str),
+            Some("Google Chrome")
+        );
+        assert_eq!(
+            dirs.get(Path::new("/usr/lib/firefox")).map(String::as_str),
+            Some("Firefox")
+        );
+        assert_eq!(
+            dirs.len(),
+            2,
+            "an unresolved program adds nothing: {dirs:?}"
+        );
+    }
+
+    #[test]
+    fn a_directory_claimed_by_different_apps_is_dropped() {
+        let resolve = resolver(&[
+            ("/usr/bin/writer", "/opt/suite/program/soffice"),
+            ("/usr/bin/calc", "/opt/suite/program/soffice"),
+            ("/usr/bin/tool", "/opt/tool/tool"),
+            ("/usr/local/bin/tool", "/opt/tool/tool"),
+        ]);
+        let dirs = dirs_from_entries(
+            &[
+                entry("writer", "Writer", "/usr/bin/writer", None),
+                entry("calc", "Calc", "/usr/bin/calc", None),
+                // The same app installed twice (a system and a user entry)
+                // agrees on the name, so it stays.
+                entry("tool", "Tool", "/usr/bin/tool", None),
+                entry("tool", "Tool", "/usr/local/bin/tool", None),
+            ],
+            &resolve,
+            None,
+        );
+        assert_eq!(dirs.get(Path::new("/opt/suite/program")), None);
+        assert_eq!(
+            dirs.get(Path::new("/opt/tool")).map(String::as_str),
+            Some("Tool")
+        );
+    }
+
+    #[test]
+    fn shared_bin_directories_and_launchers_are_not_indexed() {
+        let home = Path::new("/home/u");
+        let resolve = resolver(&[
+            ("gedit", "/usr/bin/gedit"),
+            ("/snap/bin/spotify", "/usr/bin/snap"),
+            ("mytool", "/home/u/.local/bin/mytool"),
+            ("python3", "/usr/bin/python3.12"),
+            ("/opt/app/run.sh", "/opt/app/run.sh"),
+        ]);
+        let dirs = dirs_from_entries(
+            &[
+                entry("gedit", "Text Editor", "gedit %U", None),
+                entry("spotify", "Spotify", "/snap/bin/spotify %U", None),
+                entry("mytool", "My Tool", "mytool", None),
+                entry("game", "Game", "python3 /opt/game/main.py", None),
+                entry("app", "App", "sh /opt/app/run.sh", None),
+            ],
+            &resolve,
+            Some(home),
+        );
+        assert!(dirs.is_empty(), "{dirs:?}");
+    }
+
+    #[test]
+    fn shared_directories() {
+        let home = Some(Path::new("/home/u"));
+        for dir in [
+            "/usr/bin",
+            "/bin",
+            "/usr/local/bin",
+            "/usr/games",
+            "/snap/bin",
+            "/var/lib/flatpak/exports/bin",
+            "/usr/lib",
+            "/usr/libexec",
+            "/usr/lib/x86_64-linux-gnu",
+            "/opt",
+            "/home/u",
+            "/home/u/bin",
+            "/home/u/.local/bin",
+            "/home/u/.local/bin/",
+        ] {
+            assert!(is_shared_dir(Path::new(dir), home), "{dir}");
+        }
+        for dir in [
+            "/opt/google/chrome",
+            "/usr/lib/firefox",
+            "/usr/share/code",
+            "/home/u/apps/tool",
+            "/home/v/.local/bin",
+        ] {
+            assert!(!is_shared_dir(Path::new(dir), home), "{dir}");
+        }
+        assert!(!is_shared_dir(Path::new("/home/u/.local/bin"), None));
     }
 
     #[test]

@@ -112,21 +112,23 @@ pub fn format_size(bytes: u64) -> String {
 }
 
 pub use crate::appname::display_name;
+use crate::appname::DesktopNames;
 
 /// Resolves app keys to [`display_name`]s from the system: installed
-/// desktop entries (read once) and, for versioned binaries, the process name
-/// of a member of the cgroup.
+/// desktop entries (read once) and a member of the cgroup, for the
+/// directory its executable is in and, for versioned binaries, its process
+/// name.
 pub struct AppNames {
-    desktop: HashMap<String, String>,
+    desktop: DesktopNames,
     /// Desktop entries still being read on a background thread.
-    loading: Option<mpsc::Receiver<HashMap<String, String>>>,
+    loading: Option<mpsc::Receiver<DesktopNames>>,
 }
 
 impl AppNames {
     /// Read the desktop entries now.
     pub fn new() -> Self {
         Self {
-            desktop: crate::desktop::names_by_program(),
+            desktop: crate::desktop::installed_names(),
             loading: None,
         }
     }
@@ -139,10 +141,10 @@ impl AppNames {
         let spawned = std::thread::Builder::new()
             .name("rlm-app-names".into())
             .spawn(move || {
-                let _ = tx.send(crate::desktop::names_by_program());
+                let _ = tx.send(crate::desktop::installed_names());
             });
         Self {
-            desktop: HashMap::new(),
+            desktop: DesktopNames::default(),
             loading: spawned.ok().map(|_| rx),
         }
     }
@@ -160,12 +162,14 @@ impl AppNames {
             }
         }
         let base = key.split('@').next().unwrap_or(key);
+        let member = member_in(cgroup, base);
         let comm = if base.chars().any(char::is_alphabetic) {
             None
         } else {
-            comm_in(cgroup, base)
+            member.and_then(comm_of)
         };
-        display_name(key, &self.desktop, comm.as_deref())
+        let dir = member.and_then(crate::appname::exe_dir_of_pid);
+        display_name(key, &self.desktop, comm.as_deref(), dir.as_deref())
     }
 }
 
@@ -175,12 +179,17 @@ impl Default for AppNames {
     }
 }
 
-/// The process name of the first process under `cgroup` running `exe`.
-fn comm_in(cgroup: &str, exe: &str) -> Option<String> {
+/// The first process under `cgroup` running `exe`.
+fn member_in(cgroup: &str, exe: &str) -> Option<u32> {
     super::cgfs::pids_under(cgroup)
         .into_iter()
         .find(|&p| super::cgfs::exe_basename(p).as_deref() == Some(exe))
-        .and_then(|p| std::fs::read_to_string(format!("/proc/{p}/comm")).ok())
+}
+
+/// The process name of `pid`.
+fn comm_of(pid: u32) -> Option<String> {
+    std::fs::read_to_string(format!("/proc/{pid}/comm"))
+        .ok()
         .map(|c| c.trim().to_string())
         .filter(|c| !c.is_empty())
 }
@@ -907,7 +916,7 @@ mod tests {
     }
 
     fn names(key: &str, _cg: &str) -> String {
-        display_name(key, &HashMap::new(), None)
+        display_name(key, &DesktopNames::default(), None, None)
     }
 
     fn paused() -> Call {
