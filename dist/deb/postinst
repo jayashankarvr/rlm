@@ -9,7 +9,7 @@ if [ -d /run/systemd/system ]; then
     # Upgrade: a running guard keeps the old binary until restarted. Root
     # does not restart user services; tell each user to do it.
     if [ "$1" = "configure" ] && [ -n "${2:-}" ]; then
-        echo "rlm: upgraded. If the guard runs in your session, restart it: systemctl --user restart rlm-guard"
+        echo "rlm: upgraded. If the guard runs in your session, reload and restart it: systemctl --user daemon-reload && systemctl --user restart rlm-guard"
     fi
 else
     echo "rlm: systemd not detected. Manual cgroup setup may be required."

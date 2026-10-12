@@ -3,7 +3,7 @@ post_install() {
   echo "rlm: to turn on the guard for your user: rlm guard enable"
 }
 post_upgrade() {
-  echo "rlm: restart the guard to use the new version: systemctl --user restart rlm-guard"
+  echo "rlm: reload and restart the guard to use the new version: systemctl --user daemon-reload && systemctl --user restart rlm-guard"
 }
 pre_remove() {
   # Stop the guard in every running user session before its binary goes away,
