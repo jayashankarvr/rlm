@@ -17,8 +17,10 @@
 # almost all the time, and that throttling counts as a memory stall in
 # app.slice, the pressure the guard reads. It starts only once available
 # memory is below the trigger, so the guard acts within seconds, and runs
-# for at most 15 s: systemd-oomd kills the heaviest cgroup after 20 s of
-# heavy pressure. --stall-mb 0 turns it off.
+# for at most 15 s, less if the session's pressure nears systemd-oomd's
+# limit (oomd kills the cgroup reclaiming the most memory after 20 s above
+# 50%). It stays under the guard's min_rss_mb, so the guard never picks it.
+# --stall-mb 0 turns it off.
 #
 # The scene ends as soon as the guard pauses or caps the hog: the script
 # stops the stall helper, leaves the notification up for a few seconds,
@@ -31,7 +33,7 @@
 # - It refuses to run unless rlm-guard is active.
 # - It never pushes available memory below the guard's floor
 #   (mem_available_floor_mb) plus 1 GB, counting the most the stall helper
-#   can ever hold (twice --stall-mb; throttling keeps it far below that).
+#   can ever hold (counted as twice --stall-mb, more than it can reach).
 # - The hog is a python3 process holding plain memory, so its memory is
 #   freed the moment it exits; nothing is left in tmpfs.
 # - `timeout -s KILL` ends it after --max-seconds, even if this script is
@@ -49,8 +51,11 @@ STEP_MB=200
 HOLD_SECS=60
 MARGIN_MB=256
 MAX_SECONDS=240
-# MemoryHigh of the stall helper's scope; 0 turns the helper off.
-STALL_MB=300
+# MemoryHigh of the stall helper's scope; 0 turns the helper off. Kept
+# small (at most 128) so the helper stays under the guard's min_rss_mb
+# (200 MB by default) and is never the app the guard picks; throttling
+# depends on how far over the limit it is, not on its size.
+STALL_MB=128
 ASSUME_YES=0
 # Never go below the guard's floor plus this much.
 FLOOR_MARGIN_MB=1024
@@ -87,7 +92,7 @@ done
 
 [[ "$STALL_MB" =~ ^[0-9]{1,9}$ ]] || { echo "--stall-mb takes a whole number" >&2; exit 2; }
 STALL_MB=$((10#$STALL_MB))
-(( STALL_MB <= 2048 )) || { echo "--stall-mb must be at most 2048" >&2; exit 2; }
+(( STALL_MB <= 128 )) || { echo "--stall-mb must be at most 128" >&2; exit 2; }
 
 (( HOLD_SECS + 5 < MAX_SECONDS )) \
     || { echo "--hold must be more than 5 seconds shorter than --max-seconds, or the hog has no time to grow" >&2; exit 2; }
@@ -119,7 +124,8 @@ total_mb="$(meminfo_mb MemTotal)"
 avail_mb="$(meminfo_mb MemAvailable)"
 trigger_mb=$(( total_mb * pct / 100 ))
 target_mb=$(( trigger_mb - MARGIN_MB ))
-# The stall helper can hold up to twice STALL_MB on top of the hog.
+# The stall helper holds at most STALL_MB plus 32 MB; count twice STALL_MB
+# to be safe.
 min_mb=$(( floor_mb + FLOOR_MARGIN_MB + 2 * STALL_MB ))
 if (( target_mb < min_mb )); then
     say "the trigger (${trigger_mb} MB) is too close to the floor; stopping at ${min_mb} MB instead,"
@@ -150,10 +156,20 @@ STALL_PID=""
 # gone before the thaw; with a shorter freeze_hold_secs the guard may move
 # on to your next app.
 SHOW_SECS=2
-# Longest the stall helper runs. systemd-oomd (on by default in Ubuntu)
-# kills the heaviest cgroup once the session's memory pressure has been
-# above 50% for 20 s, so the helper stops well before that.
+# Longest the stall helper runs. systemd-oomd (on by default in Ubuntu and
+# Fedora) kills the cgroup reclaiming the most memory once the session's
+# memory pressure ("full" avg10 of user@UID.service) has stayed above 50%
+# for 20 s, so the helper stops well before that, or as soon as that
+# pressure passes OOMD_SAFE_PCT.
 STALL_MAX_SECS=15
+OOMD_SAFE_PCT=40
+SESSION_PRESSURE="/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service/memory.pressure"
+
+# The session's "full" avg10, as a whole number; 0 when unreadable.
+session_full_pct() {
+    awk '$1 == "full" { split($2, a, "="); printf "%d", a[2]; found = 1 } END { if (!found) print 0 }' \
+        "$SESSION_PRESSURE" 2>/dev/null || echo 0
+}
 
 cleanup() {
     trap - EXIT INT TERM
@@ -213,18 +229,18 @@ print("[hog] done, exiting", flush=True)
 
 # The stall helper: allocates 16 MB at a time past its MemoryHigh, where
 # the kernel throttles it almost continuously. It never holds more than
-# twice the limit (oldest block dropped for each new one), and the short
-# sleep keeps it from spinning when the limit is not applied (no memory
-# delegation).
+# the limit plus two blocks (oldest block dropped for each new one), so it
+# stays under the guard's min_rss_mb, and the short sleep keeps it from
+# spinning when the limit is not applied (no memory delegation).
 STALL='
 import sys, time
 cap_mb, max_secs = (int(a) for a in sys.argv[1:3])
 start = time.monotonic()
 chunk_mb = 16
 held = []
-print(f"[stall] throttled at {cap_mb} MB, holding at most {2 * cap_mb} MB", flush=True)
+print(f"[stall] throttled at {cap_mb} MB, holding at most {cap_mb + 2 * chunk_mb} MB", flush=True)
 while time.monotonic() - start < max_secs - 2:
-    if len(held) * chunk_mb >= 2 * cap_mb:
+    if len(held) * chunk_mb >= cap_mb + 2 * chunk_mb:
         held.pop(0)
     held.append(bytearray(b"\x5a") * (chunk_mb * 1024 * 1024))
     time.sleep(0.05)
@@ -271,14 +287,19 @@ guard_acted_on_hog() {
         fi
         if [[ "$stall" == off ]] && (( STALL_MB > 0 )) \
             && (( $(meminfo_mb MemAvailable) <= trigger_mb )); then
-            start_stall
-            stall=on
             started=$SECONDS
+            stall=on
+            start_stall
         elif [[ "$stall" == on ]] && (( SECONDS - started >= STALL_MAX_SECS )); then
             stop_stall
             stall=done
             say "the guard did not step in within ${STALL_MAX_SECS} s; stopped the stall helper"
             say "before systemd-oomd would (it acts after 20 s of heavy pressure)"
+        elif [[ "$stall" == on ]] && (( $(session_full_pct) >= OOMD_SAFE_PCT )); then
+            stop_stall
+            stall=done
+            say "session memory pressure reached ${OOMD_SAFE_PCT}%; stopped the stall helper"
+            say "so systemd-oomd does not step in"
         fi
         sleep 0.5
     done
