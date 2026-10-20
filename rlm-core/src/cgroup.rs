@@ -894,6 +894,34 @@ mod tests {
     }
 
     #[test]
+    fn reset_limits_touches_only_the_given_kinds() {
+        let dir = tempfile::tempdir().unwrap();
+        let cg = dir.path().join("app-x");
+        std::fs::create_dir(&cg).unwrap();
+        for (file, value) in [
+            ("memory.high", "900"),
+            ("memory.max", "1000"),
+            ("memory.swap.max", "0"),
+            ("cpu.max", "50000 100000"),
+        ] {
+            std::fs::write(cg.join(file), value).unwrap();
+        }
+        let m = CgroupManager::at(dir.path().to_path_buf());
+        let warnings = m.reset_limits(
+            "app-x",
+            LimitKinds {
+                cpu: true,
+                ..LimitKinds::default()
+            },
+        );
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let read = |f: &str| std::fs::read_to_string(cg.join(f)).unwrap();
+        assert_eq!(read("cpu.max"), "max");
+        assert_eq!(read("memory.max"), "1000");
+        assert_eq!(read("memory.swap.max"), "0");
+    }
+
+    #[test]
     fn released_processes_can_be_limited_again() {
         let dir = tempfile::tempdir().unwrap();
         for (name, procs) in [("unlimit", "4242\n"), ("pid-7", "7\n")] {
