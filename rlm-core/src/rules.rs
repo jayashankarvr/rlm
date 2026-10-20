@@ -143,6 +143,9 @@ pub fn needs_ensure(recorded_inode: Option<u64>, current_inode: Option<u64>) -> 
 /// Enforces persistent application rules against real cgroups.
 pub struct RulesEnforcer {
     rules: Vec<CompiledRule>,
+    /// The config rules these were compiled from, to tell on a reload which
+    /// rules changed.
+    sources: HashMap<String, AppRule>,
     /// Rule cgroup name to the directory inode at the last limit write.
     ensured: HashMap<String, u64>,
 }
@@ -158,8 +161,26 @@ impl RulesEnforcer {
             .collect();
         Self {
             rules,
+            sources: cfg.rules.clone(),
             ensured: HashMap::new(),
         }
+    }
+
+    /// Replace the rules with `cfg`'s after the config file changed. A rule
+    /// whose config entry is unchanged keeps its record of the last limit
+    /// write, so its limits are not written again (see [`needs_ensure`]): a
+    /// config save that touched other settings must not rewrite every rule
+    /// cgroup's limits, or revert a limit set by hand on one. Added and
+    /// edited rules are written on the next pass; removed rules are dropped.
+    pub fn reload(&mut self, cfg: &Config) {
+        let mut next = Self::new(cfg);
+        for rule in &next.rules {
+            let unchanged = self.sources.get(&rule.name) == cfg.rules.get(&rule.name);
+            if let (true, Some(&ino)) = (unchanged, self.ensured.get(&rule.cgroup)) {
+                next.ensured.insert(rule.cgroup.clone(), ino);
+            }
+        }
+        *self = next;
     }
 
     pub fn rule_count(&self) -> usize {
@@ -443,5 +464,33 @@ mod tests {
             rule: "firefox".into(),
             pid: 11
         }));
+    }
+
+    #[test]
+    fn reload_keeps_unchanged_rules_written_and_rewrites_edited_ones() {
+        let rule = |memory: &str| AppRule {
+            match_exe: vec!["app".into()],
+            memory: Some(memory.into()),
+            ..AppRule::default()
+        };
+        let mut cfg = Config::default();
+        cfg.rules.insert("kept".into(), rule("1G"));
+        cfg.rules.insert("edited".into(), rule("1G"));
+        cfg.rules.insert("removed".into(), rule("1G"));
+        let mut e = RulesEnforcer::new(&cfg);
+        for name in ["kept", "edited", "removed"] {
+            e.ensured.insert(cgroup_name_for(name), 7);
+        }
+
+        cfg.rules.insert("edited".into(), rule("2G"));
+        cfg.rules.remove("removed");
+        cfg.rules.insert("added".into(), rule("1G"));
+        e.reload(&cfg);
+
+        assert_eq!(e.rule_count(), 3);
+        assert_eq!(e.ensured.get("app-kept"), Some(&7));
+        assert_eq!(e.ensured.get("app-edited"), None);
+        assert_eq!(e.ensured.get("app-removed"), None);
+        assert_eq!(e.ensured.get("app-added"), None);
     }
 }

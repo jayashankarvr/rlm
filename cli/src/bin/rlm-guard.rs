@@ -367,10 +367,9 @@ fn run(config: Config) -> common::Result<()> {
             let loaded = Config::load_validated();
             reload_notify_flags(&mut notifier, &loaded);
             if let Ok(config) = &loaded {
-                // A fresh enforcer also forgets which rule cgroups it already
-                // wrote, so an edited limit is written on the next pass, which
-                // runs on the next tick.
-                enforcer = RulesEnforcer::new(config);
+                // Added and edited rules are written on the next pass, which
+                // runs on the next tick; unchanged ones are left alone.
+                enforcer.reload(config);
                 last_rules_ms = None;
                 tracing::info!(
                     rules = enforcer.rule_count(),
