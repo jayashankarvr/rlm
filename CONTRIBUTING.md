@@ -68,7 +68,7 @@ Tests that touch real cgroups are `#[ignore]` and opt-in. They create `test-*` a
 
 Memory being short is not enough for the guard: it also waits for apps to stall on memory, and a machine with spare cache, zram or fast swap rarely stalls at the trigger. So next to the hog the script runs a small stall helper in its own scope (`rlm-demo-stall-<pid>.scope`) with `MemoryHigh` set to `--stall-mb` (300 MB by default) and swap off. It keeps allocating past that limit, the kernel throttles it almost all the time, and that throttling counts as a memory stall in `app.slice`, the pressure the guard reads. The floor plus 1 GB still holds with the helper's memory counted. `--stall-mb 0` turns the helper off.
 
-The scene ends as soon as the guard pauses or caps the hog: the script stops the stall helper, leaves the notification up for 3 seconds, then ends its own hog so the memory is free before the guard's 5-second thaw. Without that, memory would still be short at the thaw and the guard would move on to your next-largest app, because each python3 scope is an app of its own to the guard. The guard itself never kills anything; the terminal says when the script ends its hog.
+The scene ends as soon as the guard pauses or caps the hog: the script stops the stall helper, leaves the notification up for 2 seconds, then ends its own hog so the memory is free before the guard's 5-second thaw (the default `freeze_hold_secs`; with a shorter one the guard may move on to your next app). Without that, memory would still be short at the thaw and the guard would move on to your next-largest app, because each python3 scope is an app of its own to the guard. The guard itself never kills anything; the terminal says when the script ends its hog.
 
 ## Reporting Issues
 

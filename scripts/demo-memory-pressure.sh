@@ -142,9 +142,11 @@ UNIT="rlm-demo-hog-$$"
 STALL_UNIT="rlm-demo-stall-$$"
 HOG_PID=""
 STALL_PID=""
-# How long the "paused" notification stays up before the hog ends. Below
-# the guard's default 5 s freeze, so the hog is gone before the thaw.
-SHOW_SECS=3
+# How long the "paused" notification stays up before the hog ends. Well
+# below the guard's default 5 s freeze (freeze_hold_secs), so the hog is
+# gone before the thaw; with a shorter freeze_hold_secs the guard may move
+# on to your next app.
+SHOW_SECS=2
 
 cleanup() {
     trap - EXIT INT TERM
@@ -237,8 +239,10 @@ if (( STALL_MB > 0 )); then
         || say "the stall helper did not start; the guard may not step in"
 fi
 
+HOG_CG=""
+
 # True once the guard has paused (cgroup.freeze 1) or capped (memory.high
-# set) the hog's scope; false when the hog ends first.
+# set) the hog's scope; false when the hog ends first. Sets HOG_CG.
 guard_acted_on_hog() {
     local cg="" freeze high
     while kill -0 "$HOG_PID" 2>/dev/null; do
@@ -246,7 +250,10 @@ guard_acted_on_hog() {
         if [[ -n "$cg" ]]; then
             freeze="$(cat "/sys/fs/cgroup$cg/cgroup.freeze" 2>/dev/null || echo 0)"
             high="$(cat "/sys/fs/cgroup$cg/memory.high" 2>/dev/null || echo max)"
-            [[ "$freeze" == 1 || "$high" != max ]] && return 0
+            if [[ "$freeze" == 1 || "$high" != max ]]; then
+                HOG_CG="$cg"
+                return 0
+            fi
         fi
         sleep 0.5
     done
@@ -264,8 +271,10 @@ if guard_acted_on_hog; then
     systemctl --user stop "$STALL_UNIT.scope" 2>/dev/null || true
     sleep "$SHOW_SECS"
     say "ending the demo hog so its memory is free before the guard's thaw"
-    # SIGKILL ends a process even while it is frozen (cgroup v2).
-    systemctl --user kill -s KILL "$UNIT.scope" 2>/dev/null || true
+    # Both end processes even while they are frozen (cgroup v2); cgroup.kill
+    # (kernel 5.14+) skips the round trip through systemd.
+    echo 1 2>/dev/null > "/sys/fs/cgroup$HOG_CG/cgroup.kill" \
+        || systemctl --user kill -s KILL "$UNIT.scope" 2>/dev/null || true
 fi
 wait "$HOG_PID" || true
 HOG_PID=""
