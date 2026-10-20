@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.2.9] - 2026-10-20
 
 ### Added
 
@@ -19,6 +19,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The README and the website show the guard at work: a demo clip of a test app filling memory, rlm-guard pausing it, and the desktop app listing it as frozen.
+- `rlmctl-core` library: `guard::Action` has a new `Release` variant for an intervention whose app ended, and `CgroupManager::reset_limits` with `LimitKinds` sets chosen limits back to unlimited; `RulesEnforcer` gains `reload`.
 - `scripts/demo-memory-pressure.sh` runs a small stall helper next to the hog: a process in its own scope with `MemoryHigh` set to `--stall-mb` (128 MB by default, at most 128, so the guard never picks it) and swap off, which the kernel throttles. Without it, a machine with spare cache, zram or fast swap rarely stalls at the trigger, so the guard did not step in. It starts only once available memory is below the trigger and runs for at most 15 seconds, less if the session's pressure passes 40%, so systemd-oomd (which acts after 20 seconds above 50%) does not step in first. `--stall-mb 0` turns it off; the floor plus 1 GB still holds with its memory counted. Once the guard pauses or caps the hog, the script stops the helper, leaves the notification up for 3 seconds and ends its own hog before the guard's thaw, so the guard does not move on to another app.
 
 ## [0.2.8] - 2026-10-01
