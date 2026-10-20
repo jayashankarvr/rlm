@@ -460,7 +460,7 @@ rlm import profiles.yaml         <span class="c"># import profiles</span></code>
       <h2>The guard</h2>
       <p>When memory runs short, Linux usually freezes the whole desktop for minutes and then kills something. rlm-guard steps in earlier and more gently.</p>
       <div class="shots">
-        <figure><video src="img/demo.mp4" poster="img/demo-poster.jpg" width="1600" height="794" autoplay muted loop playsinline preload="metadata" aria-label="A test app fills 9 GB of memory in a terminal; rlm-guard pauses it, a Python3.10 paused notification appears and the desktop app lists it as frozen"></video><figcaption>The guard at work: a test app fills memory, rlm-guard pauses it, and the Guard page lists it as frozen (sped up while memory fills).</figcaption></figure>
+        <figure><video src="img/demo.mp4" poster="img/demo-poster.jpg" width="1600" height="794" autoplay muted loop playsinline controls preload="metadata" aria-label="A test app fills 9 GB of memory in a terminal; rlm-guard pauses it, a Python3.10 paused notification appears and the desktop app lists it as frozen"></video><figcaption>The guard at work: a test app fills memory, rlm-guard pauses it, and the Guard page lists it as frozen (sped up while memory fills).</figcaption></figure>
       </div>
       <ul class="plain">
         <li>It acts when apps stall on memory and available memory is below 20% of RAM, or at once when available memory drops below 400 MB.</li>
@@ -570,6 +570,11 @@ sudo systemctl daemon-reload</code></pre></div>
 </div>
 
 <script>
+  // The demo video plays on its own unless the reader asked for less motion.
+  if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+    document.querySelectorAll('video[autoplay]').forEach(v => { v.autoplay = false; v.pause(); });
+  }
+
   // Contents: open by default on wide screens, a menu on narrow ones.
   const toc = document.getElementById('toc');
   const wide = window.matchMedia('(min-width: 56.01rem)');
