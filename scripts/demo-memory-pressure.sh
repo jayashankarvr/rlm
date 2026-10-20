@@ -151,12 +151,13 @@ UNIT="rlm-demo-hog-$$"
 STALL_UNIT="rlm-demo-stall-$$"
 HOG_PID=""
 STALL_PID=""
-# How long the "paused" notification stays up before the hog ends. Long
-# enough for rlm-gtk's 2 s refresh to list the frozen hog, and with the
-# 0.5 s watch still below the guard's default 5 s freeze (freeze_hold_secs),
-# so the hog is gone before the thaw; with a shorter freeze_hold_secs the
-# guard may move on to your next app.
-SHOW_SECS=4
+# How long the "paused" notification stays up before the hog ends, counted
+# from when the watcher sees the guard act. Longer than rlm-gtk's 2 s
+# refresh, so the Guard page lists the frozen hog, and with the watcher's
+# 0.5 s lag and the hog's teardown still well before the guard's default
+# 5 s freeze (freeze_hold_secs), so the hog is gone before the thaw; with a
+# shorter freeze_hold_secs the guard may move on to your next app.
+SHOW_SECS=3
 # Longest the stall helper runs. systemd-oomd (on by default in Ubuntu and
 # Fedora) kills the cgroup reclaiming the most memory once the session's
 # memory pressure ("full" avg10 of user@UID.service) has stayed above 50%
@@ -268,6 +269,7 @@ stop_stall() {
 }
 
 HOG_CG=""
+ACTED_MS=0
 
 # Watch the hog until the guard pauses (cgroup.freeze 1) or caps
 # (memory.high set) its scope; true then, false when the hog ends first.
@@ -283,6 +285,7 @@ guard_acted_on_hog() {
             high="$(cat "/sys/fs/cgroup$cg/memory.high" 2>/dev/null || echo max)"
             if [[ "$freeze" == 1 || "$high" != max ]]; then
                 HOG_CG="$cg"
+                ACTED_MS=$(( $(date +%s%N) / 1000000 ))
                 return 0
             fi
         fi
@@ -316,13 +319,17 @@ HOG_PID=$!
 if guard_acted_on_hog; then
     say "rlm-guard stepped in on the hog; the notification shows what it did"
     stop_stall
-    sleep "$SHOW_SECS"
+    # Sleep only what is left, so a slow systemctl stop under pressure does
+    # not push the kill past the thaw.
+    left_ms=$(( SHOW_SECS * 1000 - ($(date +%s%N) / 1000000 - ACTED_MS) ))
+    (( left_ms <= 0 )) || sleep "$(( left_ms / 1000 )).$(printf '%03d' $(( left_ms % 1000 )))"
     say "ending the demo hog so its memory is free before the guard's thaw"
     # Both end processes even while they are frozen (cgroup v2); cgroup.kill
     # (kernel 5.14+) skips the round trip through systemd.
     echo 1 2>/dev/null > "/sys/fs/cgroup$HOG_CG/cgroup.kill" \
         || systemctl --user kill -s KILL "$UNIT.scope" 2>/dev/null || true
 fi
-# The redirect hides bash's "Killed" job notice for the hog we just ended.
+# The redirect hides bash's "Killed" job notice for the hog we just ended
+# (best effort: bash may report it earlier if it reaps the hog first).
 { wait "$HOG_PID"; } 2>/dev/null || true
 HOG_PID=""

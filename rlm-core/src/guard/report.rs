@@ -43,7 +43,7 @@ pub fn intervention_line(e: &JournalEntry) -> String {
     let name = e
         .unit
         .as_deref()
-        .unwrap_or_else(|| e.cgroup.rsplit('/').next().unwrap_or(&e.cgroup));
+        .unwrap_or_else(|| e.cgroup.rsplit('/').next().unwrap_or_default());
     match e.action {
         JournalAction::Freeze => format!("{name} frozen"),
         JournalAction::Cap => {
