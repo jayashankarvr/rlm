@@ -103,7 +103,7 @@ ul.plain li { margin-bottom: 0.45rem; }
 /* Screenshots of the desktop app. */
 .shots { display: grid; gap: 1.25rem; margin: 1.5rem 0; }
 .shots figure { margin: 0; }
-.shots img { display: block; width: 100%; height: auto; border-radius: 12px; box-shadow: 0 12px 32px rgba(0,0,0,.25); }
+.shots img, .shots video { display: block; width: 100%; height: auto; border-radius: 12px; box-shadow: 0 12px 32px rgba(0,0,0,.25); }
 .shots figcaption { color: var(--muted); font-size: 0.9rem; margin-top: 0.5rem; }
 
 /* The memory bar: the page's one moving part. */
@@ -460,7 +460,7 @@ rlm import profiles.yaml         <span class="c"># import profiles</span></code>
       <h2>The guard</h2>
       <p>When memory runs short, Linux usually freezes the whole desktop for minutes and then kills something. rlm-guard steps in earlier and more gently.</p>
       <div class="shots">
-        <figure><img src="img/guard.png" width="900" height="600" loading="lazy" alt="Guard page with switches for the guard and its notifications, and the guard's status"><figcaption>The Guard page in the desktop app.</figcaption></figure>
+        <figure><video src="img/demo.mp4" poster="img/demo-poster.jpg" width="1600" height="794" autoplay muted loop playsinline preload="metadata" aria-label="A test app fills 9 GB of memory in a terminal; rlm-guard pauses it, a Python3.10 paused notification appears and the desktop app lists it as frozen"></video><figcaption>The guard at work: a test app fills memory, rlm-guard pauses it, and the Guard page lists it as frozen (sped up while memory fills).</figcaption></figure>
       </div>
       <ul class="plain">
         <li>It acts when apps stall on memory and available memory is below 20% of RAM, or at once when available memory drops below 400 MB.</li>
