@@ -38,7 +38,8 @@ const RULES_INTERVAL_MS: u64 = 5_000;
 /// Longest wait at shutdown for the last notifications to go out.
 const NOTIFY_FLUSH: Duration = Duration::from_secs(1);
 
-/// The config files whose change reloads the notification settings.
+/// The config files whose change reloads the notification settings and the
+/// persistent rules.
 fn config_files() -> Vec<PathBuf> {
     let mut files = vec![PathBuf::from("/etc/rlm/config.yaml")];
     files.extend(Config::user_config_path());
@@ -277,8 +278,9 @@ fn run(config: Config) -> common::Result<()> {
     }
 
     // Desktop notifications about what the guard did. Only `guard.notify`
-    // and `guard.notify_pressure` are re-read when the config file changes;
-    // every other setting needs a restart, which would release held apps.
+    // and `guard.notify_pressure`, and the persistent rules, are re-read when
+    // the config file changes; every other setting needs a restart, which
+    // would release held apps.
     let mut notifier = Notifier::new(DesktopSink::spawn(), &gcfg);
     let mut names = AppNames::in_background();
     let cfg_files = config_files();
@@ -362,7 +364,19 @@ fn run(config: Config) -> common::Result<()> {
         let stamp = config_stamp(&cfg_files);
         if stamp != cfg_stamp {
             cfg_stamp = stamp;
-            reload_notify_flags(&mut notifier);
+            let loaded = Config::load_validated();
+            reload_notify_flags(&mut notifier, &loaded);
+            if let Ok(config) = &loaded {
+                // A fresh enforcer also forgets which rule cgroups it already
+                // wrote, so an edited limit is written on the next pass, which
+                // runs on the next tick.
+                enforcer = RulesEnforcer::new(config);
+                last_rules_ms = None;
+                tracing::info!(
+                    rules = enforcer.rule_count(),
+                    "config changed; reloaded rules"
+                );
+            }
         }
 
         // Persistent application rules, every RULES_INTERVAL_MS: absorbs
@@ -388,15 +402,16 @@ fn run(config: Config) -> common::Result<()> {
     Ok(())
 }
 
-/// The config file changed on disk: apply its notification settings, and
-/// nothing else. An invalid file keeps the current ones.
-fn reload_notify_flags(notifier: &mut Notifier<DesktopSink>) {
+/// The config file changed on disk: apply its notification settings. An
+/// invalid file keeps the current ones.
+fn reload_notify_flags(notifier: &mut Notifier<DesktopSink>, loaded: &common::Result<Config>) {
     let current = notifier.flags();
-    let loaded = Config::load_validated();
     let flags = flags_after_reload(current, loaded.as_ref().map(|c| &c.guard));
-    match &loaded {
+    match loaded {
         Err(e) => {
-            tracing::warn!("config changed but is invalid ({e}); keeping notification settings")
+            tracing::warn!(
+                "config changed but is invalid ({e}); keeping notification settings and rules"
+            )
         }
         Ok(_) if flags != current => {
             tracing::info!(

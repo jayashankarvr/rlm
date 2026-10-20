@@ -216,15 +216,15 @@ pub fn rule_kept_text(app: &str, rules: &[String], guard_running: bool) -> Strin
     }
 }
 
-/// The toast after forgetting `rules`. A running guard loaded its rules at
-/// start and keeps applying them until it restarts.
+/// The toast after forgetting `rules`. A running guard reloads its rules when
+/// the config changes, so it stops applying them within a few seconds.
 pub fn forgot_text(rules: &[String], guard_running: bool) -> String {
     let mut text = format!("Forgot {}.", rules_phrase(rules));
     if guard_running {
         text.push_str(if rules.len() == 1 {
-            " Restart rlm-guard to stop it applying the rule."
+            " rlm-guard stops applying it within a few seconds."
         } else {
-            " Restart rlm-guard to stop it applying the rules."
+            " rlm-guard stops applying them within a few seconds."
         });
     }
     text
@@ -735,7 +735,7 @@ mod tests {
         );
         assert_eq!(
             forgot_text(&one, true),
-            "Forgot rule 'firefox'. Restart rlm-guard to stop it applying the rule."
+            "Forgot rule 'firefox'. rlm-guard stops applying it within a few seconds."
         );
         assert_eq!(forgot_text(&one, false), "Forgot rule 'firefox'.");
         assert_eq!(

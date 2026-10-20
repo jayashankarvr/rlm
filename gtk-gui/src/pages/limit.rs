@@ -1109,14 +1109,14 @@ fn apply_limits(state: &Rc<RefCell<LimitState>>) {
                                 io_write.clone(),
                             ) {
                                 Ok(()) => {
-                                    // rlm-guard reads rules at startup, so say how to
-                                    // load the new one, as `rlm limit --save` does.
+                                    // A running rlm-guard reloads rules when the
+                                    // config changes, as `rlm limit --save` says.
                                     let active =
                                         rlm_core::guard::service::query().active == "active";
                                     msg.push_str(&format!(
                                         "; saved rule '{exe}' ({})",
                                         if active {
-                                            "restart the guard to load it"
+                                            "rlm-guard picks it up within a few seconds"
                                         } else {
                                             "turn the guard on to enforce it"
                                         }

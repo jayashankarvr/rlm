@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- rlm-guard reloads persistent rules when the config file changes, so a rule saved with `rlm limit --save` or the desktop app's "Save as a rule for rlm-guard", edited, or removed takes effect within a few seconds without restarting the guard (a restart would release the apps it holds). An invalid config keeps the current rules.
+
 ### Fixed
 
 - The deb, rpm and AUR upgrade notices say to run `systemctl --user daemon-reload` before restarting the guard, like the README, since the upgrade may have replaced its service file.
