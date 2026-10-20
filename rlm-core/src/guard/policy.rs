@@ -169,9 +169,9 @@ impl PolicyEngine {
         self.update_growth(now_ms, targets);
 
         // 4. Prune interventions whose cgroup is no longer live (see
-        //    `live_cgroups` doc above). LiftCap doubles as "tear down the
-        //    cap", so it's the right cleanup for both frozen and capped dead
-        //    cgroups; the effector's LiftCap tolerates a missing cgroup.
+        //    `live_cgroups` doc above). Release does LiftCap's cleanup, which
+        //    suits both frozen and capped dead cgroups and tolerates a
+        //    missing cgroup, but is recorded as the app ending.
         let dead: Vec<String> = self
             .interventions
             .keys()
@@ -180,7 +180,7 @@ impl PolicyEngine {
             .collect();
         for cg in dead {
             let (_, res, _) = self.interventions.remove(&cg).expect("just found key");
-            actions.push(Action::LiftCap { res });
+            actions.push(Action::Release { res });
         }
 
         // 5. Recover: auto-thaw held freezes, and lift caps once calm has held.
@@ -622,6 +622,12 @@ mod tests {
             .any(|a| matches!(a, Action::LiftCap { res } if res.cgroup == cg))
     }
 
+    fn has_release_target(actions: &[Action], cg: &str) -> bool {
+        actions
+            .iter()
+            .any(|a| matches!(a, Action::Release { res } if res.cgroup == cg))
+    }
+
     /// Give every target a measured (zero) growth rate, as if the engine had
     /// already scanned them on an earlier tick. Tests of the ladder use this
     /// so the cold-start deferral does not shift their first action.
@@ -902,7 +908,7 @@ mod tests {
     }
 
     #[test]
-    fn dead_pid_is_pruned_with_liftcap() {
+    fn dead_pid_is_pruned_with_release() {
         let mut e = PolicyEngine::new(cfg());
         let procs = vec![proc(2, "hog", 4000)];
         prime(&mut e, &procs);
@@ -915,12 +921,12 @@ mod tests {
         );
         assert_eq!(e.interventions().len(), 1);
 
-        // Next tick the process (and its resolution) has vanished, so LiftCap
+        // Next tick the process (and its resolution) has vanished, so Release
         // cleanup, intervention dropped.
         let a = e.tick(1_000, calm(), &[], &live_from(&[]));
         assert!(
-            has_liftcap_target(&a, cg),
-            "expected LiftCap for dead cgroup: {a:?}"
+            has_release_target(&a, cg),
+            "expected Release for dead cgroup: {a:?}"
         );
         assert!(e.interventions().is_empty());
     }
@@ -929,7 +935,7 @@ mod tests {
     /// enough file pages to drop the process below `min_rss_mb`) but still
     /// present in `live_cgroups` must NOT be pruned: the cgroup is real and
     /// alive, just not currently eligible for (re-)selection. A cgroup
-    /// absent from *both* sets must still be pruned with a LiftCap.
+    /// absent from *both* sets must still be pruned with a Release.
     #[test]
     fn intervention_survives_in_live_cgroups_but_absent_from_procs() {
         let mut e = PolicyEngine::new(cfg());
@@ -950,7 +956,7 @@ mod tests {
         let live: std::collections::HashSet<String> = [cg.to_string()].into();
         let a1 = e.tick(1_000, calm(), &[], &live);
         assert!(
-            !has_liftcap_target(&a1, cg),
+            !has_release_target(&a1, cg),
             "must not prune a cgroup still present in live_cgroups: {a1:?}"
         );
         assert_eq!(
@@ -962,8 +968,8 @@ mod tests {
         // Now the cgroup is gone from both sets entirely, so it is pruned.
         let a2 = e.tick(2_000, calm(), &[], &std::collections::HashSet::new());
         assert!(
-            has_liftcap_target(&a2, cg),
-            "expected LiftCap once absent from live_cgroups too: {a2:?}"
+            has_release_target(&a2, cg),
+            "expected Release once absent from live_cgroups too: {a2:?}"
         );
         assert!(e.interventions().is_empty());
     }

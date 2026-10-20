@@ -346,9 +346,9 @@ impl<S: NotifySink> Notifier<S> {
                     self.stuck.remove(&res.cgroup);
                 }
             }
-            // A cap lift closes the notification even if it reported an
-            // error: the guard no longer holds the cgroup either way.
-            Action::LiftCap { res } => {
+            // A cap lift or release closes the notification even if it
+            // reported an error: the guard no longer holds the cgroup either way.
+            Action::LiftCap { res } | Action::Release { res } => {
                 self.held.remove(&res.cgroup);
                 if applied.is_some() {
                     self.stuck.remove(&res.cgroup);

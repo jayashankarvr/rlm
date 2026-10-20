@@ -127,6 +127,13 @@ pub fn event_for(
             "removed the soft limit".to_string(),
             "lift cap",
         ),
+        Action::Release { res } => (
+            HistoryKind::Lift,
+            unit_or_leaf(res),
+            res.cgroup.clone(),
+            "the app ended; released it".to_string(),
+            "release",
+        ),
     };
     match result {
         Ok(()) => Some(HistoryEvent {
@@ -256,6 +263,15 @@ mod tests {
         assert_eq!(
             (t.kind, t.app.as_str()),
             (HistoryKind::Thaw, "app-firefox-1.scope")
+        );
+        let r = event_for(&Action::Release { res: res() }, &Ok(()), 11).unwrap();
+        assert_eq!(
+            (r.kind, r.app.as_str(), r.detail.as_str()),
+            (
+                HistoryKind::Lift,
+                "app-firefox-1.scope",
+                "the app ended; released it"
+            )
         );
         let e = event_for(
             &Action::Cap {

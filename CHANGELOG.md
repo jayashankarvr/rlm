@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - The deb, rpm and AUR upgrade notices say to run `systemctl --user daemon-reload` before restarting the guard, like the README, since the upgrade may have replaced its service file.
 - Active interventions, in `rlm guard status` and the Guard page, name the app's unit (for example `app-firefox-12.scope frozen`) instead of its full cgroupfs path.
+- When an app the guard froze or capped exits, `rlm guard history` and the Guard page say "the app ended; released it" instead of "removed the soft limit", which read as if a frozen app had been capped.
 
 ### Changed
 

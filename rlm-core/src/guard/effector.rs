@@ -121,6 +121,10 @@ impl<'a> Effector<'a> {
                 cap_bytes: Some(bytes),
             }),
             Action::LiftCap { res } => self.lift_cap(res).map(|()| done),
+            Action::Release { res } => {
+                tracing::info!(cgroup = %res.cgroup, "releasing ended app");
+                self.release(res).map(|()| done)
+            }
         }
     }
 
@@ -305,6 +309,12 @@ impl<'a> Effector<'a> {
 
     fn lift_cap(&self, res: &Resolution) -> Result<()> {
         tracing::info!(cgroup = %res.cgroup, "lifting cap");
+        self.release(res)
+    }
+
+    /// Undo whatever the guard holds on `res` (thaw, restore memory.high)
+    /// and drop its journal record. Tolerates a cgroup that is already gone.
+    fn release(&self, res: &Resolution) -> Result<()> {
         let entries = self.entries_for(&res.cgroup);
         // Mechanism-independent thaw always runs, regardless of whether any
         // journal record exists: a dead-cgroup prune (carry-forward

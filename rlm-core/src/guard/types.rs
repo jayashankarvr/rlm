@@ -92,6 +92,9 @@ pub enum Action {
     Cap { res: Resolution, name: String },
     /// Remove a soft cap on the resolved cgroup.
     LiftCap { res: Resolution },
+    /// Drop the guard's hold on a cgroup that no longer exists (its app
+    /// ended): the same cleanup as `LiftCap`, recorded as the app ending.
+    Release { res: Resolution },
 }
 
 /// An active intervention the engine is tracking, for `guard status` and
