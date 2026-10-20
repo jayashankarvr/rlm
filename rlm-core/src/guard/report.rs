@@ -37,17 +37,22 @@ pub fn trigger_line(t: &GuardTrigger) -> String {
 }
 
 /// One line describing a currently active intervention, from the guard's
-/// write-ahead journal.
+/// write-ahead journal. Names the systemd unit, or the cgroup's last path
+/// component when there is none, rather than the whole cgroupfs path.
 pub fn intervention_line(e: &JournalEntry) -> String {
+    let name = e
+        .unit
+        .as_deref()
+        .unwrap_or_else(|| e.cgroup.rsplit('/').next().unwrap_or(&e.cgroup));
     match e.action {
-        JournalAction::Freeze => format!("{} frozen", e.cgroup),
+        JournalAction::Freeze => format!("{name} frozen"),
         JournalAction::Cap => {
             let bytes = e
                 .our_high
                 .as_deref()
                 .and_then(|s| s.parse::<u64>().ok())
                 .unwrap_or(0);
-            format!("{} capped at {}", e.cgroup, common::format_bytes(bytes))
+            format!("{name} capped at {}", common::format_bytes(bytes))
         }
     }
 }
@@ -168,5 +173,24 @@ mod tests {
             config_error_line("/x/config.yaml", &e),
             "invalid (/x/config.yaml): config error: guard: bad value"
         );
+    }
+
+    #[test]
+    fn intervention_line_names_the_unit_not_the_path() {
+        let mut e = JournalEntry {
+            cgroup: "/user.slice/user-1000.slice/user@1000.service/app.slice/app-firefox-12.scope"
+                .into(),
+            inode: 1,
+            unit: Some("app-firefox-12.scope".into()),
+            action: JournalAction::Freeze,
+            prev_high: None,
+            our_high: None,
+        };
+        assert_eq!(intervention_line(&e), "app-firefox-12.scope frozen");
+        e.unit = None;
+        e.cgroup = "/user.slice/user-1000.slice/user@1000.service/app.slice/firefox".into();
+        e.action = JournalAction::Cap;
+        e.our_high = Some("1073741824".into());
+        assert!(intervention_line(&e).starts_with("firefox capped at "));
     }
 }

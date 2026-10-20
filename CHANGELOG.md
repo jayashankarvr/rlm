@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - The deb, rpm and AUR upgrade notices say to run `systemctl --user daemon-reload` before restarting the guard, like the README, since the upgrade may have replaced its service file.
+- Active interventions, in `rlm guard status` and the Guard page, name the app's unit (for example `app-firefox-12.scope frozen`) instead of its full cgroupfs path.
 
 ### Changed
 
