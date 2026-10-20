@@ -151,11 +151,12 @@ UNIT="rlm-demo-hog-$$"
 STALL_UNIT="rlm-demo-stall-$$"
 HOG_PID=""
 STALL_PID=""
-# How long the "paused" notification stays up before the hog ends. Well
-# below the guard's default 5 s freeze (freeze_hold_secs), so the hog is
-# gone before the thaw; with a shorter freeze_hold_secs the guard may move
-# on to your next app.
-SHOW_SECS=2
+# How long the "paused" notification stays up before the hog ends. Long
+# enough for rlm-gtk's 2 s refresh to list the frozen hog, and with the
+# 0.5 s watch still below the guard's default 5 s freeze (freeze_hold_secs),
+# so the hog is gone before the thaw; with a shorter freeze_hold_secs the
+# guard may move on to your next app.
+SHOW_SECS=4
 # Longest the stall helper runs. systemd-oomd (on by default in Ubuntu and
 # Fedora) kills the cgroup reclaiming the most memory once the session's
 # memory pressure ("full" avg10 of user@UID.service) has stayed above 50%
@@ -322,5 +323,6 @@ if guard_acted_on_hog; then
     echo 1 2>/dev/null > "/sys/fs/cgroup$HOG_CG/cgroup.kill" \
         || systemctl --user kill -s KILL "$UNIT.scope" 2>/dev/null || true
 fi
-wait "$HOG_PID" || true
+# The redirect hides bash's "Killed" job notice for the hog we just ended.
+{ wait "$HOG_PID"; } 2>/dev/null || true
 HOG_PID=""
