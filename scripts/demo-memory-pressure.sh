@@ -15,7 +15,10 @@
 # its own scope (rlm-demo-stall-<pid>.scope) with MemoryHigh=--stall-mb and
 # swap off. It keeps allocating past that limit, the kernel throttles it
 # almost all the time, and that throttling counts as a memory stall in
-# app.slice, the pressure the guard reads. --stall-mb 0 turns it off.
+# app.slice, the pressure the guard reads. It starts only once available
+# memory is below the trigger, so the guard acts within seconds, and runs
+# for at most 15 s: systemd-oomd kills the heaviest cgroup after 20 s of
+# heavy pressure. --stall-mb 0 turns it off.
 #
 # The scene ends as soon as the guard pauses or caps the hog: the script
 # stops the stall helper, leaves the notification up for a few seconds,
@@ -147,6 +150,10 @@ STALL_PID=""
 # gone before the thaw; with a shorter freeze_hold_secs the guard may move
 # on to your next app.
 SHOW_SECS=2
+# Longest the stall helper runs. systemd-oomd (on by default in Ubuntu)
+# kills the heaviest cgroup once the session's memory pressure has been
+# above 50% for 20 s, so the helper stops well before that.
+STALL_MAX_SECS=15
 
 cleanup() {
     trap - EXIT INT TERM
@@ -223,8 +230,9 @@ while time.monotonic() - start < max_secs - 2:
     time.sleep(0.05)
 '
 
-if (( STALL_MB > 0 )); then
-    say "starting the stall helper in $STALL_UNIT.scope"
+# Start the stall helper and wait up to 3 s for its scope to come up.
+start_stall() {
+    say "memory is below the trigger; starting the stall helper in $STALL_UNIT.scope"
     systemd-run --user --scope --quiet --slice=app.slice --unit="$STALL_UNIT" \
         --description="rlm memory pressure demo (stall helper)" \
         -p MemoryHigh="${STALL_MB}M" -p MemorySwapMax=0 \
@@ -232,19 +240,25 @@ if (( STALL_MB > 0 )); then
         python3 -c "$STALL" "$STALL_MB" "$MAX_SECONDS" &
     STALL_PID=$!
     for _ in 1 2 3 4 5 6; do
-        systemctl --user is-active --quiet "$STALL_UNIT.scope" && break
+        systemctl --user is-active --quiet "$STALL_UNIT.scope" && return 0
         sleep 0.5
     done
-    systemctl --user is-active --quiet "$STALL_UNIT.scope" \
-        || say "the stall helper did not start; the guard may not step in"
-fi
+    say "the stall helper did not start; the guard may not step in"
+}
+
+stop_stall() {
+    systemctl --user stop "$STALL_UNIT.scope" 2>/dev/null || true
+}
 
 HOG_CG=""
 
-# True once the guard has paused (cgroup.freeze 1) or capped (memory.high
-# set) the hog's scope; false when the hog ends first. Sets HOG_CG.
+# Watch the hog until the guard pauses (cgroup.freeze 1) or caps
+# (memory.high set) its scope; true then, false when the hog ends first.
+# Sets HOG_CG. Starts the stall helper only once available memory is below
+# the trigger, so the stall and the shortage begin together and the guard
+# acts within seconds, and stops it after STALL_MAX_SECS in any case.
 guard_acted_on_hog() {
-    local cg="" freeze high
+    local cg="" freeze high stall=off started=0
     while kill -0 "$HOG_PID" 2>/dev/null; do
         [[ -n "$cg" ]] || cg="$(systemctl --user show -p ControlGroup --value "$UNIT.scope" 2>/dev/null || true)"
         if [[ -n "$cg" ]]; then
@@ -254,6 +268,17 @@ guard_acted_on_hog() {
                 HOG_CG="$cg"
                 return 0
             fi
+        fi
+        if [[ "$stall" == off ]] && (( STALL_MB > 0 )) \
+            && (( $(meminfo_mb MemAvailable) <= trigger_mb )); then
+            start_stall
+            stall=on
+            started=$SECONDS
+        elif [[ "$stall" == on ]] && (( SECONDS - started >= STALL_MAX_SECS )); then
+            stop_stall
+            stall=done
+            say "the guard did not step in within ${STALL_MAX_SECS} s; stopped the stall helper"
+            say "before systemd-oomd would (it acts after 20 s of heavy pressure)"
         fi
         sleep 0.5
     done
@@ -268,7 +293,7 @@ systemd-run --user --scope --quiet --slice=app.slice --unit="$UNIT" \
 HOG_PID=$!
 if guard_acted_on_hog; then
     say "rlm-guard stepped in on the hog; the notification shows what it did"
-    systemctl --user stop "$STALL_UNIT.scope" 2>/dev/null || true
+    stop_stall
     sleep "$SHOW_SECS"
     say "ending the demo hog so its memory is free before the guard's thaw"
     # Both end processes even while they are frozen (cgroup v2); cgroup.kill
