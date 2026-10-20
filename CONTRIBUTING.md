@@ -62,11 +62,13 @@ Tests that touch real cgroups are `#[ignore]` and opt-in. They create `test-*` a
 `scripts/demo-memory-pressure.sh` puts the desktop under memory pressure so rlm-guard can be recorded stepping in. It refuses to run unless rlm-guard is active. It starts a python3 memory hog as you, in its own scope (`rlm-demo-hog-<pid>.scope` under `app.slice`) so the guard sees it as an app of its own. The hog grows by 200 MB a second until available memory is just below the guard's trigger (read from `rlm guard status`, 20% of RAM by default), holds for up to 60 seconds, then exits and frees its memory. It never goes below the guard's floor plus 1 GB, `timeout -s KILL` ends the hog after 240 seconds (later if the guard has it paused at that moment; the kill lands once it is resumed), and Ctrl+C stops it at once. While it holds, the hog keeps writing to its memory so the kernel has to work for room. `--help` lists the options.
 
 1. Save your work and close anything you would mind being paused.
-2. Start the screen recorder. On GNOME, Ctrl+Shift+Alt+R starts and stops a screencast (saved in `~/Videos/Screencasts`).
+2. Start the screen recorder. On GNOME, press Print Screen and pick the video camera (saved in `~/Videos/Screencasts`); Ctrl+Shift+Alt+R also works but may stop after 30 seconds.
 3. Run `scripts/demo-memory-pressure.sh` and confirm. Watch for the "Python3 paused" notification and the Guard page in rlm-gtk.
 4. Stop the recording once the script says the hog stopped.
 
-The guard steps in only when apps actually stall on memory, so on a machine with plenty of cache to drop it may do nothing. Run it again with a larger `--margin-mb` to go further below the trigger; it still never goes below the floor plus 1 GB.
+Memory being short is not enough for the guard: it also waits for apps to stall on memory, and a machine with spare cache, zram or fast swap rarely stalls at the trigger. So next to the hog the script runs a small stall helper in its own scope (`rlm-demo-stall-<pid>.scope`) with `MemoryHigh` set to `--stall-mb` (300 MB by default) and swap off. It keeps allocating past that limit, the kernel throttles it almost all the time, and that throttling counts as a memory stall in `app.slice`, the pressure the guard reads. The floor plus 1 GB still holds with the helper's memory counted. `--stall-mb 0` turns the helper off.
+
+The scene ends as soon as the guard pauses or caps the hog: the script stops the stall helper, leaves the notification up for 3 seconds, then ends its own hog so the memory is free before the guard's 5-second thaw. Without that, memory would still be short at the thaw and the guard would move on to your next-largest app, because each python3 scope is an app of its own to the guard. The guard itself never kills anything; the terminal says when the script ends its hog.
 
 ## Reporting Issues
 

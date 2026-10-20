@@ -9,26 +9,45 @@
 # `rlm guard status`, minus --margin-mb), holds there for up to --hold
 # seconds, then exits and frees everything.
 #
+# Memory being short is not enough: the guard also waits for apps to stall
+# on memory, and a machine with spare cache, zram or a fast swap rarely
+# stalls at the trigger. So a small stall helper runs next to the hog in
+# its own scope (rlm-demo-stall-<pid>.scope) with MemoryHigh=--stall-mb and
+# swap off. It keeps allocating past that limit, the kernel throttles it
+# almost all the time, and that throttling counts as a memory stall in
+# app.slice, the pressure the guard reads. --stall-mb 0 turns it off.
+#
+# The scene ends as soon as the guard pauses or caps the hog: the script
+# stops the stall helper, leaves the notification up for a few seconds,
+# then ends its own hog so the memory is free before the guard's thaw.
+# Otherwise memory would still be short when the hog is thawed, and the
+# guard would move on to your next-largest app (each python3 scope is an
+# app of its own to the guard). The guard itself never kills anything.
+#
 # Safety:
 # - It refuses to run unless rlm-guard is active.
 # - It never pushes available memory below the guard's floor
-#   (mem_available_floor_mb) plus 1 GB.
+#   (mem_available_floor_mb) plus 1 GB, counting the most the stall helper
+#   can ever hold (twice --stall-mb; throttling keeps it far below that).
 # - The hog is a python3 process holding plain memory, so its memory is
 #   freed the moment it exits; nothing is left in tmpfs.
 # - `timeout -s KILL` ends it after --max-seconds, even if this script is
 #   killed or its terminal closed. The timer runs inside the demo's scope, so
 #   if the guard has the hog paused at that moment, the kill lands once it is
 #   resumed (5 s by default).
-# - Ctrl+C, or this script exiting for any reason, stops the scope.
+# - Ctrl+C, or this script exiting for any reason, stops both scopes.
 #
 # Usage: scripts/demo-memory-pressure.sh [--yes] [--step-mb N] [--hold S]
 #                                        [--margin-mb N] [--max-seconds S]
+#                                        [--stall-mb N]
 set -euo pipefail
 
 STEP_MB=200
 HOLD_SECS=60
 MARGIN_MB=256
 MAX_SECONDS=240
+# MemoryHigh of the stall helper's scope; 0 turns the helper off.
+STALL_MB=300
 ASSUME_YES=0
 # Never go below the guard's floor plus this much.
 FLOOR_MARGIN_MB=1024
@@ -41,13 +60,14 @@ usage() {
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --yes | -y) ASSUME_YES=1; shift ;;
-        --step-mb | --hold | --margin-mb | --max-seconds)
+        --step-mb | --hold | --margin-mb | --max-seconds | --stall-mb)
             [[ $# -ge 2 ]] || { echo "$1 needs a value" >&2; usage; }
             case "$1" in
                 --step-mb) STEP_MB="$2" ;;
                 --hold) HOLD_SECS="$2" ;;
                 --margin-mb) MARGIN_MB="$2" ;;
                 --max-seconds) MAX_SECONDS="$2" ;;
+                --stall-mb) STALL_MB="$2" ;;
             esac
             shift 2 ;;
         -h | --help) usage ;;
@@ -61,6 +81,10 @@ for var in STEP_MB HOLD_SECS MARGIN_MB MAX_SECONDS; do
     printf -v "$var" '%d' "$((10#${!var}))"
     (( ${!var} > 0 )) || { echo "options take positive whole numbers" >&2; exit 2; }
 done
+
+[[ "$STALL_MB" =~ ^[0-9]{1,9}$ ]] || { echo "--stall-mb takes a whole number" >&2; exit 2; }
+STALL_MB=$((10#$STALL_MB))
+(( STALL_MB <= 2048 )) || { echo "--stall-mb must be at most 2048" >&2; exit 2; }
 
 (( HOLD_SECS + 5 < MAX_SECONDS )) \
     || { echo "--hold must be more than 5 seconds shorter than --max-seconds, or the hog has no time to grow" >&2; exit 2; }
@@ -92,7 +116,8 @@ total_mb="$(meminfo_mb MemTotal)"
 avail_mb="$(meminfo_mb MemAvailable)"
 trigger_mb=$(( total_mb * pct / 100 ))
 target_mb=$(( trigger_mb - MARGIN_MB ))
-min_mb=$(( floor_mb + FLOOR_MARGIN_MB ))
+# The stall helper can hold up to twice STALL_MB on top of the hog.
+min_mb=$(( floor_mb + FLOOR_MARGIN_MB + 2 * STALL_MB ))
 if (( target_mb < min_mb )); then
     say "the trigger (${trigger_mb} MB) is too close to the floor; stopping at ${min_mb} MB instead,"
     say "which is above the trigger, so the guard may not step in on this machine"
@@ -103,6 +128,9 @@ say "RAM ${total_mb} MB, available now ${avail_mb} MB"
 say "guard trigger: available below ${pct}% (${trigger_mb} MB); floor ${floor_mb} MB"
 say "the hog grows by ${STEP_MB} MB a second until about ${target_mb} MB is available,"
 say "holds for up to ${HOLD_SECS} s, then exits; hard limit ${MAX_SECONDS} s"
+if (( STALL_MB > 0 )); then
+    say "a stall helper capped at ${STALL_MB} MB (MemoryHigh) makes apps stall, so the guard steps in"
+fi
 (( avail_mb > target_mb )) || die "available memory is already at or below ${target_mb} MB; nothing to do"
 
 if (( ! ASSUME_YES )); then
@@ -111,16 +139,22 @@ if (( ! ASSUME_YES )); then
 fi
 
 UNIT="rlm-demo-hog-$$"
+STALL_UNIT="rlm-demo-stall-$$"
 HOG_PID=""
+STALL_PID=""
+# How long the "paused" notification stays up before the hog ends. Below
+# the guard's default 5 s freeze, so the hog is gone before the thaw.
+SHOW_SECS=3
 
 cleanup() {
     trap - EXIT INT TERM
-    if [[ -n "$HOG_PID" ]]; then
-        kill "$HOG_PID" 2>/dev/null || true
-    fi
-    # Stops every process left in the demo's own scope, if any.
-    systemctl --user stop "$UNIT.scope" 2>/dev/null || true
-    say "hog stopped; its memory is free again"
+    local pid
+    for pid in "$HOG_PID" "$STALL_PID"; do
+        [[ -n "$pid" ]] && kill "$pid" 2>/dev/null || true
+    done
+    # Stops every process left in the demo's own scopes, if any.
+    systemctl --user stop "$UNIT.scope" "$STALL_UNIT.scope" 2>/dev/null || true
+    say "hog and stall helper stopped; their memory is free again"
 }
 trap cleanup EXIT
 trap 'exit 130' INT
@@ -168,11 +202,70 @@ while time.monotonic() < end and time.monotonic() - start < max_secs - 2:
 print("[hog] done, exiting", flush=True)
 '
 
+# The stall helper: allocates 16 MB at a time past its MemoryHigh, where
+# the kernel throttles it almost continuously. It never holds more than
+# twice the limit (oldest block dropped for each new one), and the short
+# sleep keeps it from spinning when the limit is not applied (no memory
+# delegation).
+STALL='
+import sys, time
+cap_mb, max_secs = (int(a) for a in sys.argv[1:3])
+start = time.monotonic()
+chunk_mb = 16
+held = []
+print(f"[stall] throttled at {cap_mb} MB, holding at most {2 * cap_mb} MB", flush=True)
+while time.monotonic() - start < max_secs - 2:
+    if len(held) * chunk_mb >= 2 * cap_mb:
+        held.pop(0)
+    held.append(bytearray(b"\x5a") * (chunk_mb * 1024 * 1024))
+    time.sleep(0.05)
+'
+
+if (( STALL_MB > 0 )); then
+    say "starting the stall helper in $STALL_UNIT.scope"
+    systemd-run --user --scope --quiet --slice=app.slice --unit="$STALL_UNIT" \
+        --description="rlm memory pressure demo (stall helper)" \
+        -p MemoryHigh="${STALL_MB}M" -p MemorySwapMax=0 \
+        timeout -s KILL "$MAX_SECONDS" \
+        python3 -c "$STALL" "$STALL_MB" "$MAX_SECONDS" &
+    STALL_PID=$!
+    for _ in 1 2 3 4 5 6; do
+        systemctl --user is-active --quiet "$STALL_UNIT.scope" && break
+        sleep 0.5
+    done
+    systemctl --user is-active --quiet "$STALL_UNIT.scope" \
+        || say "the stall helper did not start; the guard may not step in"
+fi
+
+# True once the guard has paused (cgroup.freeze 1) or capped (memory.high
+# set) the hog's scope; false when the hog ends first.
+guard_acted_on_hog() {
+    local cg="" freeze high
+    while kill -0 "$HOG_PID" 2>/dev/null; do
+        [[ -n "$cg" ]] || cg="$(systemctl --user show -p ControlGroup --value "$UNIT.scope" 2>/dev/null || true)"
+        if [[ -n "$cg" ]]; then
+            freeze="$(cat "/sys/fs/cgroup$cg/cgroup.freeze" 2>/dev/null || echo 0)"
+            high="$(cat "/sys/fs/cgroup$cg/memory.high" 2>/dev/null || echo max)"
+            [[ "$freeze" == 1 || "$high" != max ]] && return 0
+        fi
+        sleep 0.5
+    done
+    return 1
+}
+
 say "starting the hog in $UNIT.scope"
 systemd-run --user --scope --quiet --slice=app.slice --unit="$UNIT" \
     --description="rlm memory pressure demo" \
     timeout -s KILL "$MAX_SECONDS" \
     python3 -c "$HOG" "$target_mb" "$STEP_MB" "$HOLD_SECS" "$MAX_SECONDS" &
 HOG_PID=$!
+if guard_acted_on_hog; then
+    say "rlm-guard stepped in on the hog; the notification shows what it did"
+    systemctl --user stop "$STALL_UNIT.scope" 2>/dev/null || true
+    sleep "$SHOW_SECS"
+    say "ending the demo hog so its memory is free before the guard's thaw"
+    # SIGKILL ends a process even while it is frozen (cgroup v2).
+    systemctl --user kill -s KILL "$UNIT.scope" 2>/dev/null || true
+fi
 wait "$HOG_PID" || true
 HOG_PID=""

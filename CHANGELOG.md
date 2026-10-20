@@ -11,6 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - The deb, rpm and AUR upgrade notices say to run `systemctl --user daemon-reload` before restarting the guard, like the README, since the upgrade may have replaced its service file.
 
+### Changed
+
+- `scripts/demo-memory-pressure.sh` runs a small stall helper next to the hog: a process in its own scope with `MemoryHigh` set to `--stall-mb` (300 MB by default) and swap off, which the kernel throttles. Without it, a machine with spare cache, zram or fast swap rarely stalls at the trigger, so the guard did not step in. `--stall-mb 0` turns it off; the floor plus 1 GB still holds with its memory counted. Once the guard pauses or caps the hog, the script stops the helper, leaves the notification up for 3 seconds and ends its own hog before the guard's thaw, so the guard does not move on to another app.
+
 ## [0.2.8] - 2026-10-01
 
 ### Fixed
