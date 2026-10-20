@@ -9,6 +9,7 @@
 use std::collections::{HashMap, HashSet};
 use std::os::unix::fs::MetadataExt;
 
+use crate::cgroup::LimitKinds;
 use crate::guard::cgfs;
 use crate::process::ProcessInfo;
 use crate::CgroupManager;
@@ -148,6 +149,9 @@ pub struct RulesEnforcer {
     sources: HashMap<String, AppRule>,
     /// Rule cgroup name to the directory inode at the last limit write.
     ensured: HashMap<String, u64>,
+    /// Rule cgroup name to the limits an edited rule no longer sets, to set
+    /// back to unlimited at its next limit write.
+    dropped: HashMap<String, LimitKinds>,
 }
 
 impl RulesEnforcer {
@@ -163,6 +167,7 @@ impl RulesEnforcer {
             rules,
             sources: cfg.rules.clone(),
             ensured: HashMap::new(),
+            dropped: HashMap::new(),
         }
     }
 
@@ -171,13 +176,27 @@ impl RulesEnforcer {
     /// write, so its limits are not written again (see [`needs_ensure`]): a
     /// config save that touched other settings must not rewrite every rule
     /// cgroup's limits, or revert a limit set by hand on one. Added and
-    /// edited rules are written on the next pass; removed rules are dropped.
+    /// edited rules are written on the next pass, and a limit an edit removed
+    /// is set back to unlimited then; removed rules are dropped.
     pub fn reload(&mut self, cfg: &Config) {
         let mut next = Self::new(cfg);
         for rule in &next.rules {
             let unchanged = self.sources.get(&rule.name) == cfg.rules.get(&rule.name);
             if let (true, Some(&ino)) = (unchanged, self.ensured.get(&rule.cgroup)) {
                 next.ensured.insert(rule.cgroup.clone(), ino);
+            }
+            // A limit the old rule set and this one does not goes back to
+            // unlimited at the next write; one still pending from an earlier
+            // edit stays pending unless this rule sets it again.
+            if let Some(old) = self.rules.iter().find(|r| r.name == rule.name) {
+                let mut kinds = self.dropped.get(&rule.cgroup).copied().unwrap_or_default();
+                if !unchanged {
+                    kinds = kinds.or(LimitKinds::set_by(&old.limit));
+                }
+                let kinds = kinds.without(&rule.limit);
+                if kinds.any() {
+                    next.dropped.insert(rule.cgroup.clone(), kinds);
+                }
             }
         }
         *self = next;
@@ -248,7 +267,7 @@ impl RulesEnforcer {
             let exists = !placed.is_empty() || mgr.cgroup_exists(&rule.cgroup);
 
             for action in plan(rule, procs, &placed, exists, blocked) {
-                match apply(mgr, rule, &action, &mut self.ensured) {
+                match apply(mgr, rule, &action, &mut self.ensured, &mut self.dropped) {
                     Ok(true) => applied.push(action),
                     Ok(false) => {}
                     Err(e) => tracing::warn!(?action, error = %e, "rules: action failed"),
@@ -272,6 +291,7 @@ fn apply(
     rule: &CompiledRule,
     action: &RuleAction,
     ensured: &mut HashMap<String, u64>,
+    dropped: &mut HashMap<String, LimitKinds>,
 ) -> common::Result<bool> {
     match action {
         RuleAction::EnsureCgroup { .. } => {
@@ -281,7 +301,11 @@ fn apply(
             }
             // prepare_cgroup creates the cgroup (idempotent) and (re)sets limits.
             let prepared = mgr.prepare_cgroup(&rule.cgroup, &rule.limit)?;
-            for w in &prepared.warnings {
+            let reset = dropped
+                .remove(&rule.cgroup)
+                .map(|kinds| mgr.reset_limits(&rule.cgroup, kinds))
+                .unwrap_or_default();
+            for w in prepared.warnings.iter().chain(&reset) {
                 tracing::warn!(cgroup = %rule.cgroup, "{w}");
             }
             match cgroup_inode(mgr, &rule.cgroup) {
@@ -492,5 +516,36 @@ mod tests {
         assert_eq!(e.ensured.get("app-edited"), None);
         assert_eq!(e.ensured.get("app-removed"), None);
         assert_eq!(e.ensured.get("app-added"), None);
+    }
+
+    #[test]
+    fn reload_resets_limits_an_edit_removed() {
+        let mut cfg = Config::default();
+        cfg.rules.insert(
+            "app".into(),
+            AppRule {
+                match_exe: vec!["app".into()],
+                memory: Some("1G".into()),
+                cpu: Some("50%".into()),
+                ..AppRule::default()
+            },
+        );
+        let mut e = RulesEnforcer::new(&cfg);
+
+        // Drop cpu: it goes back to unlimited at the next write.
+        cfg.rules.get_mut("app").unwrap().cpu = None;
+        e.reload(&cfg);
+        let only_cpu = LimitKinds {
+            cpu: true,
+            ..LimitKinds::default()
+        };
+        assert_eq!(e.dropped.get("app-app"), Some(&only_cpu));
+
+        // An unrelated save keeps it pending; setting cpu again cancels it.
+        e.reload(&cfg);
+        assert_eq!(e.dropped.get("app-app"), Some(&only_cpu));
+        cfg.rules.get_mut("app").unwrap().cpu = Some("25%".into());
+        e.reload(&cfg);
+        assert_eq!(e.dropped.get("app-app"), None);
     }
 }

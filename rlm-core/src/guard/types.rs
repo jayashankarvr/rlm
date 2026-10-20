@@ -92,7 +92,7 @@ pub enum Action {
     Cap { res: Resolution, name: String },
     /// Remove a soft cap on the resolved cgroup.
     LiftCap { res: Resolution },
-    /// Drop the guard's hold on a cgroup that no longer exists (its app
+    /// Drop the guard's hold on a cgroup with no processes left (its app
     /// ended): the same cleanup as `LiftCap`, recorded as the app ending.
     Release { res: Resolution },
 }

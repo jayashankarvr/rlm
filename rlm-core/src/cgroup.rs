@@ -91,6 +91,51 @@ pub fn io_max_lines(devices: &[(u32, u32)], limit: IoLimit) -> Vec<String> {
         .collect()
 }
 
+/// Which limits to set back to unlimited, for [`CgroupManager::reset_limits`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LimitKinds {
+    pub memory: bool,
+    pub cpu: bool,
+    pub io_read: bool,
+    pub io_write: bool,
+}
+
+impl LimitKinds {
+    /// The limits `limit` sets.
+    pub fn set_by(limit: &Limit) -> Self {
+        Self {
+            memory: limit.memory.is_some(),
+            cpu: limit.cpu.is_some(),
+            io_read: limit.io.and_then(|io| io.read_bps).is_some(),
+            io_write: limit.io.and_then(|io| io.write_bps).is_some(),
+        }
+    }
+
+    /// These kinds, minus the ones `limit` sets.
+    pub fn without(self, limit: &Limit) -> Self {
+        let set = Self::set_by(limit);
+        Self {
+            memory: self.memory && !set.memory,
+            cpu: self.cpu && !set.cpu,
+            io_read: self.io_read && !set.io_read,
+            io_write: self.io_write && !set.io_write,
+        }
+    }
+
+    pub fn or(self, other: Self) -> Self {
+        Self {
+            memory: self.memory || other.memory,
+            cpu: self.cpu || other.cpu,
+            io_read: self.io_read || other.io_read,
+            io_write: self.io_write || other.io_write,
+        }
+    }
+
+    pub fn any(self) -> bool {
+        self.memory || self.cpu || self.io_read || self.io_write
+    }
+}
+
 pub struct CgroupManager {
     base_path: PathBuf,
 }
@@ -172,6 +217,42 @@ impl CgroupManager {
                 Err(e)
             }
         }
+    }
+
+    /// Set the `kinds` limits of an existing cgroup back to unlimited, leaving
+    /// the others alone. Best-effort: problems come back as warnings.
+    pub fn reset_limits(&self, name: &str, kinds: LimitKinds) -> Vec<String> {
+        let mut warnings = Vec::new();
+        let Ok(safe_name) = sanitize_cgroup_name(name) else {
+            return warnings;
+        };
+        let path = self.base_path.join(safe_name);
+        let mut write = |file: &str, value: &str| {
+            if let Err(e) = fs::write(path.join(file), value) {
+                warnings.push(format!("could not reset {file}: {e}"));
+            }
+        };
+        if kinds.memory {
+            write("memory.high", "max");
+            write("memory.max", "max");
+            write("memory.swap.max", "max");
+        }
+        if kinds.cpu {
+            write("cpu.max", "max");
+        }
+        if kinds.io_read || kinds.io_write {
+            let mut fields = String::new();
+            if kinds.io_read {
+                fields.push_str(" rbps=max");
+            }
+            if kinds.io_write {
+                fields.push_str(" wbps=max");
+            }
+            for (major, minor) in Self::get_real_block_devices().unwrap_or_default() {
+                write("io.max", &format!("{major}:{minor}{fields}"));
+            }
+        }
+        warnings
     }
 
     /// Set limits on an existing cgroup. Memory and CPU failures are errors;

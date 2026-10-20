@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- rlm-guard reloads persistent rules when the config file changes, so a rule saved with `rlm limit --save` or the desktop app's "Save as a rule for rlm-guard", edited, or removed takes effect within a few seconds without restarting the guard (a restart would release the apps it holds). Unchanged rules are not written again, so saving other settings never reverts a limit set by hand on a rule's app. An invalid config keeps the current rules.
+- rlm-guard reloads persistent rules when the config file changes, so a rule saved with `rlm limit --save` or the desktop app's "Save as a rule for rlm-guard", edited, or removed takes effect within a few seconds without restarting the guard (a restart would release the apps it holds). A limit removed from a rule is set back to unlimited. Unchanged rules are not written again, so saving other settings never reverts a limit set by hand on a rule's app. An invalid config keeps the current rules.
 
 ### Fixed
 

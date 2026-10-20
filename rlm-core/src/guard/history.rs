@@ -127,6 +127,8 @@ pub fn event_for(
             "removed the soft limit".to_string(),
             "lift cap",
         ),
+        // Recorded as a lift with its own detail, not a kind of its own, so
+        // history files stay readable by older rlm versions.
         Action::Release { res } => (
             HistoryKind::Lift,
             unit_or_leaf(res),
