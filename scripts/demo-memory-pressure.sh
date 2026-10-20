@@ -316,6 +316,9 @@ systemd-run --user --scope --quiet --slice=app.slice --unit="$UNIT" \
     timeout -s KILL "$MAX_SECONDS" \
     python3 -c "$HOG" "$target_mb" "$STEP_MB" "$HOLD_SECS" "$MAX_SECONDS" &
 HOG_PID=$!
+# Disowned, bash never prints a "Killed" job notice when the hog is ended;
+# it still reaps it, so kill -0 below sees it go.
+disown "$HOG_PID"
 if guard_acted_on_hog; then
     say "rlm-guard stepped in on the hog; the notification shows what it did"
     stop_stall
@@ -329,7 +332,5 @@ if guard_acted_on_hog; then
     echo 1 2>/dev/null > "/sys/fs/cgroup$HOG_CG/cgroup.kill" \
         || systemctl --user kill -s KILL "$UNIT.scope" 2>/dev/null || true
 fi
-# The redirect hides bash's "Killed" job notice for the hog we just ended
-# (best effort: bash may report it earlier if it reaps the hog first).
-{ wait "$HOG_PID"; } 2>/dev/null || true
+while kill -0 "$HOG_PID" 2>/dev/null; do sleep 0.2; done
 HOG_PID=""
