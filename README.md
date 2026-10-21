@@ -2,8 +2,6 @@
 
 rlm sets memory, CPU and I/O limits on your own Linux processes without root, from a CLI or a GTK app, and can run a small guard that freezes or caps a runaway app under memory pressure instead of killing it.
 
-![The rlm desktop app on its Guard page, next to a "Firefox paused" notification from the guard](https://raw.githubusercontent.com/jayashankarvr/rlm/main/docs/assets/hero-dark.png)
-
 ![A test app fills 9 GB of memory in a terminal; rlm-guard pauses it, a "Python3.10 paused" notification appears and the desktop app lists it as frozen](https://raw.githubusercontent.com/jayashankarvr/rlm/main/docs/assets/demo.gif)
 
 The guard at work: `scripts/demo-memory-pressure.sh` fills memory with a test app, rlm-guard pauses it instead of letting the desktop freeze, and the script then ends it (sped up while memory fills).
