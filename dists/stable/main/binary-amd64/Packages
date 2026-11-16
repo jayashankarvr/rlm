@@ -1,17 +1,17 @@
 Package: rlm-gtk
 Architecture: amd64
-Version: 0.2.7-1
+Version: 0.2.10-1
 Priority: optional
 Section: admin
 Maintainer: Jayashankar <me.jayashankar@gmail.com>
-Installed-Size: 2781
+Installed-Size: 2788
 Depends: libadwaita-1-0 (>= 1.4), libadwaita-1-0 (>= 1.4~beta), libc6 (>= 2.39), libglib2.0-0t64 (>= 2.54.0), libgtk-4-1 (>= 4.0.0), libgtk-4-1 (>= 4.6), rlm (>= 0.2.0)
-Filename: pool/main/rlm-gtk_0.2.7-1_amd64.deb
-Size: 972788
-MD5sum: 16d1be805a99821394e4d204ec4a28db
-SHA1: 8dac04e07ae76b635bb9dacbcdb22b228c6e7ae6
-SHA256: 86707e9e6c6b90f4572644391037dd99e88ba3c4472dfd74c096994b87804679
-SHA512: d6fa51a595171150ff6b5161e6a370c151e0fc6620f25d83cab1f094b44915c22cb642e0fb28e36750a1ef989e83820b6429b511857b345c1fe5000738e6aeb4
+Filename: pool/main/rlm-gtk_0.2.10-1_amd64.deb
+Size: 981200
+MD5sum: e6ba94ab53b45be19e4ec2313b10577c
+SHA1: 9273bfbff7c7e813e103683ca8dfcd3969265d43
+SHA256: fd494da52a7d882109edc3936471f433092356d22b577e7d2b1a85be06c02e45
+SHA512: b43dd640f698ba802b91356c5b4bf3848c4e8673bba8701a36ec1e8ffb15192cafaaac4fbb24d6c61c6f6ef70f3061911a29aba8d5fa9c54d5bea4747c8b22b1
 Homepage: https://github.com/jayashankarvr/rlm
 Description: GTK4/Libadwaita GUI for Resource Limit Manager
  # rlm
@@ -20,9 +20,13 @@ Description: GTK4/Libadwaita GUI for Resource Limit Manager
  from a CLI or a GTK app, and can run a small guard that freezes or caps a
  runaway app under memory pressure instead of killing it.
  .
- ![The rlm desktop app on its Guard page, next to a "Firefox paused"
- notification from the
- guard](https://raw.githubusercontent.com/jayashankarvr/rlm/main/docs/assets/hero-dark.png)
+ ![A test app fills 9 GB of memory in a terminal; rlm-guard pauses it, a
+ "Python3.10 paused" notification appears and the desktop app lists it as
+ frozen](https://raw.githubusercontent.com/jayashankarvr/rlm/main/docs/assets/demo.gif)
+ .
+ The guard at work: `scripts/demo-memory-pressure.sh` fills memory with a test
+ app, rlm-guard pauses it instead of letting the desktop freeze, and the script
+ then ends it (sped up while memory fills).
  .
  ## What it does today
  .
@@ -80,9 +84,9 @@ Description: GTK4/Libadwaita GUI for Resource Limit Manager
  - Limits that come back. A saved rule applies to an app every time it starts,
  and profiles give names to limit sets you use often.
  - Limits that behave well. A memory limit also sets `memory.high` at 90% so
- reclaim starts before the hard limit, and turns swap off for that app, so at
- its limit it does not thrash the disk; if it still needs more, the kernel stops
- it instead.
+ reclaim starts before the hard limit, and turns swap off for that app (where
+ the kernel supports it), so at its limit it does not thrash swap; if it still
+ needs more, the kernel's OOM killer ends a process in it.
  - A desktop app, for people who do not want to learn cgroups.
  .
  earlyoom, nohang and systemd-oomd solve a different problem. When memory is
@@ -221,9 +225,12 @@ Description: GTK4/Libadwaita GUI for Resource Limit Manager
  pointing at your `rlm-guard`, then enables and starts it with `systemctl
  --user`.
  .
- After you upgrade the binary, restart the guard so the new version runs:
+ After you upgrade the binary, restart the guard so the new version runs. The
+ `daemon-reload` picks up the service file a package upgrade may have replaced;
+ without it, systemctl warns that the unit file changed on disk.
  .
  ```bash
+ systemctl --user daemon-reload
  systemctl --user restart rlm-guard
  ```
  .
@@ -282,8 +289,10 @@ Description: GTK4/Libadwaita GUI for Resource Limit Manager
  ```
  .
  A saved rule is applied by rlm-guard, so the guard service must be running for
- it to cover future instances. `rlm unlimit --application firefox` drops the
- live limit but keeps the rule; add `--forget` to delete the rule too.
+ it to cover future instances. A running guard picks up added, changed and
+ removed rules within a few seconds, without a restart. `rlm unlimit
+ --application firefox` drops the live limit but keeps the rule; add `--forget`
+ to delete the rule too.
  .
  ### Run a command with limits
  .
@@ -409,10 +418,10 @@ Description: GTK4/Libadwaita GUI for Resource Limit Manager
  update or clear notifications.
  - `notify_pressure: true` also warns "Memory is running low", at most once a
  minute, while apps stall, memory is short and no app is held yet.
- - The running guard picks up `notify` and `notify_pressure` without a restart,
- so held apps stay held. The Notifications switches on the GUI Guard page change
- them for you. Any other change takes effect after `systemctl --user restart
- rlm-guard`.
+ - The running guard picks up `notify`, `notify_pressure` and the persistent
+ rules without a restart, so held apps stay held. The Notifications switches on
+ the GUI Guard page change the first two for you. Any other change takes effect
+ after `systemctl --user restart rlm-guard`.
  - Unknown keys and out-of-range values are errors. `calm_hold_secs` and
  `freeze_cooldown_secs` go up to 86400 (one day), `freeze_hold_secs` up to 60,
  `sample_interval_ms` from 100 to 60000, and `mem_available_floor_mb` and
@@ -1603,18 +1612,18 @@ Description: GTK4/Libadwaita GUI for Resource Limit Manager
 
 Package: rlm
 Architecture: amd64
-Version: 0.2.7-1
+Version: 0.2.10-1
 Priority: optional
 Section: admin
 Maintainer: Jayashankar <me.jayashankar@gmail.com>
-Installed-Size: 8889
+Installed-Size: 8907
 Depends: libc6 (>= 2.34), systemd
-Filename: pool/main/rlm_0.2.7-1_amd64.deb
-Size: 1789508
-MD5sum: d0db3697804ebac2868a6a0598562111
-SHA1: b697aee5789909246dceea7242246575c9f285a9
-SHA256: b9cdf1a495b3fb7c41a7ea75c15b21fd5688bd5e3d54fe18631b2868b762e75d
-SHA512: 618b49e2d872a8824dfc406d4b713bdb2df03611e7c92982baf94074c7ced6a47f75a3ac5185522cd898da17c84437465a210a0e671bfb2347db2eb418776a03
+Filename: pool/main/rlm_0.2.10-1_amd64.deb
+Size: 1800672
+MD5sum: 836e3519fbbc210f14dbcf5c5d694951
+SHA1: b014f35f34fc8ee0e334afc22f469df7a71ec0ea
+SHA256: 6e8df703f51a85f2788aa6681535ad33bcac994c5cf2e4925764016b9be60c85
+SHA512: d3038b055f71c1c552cf9b0382cbbde346003746bca71b606b0252d12244e7161d1f5063757e50f63445dec9a2a6268d53d0c18602141e9a01a758c23c36ff6f
 Homepage: https://github.com/jayashankarvr/rlm
 Description: Unprivileged cgroup v2 limits and a freeze guard for your own Linux processes
  rlm sets unprivileged cgroup v2 memory, CPU and I/O limits on your own
