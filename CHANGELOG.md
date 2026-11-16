@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.10] - 2026-11-16
+
+### Fixed
+
+- `rlm limit --application`, `rlm unlimit --application` and the desktop app's Application mode no longer fail with "cgroup name must contain only alphanumeric characters, dashes, or underscores" for a program whose file name contains a dot, such as Claude Code (its program file is named after its version, for example `2.1.325`), `python3.10` or an AppImage. Any character other than a letter, digit, `-` or `_` now becomes `_` in the group name (`app-2_1_325`). Saved rules for such programs, which failed every time the guard applied rules with only a warning in its log, now work. Names that already worked keep the same group.
+
+### Changed
+
+- `rlmctl-core` library: new `cgroup::is_cgroup_name_char`, shared by the cgroup name check and `rules::cgroup_name_for`; `cgroup_name_for` now replaces every character outside that set with `_`.
+
 ## [0.2.9] - 2026-10-20
 
 ### Added

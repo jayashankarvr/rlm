@@ -1076,7 +1076,7 @@ fn apply_limits(state: &Rc<RefCell<LimitState>>) {
                             .map(String::from)
                     })
                     .unwrap_or_else(|| format!("multi-{}", pids[0]));
-                format!("app-{}", app_name.replace(['/', ' '], "_"))
+                rlm_core::rules::cgroup_name_for(&app_name)
             };
 
             match manager.apply_limit_to_multiple(&pids, &limit, &cgroup_name) {

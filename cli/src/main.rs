@@ -504,7 +504,7 @@ fn run() -> Result<ExitCode> {
                 if targets.is_empty() {
                     return Err(Error::ProcessNameNotFound(app_name));
                 }
-                let cgroup_name = format!("app-{}", app_name.replace(['/', ' '], "_"));
+                let cgroup_name = rlm_core::rules::cgroup_name_for(&app_name);
                 println!(
                     "Found {} process(es) for application '{}'",
                     targets.len(),
@@ -640,7 +640,7 @@ fn run() -> Result<ExitCode> {
                 println!("removed limits from cgroup '{}'", cgroup_name);
             } else if let Some(app_name) = application {
                 // Remove application cgroup
-                let cgroup_name = format!("app-{}", app_name.replace(['/', ' '], "_"));
+                let cgroup_name = rlm_core::rules::cgroup_name_for(&app_name);
                 if !manager.cgroup_exists(&cgroup_name) {
                     return Err(Error::InvalidArgs(format!(
                         "no rlm cgroup named '{cgroup_name}' (see: rlm status)"
@@ -1441,7 +1441,7 @@ mod tests {
         assert!(MANIFEST.contains("rlm-delegate.conf"));
         assert!(!MANIFEST.contains("dist/delegate.conf"));
         assert!(MANIFEST.contains("maintainer-scripts = \"../dist/deb\""));
-        assert_eq!(env!("CARGO_PKG_VERSION"), "0.2.9");
+        assert_eq!(env!("CARGO_PKG_VERSION"), "0.2.10");
     }
 
     #[test]
