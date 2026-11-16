@@ -14,6 +14,13 @@ const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 /// `guard/resolve.rs`).
 pub const UNLIMIT_CGROUP_NAME: &str = "unlimit";
 
+/// The one rule for which characters an rlm cgroup name may contain:
+/// alphanumeric, dash or underscore. Shared by [`sanitize_cgroup_name`] and
+/// `rules::cgroup_name_for` so the builder and the validator cannot drift.
+pub fn is_cgroup_name_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '-' || c == '_'
+}
+
 /// Sanitize cgroup name to prevent path traversal attacks.
 /// Only allows alphanumeric characters, dashes, and underscores.
 fn sanitize_cgroup_name(name: &str) -> Result<&str> {
@@ -30,10 +37,7 @@ fn sanitize_cgroup_name(name: &str) -> Result<&str> {
     }
 
     // Validate characters: alphanumeric, dash, underscore only
-    if !name
-        .chars()
-        .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
-    {
+    if !name.chars().all(is_cgroup_name_char) {
         return Err(Error::InvalidArgs(
             "cgroup name must contain only alphanumeric characters, dashes, or underscores".into(),
         ));
@@ -866,6 +870,31 @@ mod tests {
         assert!(sanitize_cgroup_name("a\\b").is_err());
         assert!(sanitize_cgroup_name("").is_err());
         assert!(sanitize_cgroup_name("bad name").is_err()); // space
+        assert!(sanitize_cgroup_name("..").is_err());
+        assert!(sanitize_cgroup_name(".").is_err());
+        assert!(sanitize_cgroup_name("/").is_err());
+        assert!(sanitize_cgroup_name("a.b").is_err());
+    }
+
+    #[test]
+    fn built_application_names_always_pass_sanitize() {
+        for name in [
+            "2.1.325",
+            "a..b",
+            "../x",
+            ".hidden",
+            "name with spaces",
+            "tab\there",
+            "\u{00e9}diteur",
+            "\u{1f600}app",
+            "back\\slash",
+        ] {
+            let built = crate::rules::cgroup_name_for(name);
+            assert!(
+                sanitize_cgroup_name(&built).is_ok(),
+                "{name:?} built {built:?} which sanitize rejects"
+            );
+        }
     }
 
     #[test]

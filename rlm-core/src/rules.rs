@@ -35,10 +35,26 @@ pub enum RuleAction {
     TeardownEmpty { rule: String },
 }
 
-/// Sanitize a rule name into the `app-<name>` cgroup form, matching the CLI's
-/// existing scheme (`app-{name with '/' and ' ' replaced by '_'}`).
+/// Build the shared `app-<name>` cgroup name for an application or rule name.
+/// Every character `is_cgroup_name_char` rejects (dots, slashes, spaces,
+/// emoji, ...) becomes `_`, so the result always passes cgroup name
+/// validation; names that are already valid keep their exact form.
+/// The CLI, the GUI and persistent rules all use this one function.
+///
+/// Known residual: names that differ only in replaced characters (`a.b` and
+/// `a_b`) map to the same cgroup and share one pool of limits.
 pub fn cgroup_name_for(rule_name: &str) -> String {
-    format!("app-{}", rule_name.replace(['/', ' '], "_"))
+    let safe: String = rule_name
+        .chars()
+        .map(|c| {
+            if crate::cgroup::is_cgroup_name_char(c) {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    format!("app-{safe}")
 }
 
 impl CompiledRule {
@@ -361,6 +377,12 @@ mod tests {
     fn cgroup_name_matches_cli_scheme() {
         assert_eq!(cgroup_name_for("firefox"), "app-firefox");
         assert_eq!(cgroup_name_for("my app/x"), "app-my_app_x");
+    }
+
+    #[test]
+    fn cgroup_name_replaces_dots() {
+        assert_eq!(cgroup_name_for("2.1.325"), "app-2_1_325");
+        assert_eq!(cgroup_name_for("python3.10"), "app-python3_10");
     }
 
     #[test]
